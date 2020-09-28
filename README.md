@@ -2,15 +2,21 @@
 
 This repository has the code of ACD component, configuration used for OMniLeads
 
-Asterisk Version: 5.3
-Base Image: kamailio/kamailio-ci:5.3
+Asterisk Version: 16.12.0
+Base Image: freetechsolutions/omlacd-builder:latest
 
 ## Build
 
 ```
-  docker build -t freetechsolutions/omlkam:5.3 .
+  docker build -t freetechsolutions/omlacd:$TAG .
 ```
+
+Where $TAG is the tag you want for the image
 
 ## Run container
 
 You need enviroment variables related to the asterisk and rtpengine you want
+
+## Tags of images
+
+* 773d7dec: initial image for oml 2.0 
