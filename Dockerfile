@@ -1,24 +1,29 @@
 # vim:set ft=dockerfile:
-FROM debian:buster-slim
+FROM freetechsolutions/omlacd-builder:latest as builder
 
-ENV LANG en_US.utf8
-ENV NOTVISIBLE "in users profile"
-ENV ASTERISK_VERSION 16.12.0
-ENV OPUS_CODEC asterisk-16.0/x86-64/codec_opus-16.0_current-x86_64
+FROM python:3.7-slim as production
 
-COPY scripts/build-asterisk.sh /
-RUN /build-asterisk.sh
+RUN apt-get update -qq \
+    && apt-get install -y libbinutils libedit2 \
+    && apt autoremove -y
 
-RUN apt-get install -y git iproute2 net-tools python3-minimal python3-psycopg2 bash odbc-postgresql less python3-pip wget gnupg lame postgresql-client-11 \
-    && echo "deb http://packages.irontec.com/debian stretch main" >> /etc/apt/sources.list \
-    && wget http://packages.irontec.com/public.key -q -O - | apt-key add - \
-    && apt-get update -y \
-    && apt-get install sngrep libgsm1 -y \
-    && pip3 install -e git+https://github.com/rdegges/pyst2@master#egg=pyst2 \
-    && pip3 install 'six==1.10.0' 'redis==3.5.3' alembic \
-    && apt-get remove -y --purge python3-pip git \
-    && apt autoremove -y \
-    && apt-get install -y libedit2 libbinutils
+# Todos los paquetes de asterisk
+COPY --from=builder /usr/lib/libasteriskssl.so.1 /usr/lib/libasteriskssl.so.1
+COPY --from=builder /usr/lib/libasteriskpj.so.2 /usr/lib/libasteriskpj.so.2
+COPY --from=builder /etc/asterisk /etc/asterisk/
+COPY --from=builder /var/lib/asterisk /var/lib/asterisk
+COPY --from=builder /var/log/asterisk /var/log/asterisk
+COPY --from=builder /var/spool/asterisk /var/spool/asterisk
+COPY --from=builder /usr/sbin/asterisk /usr/sbin/
+COPY --from=builder /usr/lib/asterisk /usr/lib/asterisk/
+COPY --from=builder /var/run/asterisk/ /var/run/asterisk/
+COPY --from=builder /root/ast-db-manage/ /root/ast-db-manage/
+
+# Librerias de python, curl otras librerias necesarias
+COPY --from=builder /usr/local/lib/python3.7/ /usr/local/lib/python3.7/
+COPY --from=builder /usr/local/bin/alembic /usr/local/bin/alembic
+COPY --from=builder /usr/bin/curl /usr/bin/curl
+COPY --from=builder /usr/lib/x86_64-linux-gnu/ /usr/lib/x86_64-linux-gnu/
 
 COPY asterisk/dialplan/* /etc/asterisk/
 COPY asterisk/conf/* /etc/asterisk/
