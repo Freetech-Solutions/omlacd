@@ -19,4 +19,4 @@ You need enviroment variables related to the asterisk and rtpengine you want
 
 ## Tags of images
 
-* 773d7dec: initial image for oml 2.0 
+* 5ce129ce: initial image for oml 2.0 

@@ -29,6 +29,10 @@ if [ "$1" = "" ]; then
       if [ ! -f /etc/asterisk/$i} ]; then ln -s /var/tmp/$i /etc/asterisk/$i; fi
     done
   fi
+  echo "**[omlacd] Writting the AMI credentials"
+  sed -i "s/amiuser/$AMI_USER/g" /etc/asterisk/oml_manager.conf
+  sed -i "s/amipassword/$AMI_PASSWORD/g" /etc/asterisk/oml_manager.conf
+
   echo "**[omlacd] Writting the IP in pjsip files"
   sed -i "0,/external_media_address=.*/s//external_media_address=${PUBLIC_IP}/g" /etc/asterisk/oml_pjsip_transports.conf
   sed -i "0,/external_signaling_address=.*/s//external_signaling_address=${PUBLIC_IP}/g" /etc/asterisk/oml_pjsip_transports.conf
