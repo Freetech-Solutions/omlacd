@@ -20,15 +20,6 @@ if [ "$1" = "" ]; then
     echo "**[omlacd] Running asterisk alembic database schema"
     alembic -c config.ini upgrade head
   fi
-  if [ $DEVENV == "true" ]; then
-    echo "**[omlacd] Creating symlink of asterisk dialplan files"
-    cd /var/tmp
-    array=($(ls *.conf))
-    for i in "${array[@]}"; do
-      rm -rf /etc/asterisk/$i
-      if [ ! -f /etc/asterisk/$i} ]; then ln -s /var/tmp/$i /etc/asterisk/$i; fi
-    done
-  fi
   echo "**[omlacd] Writting the AMI credentials"
   sed -i "s/amiuser/$AMI_USER/g" /etc/asterisk/oml_manager.conf
   sed -i "s/amipassword/$AMI_PASSWORD/g" /etc/asterisk/oml_manager.conf
