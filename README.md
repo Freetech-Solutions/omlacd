@@ -16,3 +16,7 @@ Where $TAG is the tag you want for the image
 ## Run container
 
 You need enviroment variables related to the asterisk and rtpengine you want
+
+## Tags of images
+
+* 5ce129ce: initial image for oml 2.0 
