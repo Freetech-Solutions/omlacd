@@ -25,7 +25,6 @@ COPY --from=builder /usr/local/bin/alembic /usr/local/bin/alembic
 COPY --from=builder /usr/bin/curl /usr/bin/curl
 COPY --from=builder /usr/lib/x86_64-linux-gnu/ /usr/lib/x86_64-linux-gnu/
 
-COPY asterisk/dialplan/* /etc/asterisk/
 COPY asterisk/conf/* /etc/asterisk/
 COPY asterisk/agi-bin/* /var/lib/asterisk/agi-bin/
 COPY asterisk/etc/*.ini /etc/
