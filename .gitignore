@@ -1,2 +1,3 @@
 /blacklist
 /grabaciones
+/asterisk/conf/oml_sip_*.conf

@@ -14,6 +14,6 @@ build:
     DOCKER_TLS_CERTDIR: ""
   image: gitlab/dind
   script:
-    - cd scripts && ./build_images.sh
+    - cd scripts && bash build_images.sh
   only:
     - web
