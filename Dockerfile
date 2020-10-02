@@ -31,4 +31,6 @@ COPY asterisk/etc/*.ini /etc/
 COPY asterisk/sounds/* /var/lib/asterisk/sounds/
 COPY scripts/run_asterisk.sh /home/
 
-EXPOSE 22 5038/tcp 7088/tcp 5060/udp 5060/tcp
+EXPOSE 5038/tcp 7088/tcp 5160-5163/udp 5060/udp
+
+ENTRYPOINT ["/home/run_asterisk.sh"]

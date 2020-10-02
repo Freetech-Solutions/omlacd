@@ -15,9 +15,9 @@ build:
   image: gitlab/dind
   script:
     - docker login -u $FTS_DOCKER_USER -p $FTS_DOCKER_PASSWORD
-    - docker build -t freetechsolutions/omlacd:$CI_COMMIT_SHORT_SHA .
+    - docker build -t freetechsolutions/omlacd:$CI_COMMIT_REF_NAME .
     - docker build -t freetechsolutions/omlacd:latest .
-    - docker push freetechsolutions/omlacd:$CI_COMMIT_SHORT_SHA
+    - docker push freetechsolutions/omlacd:$CI_COMMIT_REF_NAME
     - docker push freetechsolutions/omlacd:latest
   only:
     - web
