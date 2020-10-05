@@ -15,8 +15,8 @@ Where $TAG is the tag you want for the image
 
 ## Run container
 
-You need enviroment variables related to the asterisk and rtpengine you want
+```
+  docker run -it freetechsolutions/omlacd:latest bash
+```
 
-## Tags of images
-
-* 5ce129ce: initial image for oml 2.0 
+If you need to add environment variables and link folders to container, check docker run documentation: https://docs.docker.com/engine/reference/commandline/run/
