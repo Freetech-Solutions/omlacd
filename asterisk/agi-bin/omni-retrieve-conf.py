@@ -1,4 +1,4 @@
-#! /usr/bin/python3
+#! /usr/local/bin/python3
 # -*- coding: utf-8 -*-
 
 # Copyright (C) 2018 Freetech Solutions
@@ -28,7 +28,7 @@ import redis
 from asterisk.agi import AGI
 from utiles import write_time_stderr
 
-REDIS_GET_FAMILY_LOG = '{0}/var/log/asterisk/redis-get-family-agi-errors.log'
+REDIS_GET_FAMILY_LOG = '/var/log/asterisk/redis-get-family-agi-errors.log'
 
 if os.path.exists(REDIS_GET_FAMILY_LOG):
     append_write = 'a'  # append if already exists
