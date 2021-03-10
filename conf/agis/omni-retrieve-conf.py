@@ -1,4 +1,4 @@
-#! /usr/local/bin/python3
+#!/opt/omnileads/virtualenv/bin/python3
 # -*- coding: utf-8 -*-
 
 # Copyright (C) 2018 Freetech Solutions
@@ -28,7 +28,8 @@ import redis
 from asterisk.agi import AGI
 from utiles import write_time_stderr
 
-REDIS_GET_FAMILY_LOG = '/var/log/asterisk/redis-get-family-agi-errors.log'
+ASTERISK_LOCATION = os.getenv('ASTERISK_LOCATION')
+REDIS_GET_FAMILY_LOG = '{0}/var/log/asterisk/redis-get-family-agi-errors.log'.format(ASTERISK_LOCATION)
 
 if os.path.exists(REDIS_GET_FAMILY_LOG):
     append_write = 'a'  # append if already exists

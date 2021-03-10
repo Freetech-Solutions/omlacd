@@ -1,0 +1,76 @@
+# Copyright (C) 2018 Freetech Solutions
+
+# This file is part of OMniLeads
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see http://www.gnu.org/licenses/.
+#
+---
+
+- name: Asterisk installation and configuration
+  hosts: prodenv-aio
+  vars:
+    cron_location: /var/spool/cron/omnileads
+    packages_url: https://fts-public-packages.s3.amazonaws.com
+    asterisk_package: "{{ packages_url }}/asterisk/asterisk-{{ asterisk_version }}.x86_64.rpm"
+  tasks:
+
+  - name: Set of environments variables
+    copy:
+      dest: "/etc/profile.d/omnileads_envars.sh"
+      content: |
+        ASTERISK_HOSTNAME={{ asterisk_hostname }}
+        KAMAILIO_HOSTNAME={{ kamailio_hostname }}
+        REDIS_HOSTNAME={{ redis_hostname }}
+        RETHINKDB_HOSTNAME={{ rethinkdb_hostname }}
+        RTPENGINE_HOSTNAME={{ rtpengine_hostname }}
+        POSTGRES_HOSTNAME={{ postgres_hostname }}
+        POSTGRES_PORT={{ postgres_port }}
+        POSTGRES_USER={{ postgres_user }}
+        POSTGRES_PASSWORD={{ postgres_password }}
+
+        export ASTERISK_HOSTNAME KAMAILIO_HOSTNAME REDIS_HOSTNAME RTPENGINE_HOSTNAME RETHINKDB_HOSTNAME POSTGRES_HOSTNAME
+    when: asterisk_out is defined
+
+  # Chequeo si la version de asterisk instalada es {{ asterisk_version }}
+  - name: Check if asterisk OMniLeads package {{ asterisk_version }} is installed
+    shell: yum list installed |grep asterisk | awk -F " " '{print $2}' |awk -F "-" '{print $1}'
+    register: asterisk_installed
+    changed_when: false
+    tags: postinstall
+
+  # Se imprime que el asterisk OMniLeads configuration no esta instalado si la version actual es inferior a la requerida
+  - debug: msg="Asterisk {{ asterisk_version }} is not installed, proceeding to install"
+    when: asterisk_installed.stdout != asterisk_version
+    tags: postinstall
+
+  # Por lo contrario se imprime que ya está instalada la version mas actual
+  - debug: msg="Asterisk is already installed in version {{ asterisk_version }}, skipping installation steps"
+    when: asterisk_installed.stdout == asterisk_version
+    tags: postinstall
+
+  # Esta tarea es para eliminar paquete viejo
+  - name: Delete old asterisk OMniLeads package
+    yum: name=omnileads-asterisk state=absent
+    tags: postinstall
+    when: asterisk_installed.stdout != asterisk_version
+
+  # Se instala el paquete asterisk
+  - name: Install asterisk-{{ asterisk_version }} package (from s3 source)
+    command: yum install -y {{ asterisk_package }}
+    tags: postinstall
+    retries: 3
+    delay: 3
+    register: s3_download
+    until: s3_download is success
+    when: asterisk_installed.stdout != asterisk_version

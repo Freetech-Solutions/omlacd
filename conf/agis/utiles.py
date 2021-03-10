@@ -1,4 +1,4 @@
-#! /usr/local/bin/python3
+#!/opt/omnileads/virtualenv/bin/python3
 # -*- coding: utf-8 -*-
 
 # Copyright (C) 2018 Freetech Solutions

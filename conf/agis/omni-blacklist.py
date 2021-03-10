@@ -1,4 +1,4 @@
-#! /usr/local/bin/python3
+#!/opt/omnileads/virtualenv/bin/python3
 # -*- coding: utf-8 -*-
 
 # Copyright (C) 2018 Freetech Solutions
@@ -18,6 +18,10 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see http://www.gnu.org/licenses/.
 
+# este script es invocado como AGI desde 'oml_extensions_sub.conf' para detectar si un télefono
+# discado está en una lista negra (no está permitido llamar), cuyo valor escribe en el canal
+# correspondiente en la variable BLACKLIST
+
 import os
 import sys
 from socket import setdefaulttimeout
@@ -25,30 +29,28 @@ from socket import setdefaulttimeout
 from asterisk.agi import AGI
 from utiles import write_time_stderr
 
-DIALEDNUM_AGI_LOG = '/var/log/asterisk/dialednum-agi-errors.log'
+ASTERISK_LOCATION = os.getenv('ASTERISK_LOCATION')
+BLACKLIST_AGI_LOG = '{0}/var/log/asterisk/blacklist-agi-errors.log'.format(ASTERISK_LOCATION)
 
-if os.path.exists(DIALEDNUM_AGI_LOG):
+if os.path.exists(BLACKLIST_AGI_LOG):
     append_write = 'a' # append if already exists
 else:
     append_write = 'w' # make a new file if not
 
-sys.stderr = open(DIALEDNUM_AGI_LOG, append_write)
+sys.stderr = open(BLACKLIST_AGI_LOG, append_write)
 
 setdefaulttimeout(20)
 
 agi = AGI()
 
-ASTERISK_LISTS = configParser.get('OML', 'ASTERISK_LISTS')
 phone_number = sys.argv[1]
-camp_id = sys.argv[2]
+black_list_file = '{0}/var/spool/asterisk/blacklist/oml_backlist.txt'.format(ASTERISK_LOCATION)
 
-campaign_dialed_number_file = os.path.join(ASTERISK_LISTS, "/oml_{0}_dialednum.txt".format(camp_id))
-
-with open(campaign_dialed_number_file, 'r') as f:
-    is_dialed = int(f.read().find(phone_number) != -1)
+with open(black_list_file, 'r') as f:
+    is_black_listed = int(f.read().find(phone_number) != -1)
 
 try:
-    agi.set_variable('OMLDIALEDNUM', str(is_dialed))
+    agi.set_variable('BLACKLIST', str(is_black_listed))
 except Exception as e:
-    write_time_stderr("Unable to set variable OMLDIALEDNUM in channel due to {0}".format(e))
+    write_time_stderr("Unable to set variable BLACKLIST in channel due to {0}".format(e))
     raise e
