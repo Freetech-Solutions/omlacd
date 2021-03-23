@@ -1,5 +1,4 @@
-#! /usr/local/bin/python3
-# -*- coding: utf-8 -*-
+#!/opt/omnileads/virtualenv/bin/python3
 
 # Copyright (C) 2018 Freetech Solutions
 
@@ -28,7 +27,8 @@ import redis
 from asterisk.agi import AGI
 from utiles import write_time_stderr
 
-REDIS_AGENT_STATUS_LOG = '/var/log/asterisk/agent-status-agi-errors.log'
+ASTERISK_LOCATION = os.getenv('ASTERISK_LOCATION')
+REDIS_AGENT_STATUS_LOG = '{0}/var/log/asterisk/agent-status-agi-errors.log'.format(ASTERISK_LOCATION)
 
 if os.path.exists(REDIS_AGENT_STATUS_LOG):
     append_write = 'a'  # append if already exists

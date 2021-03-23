@@ -1,0 +1,11 @@
+/opt/omnileads/asterisk/var/log/asterisk/full {
+  daily
+  rotate 5
+  missingok
+  notifempty
+  compress
+  sharedscripts
+  postrotate
+  /usr/sbin/asterisk -rx 'logger reload' > /dev/null 2> /dev/null
+  endscript
+}
