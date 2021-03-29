@@ -5,14 +5,21 @@ This repository has the code of Asterisk component, configuration used for OMniL
 ## Docker image
 
 * **Asterisk Version:** 16.16.2
-* **Base Image:** freetechsolutions/asterisk:16.16.2
+* **Base Image:** freetechsolutions/omlacd-builder:16.16.2
 
 ### Build
 
+Asterisk image is based on the ACD builder. Is the base that will build all the binaries and libraries of asterisk. To build it:
+```
+  DOCKER_USER=$USER DOCKER_PASSWORD=$PASSWORD build_images.sh builder
+```
+Where $USER and $PASSWORD are credentials of docker repository.
+
+After building this, you can build the omlacd image.
 ```
   docker build -t freetechsolutions/omlacd:$TAG .
 ```
-Where $TAG is the docker tag you want for image.
+Where $TAG is the docker tag you want for image. You can check the .package_version file for the tag.
 
 ### Run container
 
