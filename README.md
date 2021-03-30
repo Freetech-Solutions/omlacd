@@ -11,13 +11,15 @@ This repository has the code of Asterisk component, configuration used for OMniL
 
 Asterisk image is based on the ACD builder. Is the base that will build all the binaries and libraries of asterisk. To build it:
 ```
+  cd build/docker
   DOCKER_USER=$USER DOCKER_PASSWORD=$PASSWORD build_images.sh builder
 ```
 Where $USER and $PASSWORD are credentials of docker repository.
 
 After building this, you can build the omlacd image.
 ```
-  docker build -t freetechsolutions/omlacd:$TAG .
+  cd build/docker
+  docker build -f Dockerfile -t freetechsolutions/omlacd:$TAG ../..
 ```
 Where $TAG is the docker tag you want for image. You can check the .package_version file for the tag.
 
@@ -31,10 +33,16 @@ If you need to add environment variables and link folders to container, check do
 
 **Environment variables needed:**
 ```
-  KAMAILIO_HOSTNAME //hostname of kamailio container
-  ASTERISK_HOSTNAME //hostname of asterisk container
+  AMI_USER // user of OMniLeads AMI
+  AMI_PASSWORD // password for OMniLeads AMI user
+  DOCKER_IP // IP of docker host
+  PGHOST= // host of postgresql
+  PGPORT= // port of postgresql
+  PGDATABASE // database of postgresql
+  PGPASSWORD= // password of postgresql
+  PGUSER // user pof postgresql
   REDIS_HOSTNAME // hostname of redis service
-  RTPENGINE_HOSTNAME //hostname of rtpengine service
+  TZ // timezone that will have the container
 ```
 
 ## RPM
@@ -47,8 +55,10 @@ If you need to add environment variables and link folders to container, check do
 Test the RPM build with these steps:
 
 1. Check variables for container builder in `scripts/.env_buildercontainer` file.
-2. Run scripts/builder_container.sh script
-3. Execute build_rpm.sh script
+2. Cd into build/rpm
+3. Run builder_container.sh script
+4. Inside the container, cd again into build/rpm
+5. Execute build_rpm.sh script
 
 ### Deploy
 
@@ -89,9 +99,9 @@ To deploy Asterisk in a dedicated host two main steps are needed:
   pip3 install pip --upgrade
   pip3 install 'ansible==2.9.2'
 ```
-* Go to `ansible` directory
+* Go to `deploy` directory
 ```
-  cd omlacd/ansible
+  cd omlacd/deploy
 ```
 * Open the file ansible/inventory and set there the parameters.
 ```

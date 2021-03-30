@@ -1,8 +1,8 @@
 #!/bin/bash
 
-ASTERISK_VERSION=$(cat .asterisk_version)
-PACKAGE_VERSION=$(cat .package_version)
-
+ASTERISK_VERSION=$(cat ../../.asterisk_version)
+PACKAGE_VERSION=$(cat ../../.package_version)
+ASTERISK_LOCATION="/opt/omnileads/asterisk"
 if test -z ${ASTERISK_VERSION}; then
   echo "${PROGNAME}: ASTERISK_VERSION required" >&2
   exit 1
@@ -30,7 +30,7 @@ git clone https://github.com/felipem1210/asterisk-res_json
 ./asterisk-res_json/install.sh
 
 # Configure
-./configure --with-jansson-bundled --libdir=/opt/omnileads/asterisk/lib64 --prefix=/opt/omnileads/asterisk
+./configure --with-jansson-bundled --libdir=${ASTERISK_LOCATION}/lib64 --prefix=${ASTERISK_LOCATION}
 make menuselect/menuselect menuselect-tree menuselect.makeopts
 
 # disable BUILD_NATIVE to avoid platform issues
@@ -51,7 +51,7 @@ make config
 ldconfig
 
 # set runuser and rungroup
-#sed -i -E 's/^;(run)(user|group)/\1\2/' /opt/omnileads/asterisk/etc/asterisk/asterisk.conf
+#sed -i -E 's/^;(run)(user|group)/\1\2/' ${ASTERISK_LOCATION}/etc/asterisk/asterisk.conf
 
 # Install codec g729
 echo "Adding codec g729"
@@ -59,27 +59,47 @@ mkdir -p /usr/src/codecs \
   && cd /usr/src/codecs \
   && wget https://${AWS_BUCKET}.s3.amazonaws.com/codec_g729.so \
   && chmod 755 codec_g729.so \
-  && cp *.so /opt/omnileads/asterisk/lib64/asterisk/modules/
+  && cp *.so ${ASTERISK_LOCATION}/lib64/asterisk/modules/
 cd /
 rm -rf /usr/src/asterisk \
        /usr/src/codecs
 cd /builds/omnileads/omlacd
+echo "Creating oml_asterisk.conf file"
+cat > source/astconf/oml_asterisk.conf <<EOF
+[directories](!)
+astetcdir => ${ASTERISK_LOCATION}/etc/asterisk
+astmoddir => ${ASTERISK_LOCATION}/lib64/asterisk/modules
+astvarlibdir => ${ASTERISK_LOCATION}/var/lib/asterisk
+astdbdir => ${ASTERISK_LOCATION}/var/lib/asterisk
+astkeydir => ${ASTERISK_LOCATION}/var/lib/asterisk
+astdatadir => ${ASTERISK_LOCATION}/var/lib/asterisk
+astagidir => ${ASTERISK_LOCATION}/var/lib/asterisk/agi-bin
+astspooldir => ${ASTERISK_LOCATION}/var/spool/asterisk
+astrundir => ${ASTERISK_LOCATION}/var/run/asterisk
+astlogdir => ${ASTERISK_LOCATION}/var/log/asterisk
+astsbindir => /usr/sbin
+
+[options]
+runuser = omnileads
+rungroup = omnileads
+EOF
+
 echo "Adding conf, agis, logrotate and sounds omnileads"
-cp -a conf/astconf/* /opt/omnileads/asterisk/etc/asterisk/
-cp -a conf/agis/* /opt/omnileads/asterisk/var/lib/asterisk/agi-bin/
-cp -a conf/sounds/* /opt/omnileads/asterisk/var/lib/asterisk/sounds/
+cp -a source/astconf/* ${ASTERISK_LOCATION}/etc/asterisk/
+cp -a source/agis/* ${ASTERISK_LOCATION}/var/lib/asterisk/agi-bin/
+cp -a source/sounds/* ${ASTERISK_LOCATION}/var/lib/asterisk/sounds/
 
 echo "Packing the rpm"
 fpm -s dir -d libxslt -d uriparser -d net-tools -t rpm -n asterisk -v ${PACKAGE_VERSION} \
   --rpm-user omnileads \
   --rpm-group omnileads \
-  --before-install scripts/before_install.sh \
-  --after-install scripts/after_install.sh \
-  --after-remove scripts/after_remove.sh \
-  -f /opt/omnileads/asterisk \
-    asterisk.service=/etc/systemd/system/asterisk.service \
-    logrotate/asterisk=/etc/logrotate.d/asterisk \
-    conf/odbc/odbc.ini=/etc/odbc.ini
+  --before-install build/rpm/scripts/before_install.sh \
+  --after-install build/rpm/scripts/after_install.sh \
+  --after-remove build/rpm/scripts/after_remove.sh \
+  -f ${ASTERISK_LOCATION} \
+    build/rpm/asterisk.service=/etc/systemd/system/asterisk.service \
+    source/logrotate/asterisk=/etc/logrotate.d/asterisk \
+    source/odbc/odbc.ini=/etc/odbc.ini
 mv asterisk-${PACKAGE_VERSION}* /root
 
 echo "Uploading RPM to AWS repository"
