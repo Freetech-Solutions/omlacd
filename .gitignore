@@ -1,4 +1,9 @@
 /blacklist
 /grabaciones
-/asterisk/conf/oml_sip_*.conf
 /asterisk/agi-bin/__pycache__/
+/src
+/source/astconf/oml_pjsip_agents.conf
+/source/astconf/oml_pjsip_trunks.conf
+/source/astconf/oml_queues.conf
+/source/astconf/oml_extensions_outr.conf
+/source/astconf/oml_moh.conf

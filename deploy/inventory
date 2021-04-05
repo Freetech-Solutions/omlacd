@@ -6,6 +6,7 @@ localhost ansible_connection=local
 ## WARNING: if you use hostnames you manage the hostname resolve ###
 asterisk_hostname=asterisk
 kamailio_hostname=kamailio
+omnileads_hostname=omnileads
 redis_hostname=redis
 rethinkdb_hostname=rethinkdb
 rtpengine_hostname=rtpengine

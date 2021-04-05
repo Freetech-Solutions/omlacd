@@ -11,7 +11,7 @@ This repository has the code of Asterisk component, configuration used for OMniL
 
 Asterisk image is based on the ACD builder. Is the base that will build all the binaries and libraries of asterisk. To build it:
 ```
-  cd build/docker
+  cd build/docker/acdbuilder
   DOCKER_USER=$USER DOCKER_PASSWORD=$PASSWORD build_images.sh builder
 ```
 Where $USER and $PASSWORD are credentials of docker repository.

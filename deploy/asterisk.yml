@@ -31,6 +31,7 @@
       content: |
         ASTERISK_HOSTNAME={{ asterisk_hostname }}
         KAMAILIO_HOSTNAME={{ kamailio_hostname }}
+        OMNILEADS_HOSTNAME={{ omnileads_hostname }}
         REDIS_HOSTNAME={{ redis_hostname }}
         RETHINKDB_HOSTNAME={{ rethinkdb_hostname }}
         RTPENGINE_HOSTNAME={{ rtpengine_hostname }}
@@ -69,8 +70,7 @@
   - name: Install asterisk-{{ asterisk_version }} package (from s3 source)
     command: yum install -y {{ asterisk_package }}
     tags: postinstall
-    retries: 3
-    delay: 3
-    register: s3_download
-    until: s3_download is success
     when: asterisk_installed.stdout != asterisk_version
+    register: s3_download
+    failed_when:
+      - "s3_download.rc != 0 or 'scriptlet failure' in s3_download.stderr"

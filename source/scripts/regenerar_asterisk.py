@@ -29,19 +29,16 @@ import gc
 import subprocess
 import shlex
 
-logger = logging.getLogger("asyncio")
+ASTERISK_LOCATION = os.environ.get('ASTERISK_LOCATION') or ''
+OML_SERVER = os.environ.get('OMNILEADS_HOSTNAME') or 'localhost'
+WSURL = f'wss://{OML_SERVER}/consumers/stream/asterisk/conf/updater'
+CONF_FILES_PATH = f'{ASTERISK_LOCATION}/etc/asterisk/'
 
-fh = logging.FileHandler('websockets.log')
+logger = logging.getLogger("asyncio")
+fh = logging.FileHandler(f'{ASTERISK_LOCATION}/var/log/asterisk/websockets.log')
 
 logger.addHandler(fh)
 logger.setLevel(logging.INFO)
-
-ASTERISK_LOCATION = os.environ.get('ASTERISK_LOCATION') or ''
-WS_SERVER = os.environ.get('WEBSOCKET_SERVER') or 'websockets'
-WS_PORT = os.environ.get('WEBSOCKET_PORT') or '8000'
-WSURL = f'wss://{WS_SERVER}:{WS_PORT}/consumers/stream/asterisk/conf/updater'
-CONF_FILES_PATH = f'{ASTERISK_LOCATION}/etc/asterisk/'
-
 websocket.enableTrace(False)
 
 

@@ -23,13 +23,14 @@ COPY --from=builder /usr/local/lib/python3.7/ /usr/local/lib/python3.7/
 COPY --from=builder /usr/lib/x86_64-linux-gnu/ /usr/lib/x86_64-linux-gnu/
 
 RUN cp -a /usr/local/lib/python3.7/site-packages/pyst2 /src/ && \
-  mkdir -p /opt/omnileads/virtualenv/bin/ && \
-  ln -s /usr/local/bin/python3 /opt/omnileads/virtualenv/bin/
+  mkdir -p /opt/omnileads/asterisk/virtualenv/bin/ && \
+  ln -s /usr/local/bin/python3 /opt/omnileads/asterisk/virtualenv/bin/
 
 COPY source/astconf/* /etc/asterisk/
 COPY source/agis/* /var/lib/asterisk/agi-bin/
 COPY source/odbc/*.ini /etc/
 COPY source/sounds/* /var/lib/asterisk/sounds/
+COPY source/scripts/* /opt/omnileads/asterisk/virtualenv/
 COPY build/docker/docker-entrypoint.sh /docker-entrypoint.sh
 
 EXPOSE 5038/tcp 7088/tcp 5160-5163/udp 5060/udp
