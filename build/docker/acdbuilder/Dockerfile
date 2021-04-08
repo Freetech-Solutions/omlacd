@@ -4,11 +4,10 @@ ENV LANG en_US.utf8
 ENV NOTVISIBLE "in users profile"
 ENV OPUS_CODEC asterisk-16.0/x86-64/codec_opus-16.0_current-x86_64
 
-COPY build-asterisk.sh .asterisk_version /
+COPY build-asterisk.sh .asterisk_version requirements.txt /
 RUN ASTERISK_VERSION=$(cat .asterisk_version) /build-asterisk.sh
 RUN apt-get install -y odbc-postgresql libgsm1 git curl python3-psycopg2 gnupg \
-    && pip3 install 'redis==3.5.3' \
-         -e git+https://github.com/SrMoreno/pyst2@master#egg=pyst2 \
+    && pip3 install -r /requirements.txt \
     && echo "deb http://packages.irontec.com/debian stretch main" >> /etc/apt/sources.list \
     && wget http://packages.irontec.com/public.key -q -O - | apt-key add - \
     && apt-get update -y \
