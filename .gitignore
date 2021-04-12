@@ -1,6 +1,6 @@
 /blacklist
 /grabaciones
-/asterisk/agi-bin/__pycache__/
+/source/agis/__pycache__/
 /src
 /source/astconf/oml_pjsip_agents.conf
 /source/astconf/oml_pjsip_trunks.conf

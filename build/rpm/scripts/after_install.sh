@@ -41,6 +41,12 @@ echo "Changing permisions of ${ASTERISK_LOCATION}"
 chown -R omnileads. ${ASTERISK_LOCATION}
 rm -rf /etc/logrotate.d/omnileads
 
+cd /usr/lib64/
+echo "Check if libtinfo.so.5 library is created"
+if [ ! -f libtinfo.so.5 ]; then
+  ln -s libtinfo.so.6 libtinfo.so.5
+fi
+
 echo "Restarting and enabling asterisk-reloader"
 systemctl enable asterisk-reloader
 systemctl restart asterisk-reloader

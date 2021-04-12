@@ -88,7 +88,7 @@ EOF
 
 # Setting virtualenv
 echo "Installing the virtualenv"
-python3 -m venv ${VIRTUALENV_LOCATION}/
+python3 -m venv ${VIRTUALENV_LOCATION}
 source ${VIRTUALENV_LOCATION}/bin/activate
 pip3 install setuptools --upgrade
 echo "Installing the requirements packages"
@@ -109,11 +109,10 @@ fpm -s dir -d libxslt -d python3 -d uriparser -d net-tools -t rpm -n asterisk -v
   --after-install build/rpm/scripts/after_install.sh \
   --after-remove build/rpm/scripts/after_remove.sh \
   -f ${ASTERISK_LOCATION} \
-     ${VIRTUALENV_LOCATION}=${VIRTUALENV_LOCATION} \
      build/rpm/asterisk.service=/etc/systemd/system/asterisk.service \
      build/rpm/asterisk-reloader.service=/etc/systemd/system/asterisk-reloader.service \
      source/logrotate/asterisk=/etc/logrotate.d/asterisk \
-     source/odbc/odbc.ini=/etc/odbc.ini \
+     source/odbc/odbc.ini=/etc/odbc.ini
 
 mv asterisk-${PACKAGE_VERSION}* /root
 echo "Uploading RPM to AWS repository"

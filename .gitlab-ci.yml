@@ -14,7 +14,7 @@ build-image:
     DOCKER_TLS_CERTDIR: ""
   image: gitlab/dind
   script:
-    - cd build/docker && bash build_images.sh asterisk
+    - cd build/docker && bash build_image.sh
   only:
     - web
     - /.*release.*$/

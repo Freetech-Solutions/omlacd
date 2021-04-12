@@ -42,11 +42,11 @@ if [ "$1" == "" ]; then
                      /usr/*/asterisk \
                      /etc/asterisk
   echo "**[omlacd] Initializing regenerar_asterisk script"
-  python3 /opt/omnileads/asterisk/virtualenv/regenerar_asterisk.py
+  python3 /opt/omnileads/asterisk/virtualenv/regenerar_asterisk.py &
   echo "**[omlacd] Initializing asterisk"
 else
   echo "**[omlacd] Initializing regenerar_asterisk script"
-  python3 /opt/omnileads/asterisk/virtualenv/regenerar_asterisk.py
+  python3 /opt/omnileads/asterisk/virtualenv/regenerar_asterisk.py &
   echo "**[omlacd] Initializing asterisk"
 fi
 
