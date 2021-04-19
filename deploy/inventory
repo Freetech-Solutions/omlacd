@@ -4,28 +4,25 @@ localhost ansible_connection=local
 [prodenv-aio:vars]
 ## IP or hostnames of services that interact with asterisk       ###
 ## WARNING: if you use hostnames you manage the hostname resolve ###
-asterisk_hostname=asterisk
-kamailio_hostname=kamailio
 omnileads_hostname=omnileads
 redis_hostname=redis
 rethinkdb_hostname=rethinkdb
-rtpengine_hostname=rtpengine
 postgres_hostname=postgres
 postgres_port=5432
+postgres_database=omnileads
 postgres_user=omnileads
 postgres_password=my_very_strong_pass
 
-# asterisk user & group
-runuser=omnileads
-rungroup=omnileads
+#########################################################################################################################################
+# External IP. This parameter will set the public IP for SIP and RTP traffic, on environments where calls go through a firewall. 	#
+# auto = The public IP will be obtained from http://ipinfo.io/ip. It depends on the WAN connection that OML is using to go to Internet. #
+# X.X.X.X = The public IP is set manually.  												#
+#########################################################################################################################################
+extern_ip=auto
 
 # ami credentials
 ami_user=omnileads
 ami_password=C12H17N2O4P_o98o98
-
-# WAV or MP3 Call recordings format
-MONITORFORMAT=mp3
-
 
 ### Don't change these variable ###
 asterisk_out=true

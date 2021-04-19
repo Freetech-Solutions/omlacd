@@ -12,9 +12,9 @@ This repository has the code of Asterisk component, configuration used for OMniL
 Asterisk image is based on the ACD builder. Is the base that will build all the binaries and libraries of asterisk. To build it:
 ```
   cd build/docker/acdbuilder
-  DOCKER_USER=$USER DOCKER_PASSWORD=$PASSWORD build_images.sh builder
+  DOCKER_USER=$USER DOCKER_PASSWORD=$PASSWORD build_images.sh $TAG
 ```
-Where $USER and $PASSWORD are credentials of docker repository.
+Where $USER and $PASSWORD are credentials of docker repository and $TAG is the docker tag you want for the acdbuilder image.
 
 After building this, you can build the omlacd image.
 ```
@@ -36,6 +36,7 @@ If you need to add environment variables and link folders to container, check do
   AMI_USER // user of OMniLeads AMI
   AMI_PASSWORD // password for OMniLeads AMI user
   DOCKER_IP // IP of docker host
+  OMNILEADS_HOSTNAME //hostname of omnileads service
   PGHOST= // host of postgresql
   PGPORT= // port of postgresql
   PGDATABASE // database of postgresql
@@ -64,8 +65,7 @@ Test the RPM build with these steps:
 
 To deploy Asterisk in a dedicated host two main steps are needed:
 
-1. Install OMniLeads in its host, editing the parameter `asterisk_host` with the IP or hostname of the machine where Asterisk will be installed.
-2. Install Asterisk in its host, following these steps:
+1. Install Asterisk in its host, following these steps:
 
 **SO:** Centos7 and derivatives
 
@@ -108,15 +108,20 @@ To deploy Asterisk in a dedicated host two main steps are needed:
   [prodenv-aio:vars]
   ## IP or hostnames of services that interact with asterisk       ###
   ## WARNING: if you use hostnames you manage the hostname resolve ###
-  asterisk_hostname=asterisk
-  kamailio_hostname=kamailio
+  omnileads_hostname=omnileads
   redis_hostname=redis
   rethinkdb_hostname=rethinkdb
-  rtpengine_hostname=rtpengine
   postgres_hostname=postgres
   postgres_port=5432
   postgres_user=omnileads
   postgres_password=my_very_strong_pass
+
+  #########################################################################################################################################
+  # External IP. This parameter will set the public IP for SIP and RTP traffic, on environments where calls go through a firewall. 	#
+  # auto = The public IP will be obtained from http://ipinfo.io/ip. It depends on the WAN connection that OML is using to go to Internet. #
+  # X.X.X.X = The public IP is set manually.  												#
+  #########################################################################################################################################
+  extern_ip=auto
 
   # ami credentials
   ami_user=omnileads
@@ -125,10 +130,14 @@ To deploy Asterisk in a dedicated host two main steps are needed:
 
 * Run ansible-playbook   
 ```
-  ansible-playbook asterisk.yml -i inventory --extra-vars "repo_location=$(pwd)/.. asterisk_version=$(cat ../.package_version)"
+  ansible-playbook asterisk.yml -i inventory --extra-vars "asterisk_version=$(cat ../.package_version)"
 ```
+
+2. Install OMniLeads in its host, editing the parameter `asterisk_host` with the IP or hostname of the machine where Asterisk will be installed.
+
 ---
 **NOTE**
 
-* If asterisk can't access redis and rtpengine services, asterisk service will not start.
+* Is MANDATORY that you use same `ami_user` and `ami_password` for your OMniLeads and Asterisk installations
+* If the PostgeSQL database you are going to use wasn't up and running when you install asterisk, you must to run your database and after that restart asterisk server.
 ---
