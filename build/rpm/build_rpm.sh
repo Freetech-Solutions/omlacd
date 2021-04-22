@@ -102,7 +102,7 @@ cp -a source/sounds/* ${ASTERISK_LOCATION}/var/lib/asterisk/sounds/
 cp -a source/scripts/* ${VIRTUALENV_LOCATION}
 
 echo "Packing the rpm"
-fpm -s dir -d libxslt -d python3 -d uriparser -d net-tools -t rpm -n asterisk -v ${PACKAGE_VERSION} \
+fpm -s dir -d libxslt -d python3 -d uriparser -d net-tools -d unixODBC -t rpm -n asterisk -v ${PACKAGE_VERSION} \
   --rpm-user omnileads \
   --rpm-group omnileads \
   --before-install build/rpm/scripts/before_install.sh \

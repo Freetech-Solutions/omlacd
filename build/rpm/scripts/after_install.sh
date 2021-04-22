@@ -25,11 +25,11 @@ sed -i "0,/external_media_address=.*/s//external_media_address=${EXTERN_IP}/g" $
 sed -i "0,/external_signaling_address=.*/s//external_signaling_address=${EXTERN_IP}/g" ${ASTERISK_LOCATION}/etc/asterisk/oml_pjsip_transports.conf
 
 echo "Writing the odbc.ini file with database variables"
-sed -i "s/Servername.*/Database           = ${PGHOST}/g" /etc/odbc.ini
+sed -i "s/^Servername.*/Servername          = ${PGHOST}/g" /etc/odbc.ini
 sed -i "s/^Database.*/Database            = ${PGDATABASE}/g" /etc/odbc.ini
 sed -i "s/^UserName.*/UserName            = ${PGUSER}/g" /etc/odbc.ini
 sed -i "s/^Password.*/Password            = ${PGPASSWORD}/g" /etc/odbc.ini
-sed -i "s/^Port.*/Port                    = ${PGPORT}/g" /etc/odbc.ini
+sed -i "s/^Port.*/Port                = ${PGPORT}/g" /etc/odbc.ini
 
 echo "Writing oml_res_odbc.conf file"
 sed -i "s/^username.*/username => ${PGUSER}/g" ${ASTERISK_LOCATION}/etc/asterisk/oml_res_odbc.conf
