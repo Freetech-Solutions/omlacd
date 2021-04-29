@@ -28,14 +28,21 @@ import datetime
 import gc
 import subprocess
 import shlex
+import base64
+import tarfile
+import shutil
 
 ASTERISK_LOCATION = os.environ.get('ASTERISK_LOCATION') or ''
 OML_SERVER = os.environ.get('OMNILEADS_HOSTNAME') or 'localhost'
 WSURL = f'wss://{OML_SERVER}/consumers/stream/asterisk/conf/updater'
 CONF_FILES_PATH = f'{ASTERISK_LOCATION}/etc/asterisk/'
+ASTERISK_SOUND_FILES = f'{ASTERISK_LOCATION}/var/lib/asterisk/sounds/'
+CUSTOM_AUDIO_FILES_PATH = f'{ASTERISK_SOUND_FILES}oml/'
+MOH_AUDIO_FILES_PATH = f'{ASTERISK_SOUND_FILES}'
 
 logger = logging.getLogger("asyncio")
-fh = logging.FileHandler(f'{ASTERISK_LOCATION}/var/log/asterisk/websockets.log')
+fh = logging.FileHandler(
+    f'{ASTERISK_LOCATION}/var/log/asterisk/websockets.log')
 
 logger.addHandler(fh)
 logger.setLevel(logging.INFO)
@@ -99,10 +106,20 @@ class RegenerarConfiguracion(object):
         self.logger = logger
 
     def procesa_stream(self, stream_data):
+        # TODO: Refactorizar para dividir responsabilidades
         lista_data = self._json_string_a_lista(stream_data)
         for archivo in lista_data:
-            if self._escribe_archivo_conf(archivo):
-                self._comando_regeneracion_asterisk(archivo['archivo'])
+            if archivo['type'] == 'CONF_FILE':
+                if self._escribe_archivo_conf(archivo):
+                    self._comando_regeneracion_asterisk(archivo['archivo'])
+            elif archivo['type'] == 'AUDIO_CUSTOM' and archivo['action'] == 'COPY':
+                self._escribe_audio_custom(archivo)
+            elif archivo['type'] == 'AUDIO_CUSTOM' and archivo['action'] == 'DELETE':
+                self._delete_audio_custom(archivo)
+            elif archivo['type'] == 'ASTERISK_SOUNDS' and archivo['action'] == 'COPY':
+                self._escribe_asterisk_sounds(archivo)
+            elif archivo['type'] == 'ASTERISK_PLAY_LIST_DIR' and archivo['action'] == 'DELETE':
+                self._delete_playlist_files(archivo)
 
     def _escribe_archivo_conf(self, archivo_info):
         nombre_archivo = archivo_info['archivo']
@@ -115,6 +132,63 @@ class RegenerarConfiguracion(object):
         except Exception as e:
             self.logger.error(f'Error creating file: {nombre_archivo} {e}')
             return False
+
+    def _escribe_audio_custom(self, archivo_info):
+        try:
+            folder, nombre_archivo = os.path.split(archivo_info['archivo'])
+            contenido_encoded = str(archivo_info['content'])
+            contenido_bin = base64.b64decode(contenido_encoded)
+            if folder == "" or folder is None:
+                file_path = f'{CUSTOM_AUDIO_FILES_PATH}'
+            else:
+                file_path = f'{ASTERISK_SOUND_FILES}{folder}/'
+            os.makedirs(file_path, exist_ok=True)
+            f = open(f'{file_path}{nombre_archivo}', 'wb')
+            f.write(contenido_bin)
+            f.close()
+            self.logger.info(f'File: {nombre_archivo} copied')
+        except Exception as e:
+            self.logger.error(f'Error creating file: {nombre_archivo} {e}')
+
+    def _escribe_asterisk_sounds(self, archivo_info):
+        try:
+            nombre_archivo = archivo_info['archivo']
+            contenido_encoded = str(archivo_info['content'])
+            language = archivo_info['language']
+            contenido_bin = base64.b64decode(contenido_encoded)
+            files_path = f'{ASTERISK_SOUND_FILES}{language}'
+            os.makedirs(files_path, exist_ok=True)
+            f = open(f'{files_path}/{nombre_archivo}', 'wb')
+            f.write(contenido_bin)
+            f.close()
+            tar = tarfile.open(f'{files_path}/{nombre_archivo}')
+            tar.extractall(files_path)
+            tar.close()
+            os.remove(f'{files_path}/{nombre_archivo}')
+            self.logger.info(f'Sounds of language : {language} copied')
+        except Exception as e:
+            self.logger.error(f'Error creating language files: {language} {e}')
+
+    def _delete_audio_custom(self, archivo_info):
+        try:
+            folder, nombre_archivo = os.path.split(archivo_info['archivo'])
+            if folder is None:
+                file_path = f'{CUSTOM_AUDIO_FILES_PATH}'
+            else:
+                file_path = f'{ASTERISK_SOUND_FILES}{folder}/'
+            os.remove(f'{file_path}{nombre_archivo}')
+            self.logger.info(f'File: {nombre_archivo} deleted')
+        except Exception as e:
+            self.logger.error(f'Error deleting file: {nombre_archivo} {e}')
+
+    def _delete_playlist_files(self, archivo_info):
+        try:
+            playlist = archivo_info['archivo']
+            playlist_path = f'{MOH_AUDIO_FILES_PATH}{playlist}'
+            shutil.rmtree(playlist_path)
+            self.logger.info(f'Playlist: {playlist} deleted')
+        except Exception as e:
+            self.logger.error(f'Error deleting playlist: {playlist} {e}')
 
     def _comando_regeneracion_asterisk(self, nombre_archivo):
         COMANDOS = {
