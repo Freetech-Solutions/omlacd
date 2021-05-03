@@ -196,7 +196,9 @@ class RegenerarConfiguracion(object):
             'oml_pjsip_trunks.conf': 'asterisk -rx \'module reload res_pjsip.so\'',
             'oml_queues.conf': 'asterisk -rx \'module reload app_queue.so\'',
             'oml_extensions_outr.conf': 'asterisk -rx \'dialplan reload\'',
-            'oml_moh.conf': 'asterisk -rx \'module reload res_musiconhold.so\''
+            'oml_moh.conf': 'asterisk -rx \'module reload res_musiconhold.so\'',
+            'oml_amd.conf': 'asterisk -rx \'module reload app_amd.so\'',
+            'oml_sip_trunks.conf': 'asterisk -rx \'module reload chan_sip.sh\''
         }
         string_command = COMANDOS.get(nombre_archivo, False)
         if string_command:
