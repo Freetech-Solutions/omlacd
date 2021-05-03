@@ -24,6 +24,7 @@
 
 import os
 import sys
+import redis
 from socket import setdefaulttimeout
 
 from asterisk.agi import AGI
@@ -31,11 +32,12 @@ from utiles import write_time_stderr
 
 ASTERISK_LOCATION = os.getenv('ASTERISK_LOCATION')
 BLACKLIST_AGI_LOG = '{0}/var/log/asterisk/blacklist-agi-errors.log'.format(ASTERISK_LOCATION)
+BLACKLIST_ERROR_CODE = 2
 
 if os.path.exists(BLACKLIST_AGI_LOG):
-    append_write = 'a' # append if already exists
+    append_write = 'a'  # append if already exists
 else:
-    append_write = 'w' # make a new file if not
+    append_write = 'w'  # make a new file if not
 
 sys.stderr = open(BLACKLIST_AGI_LOG, append_write)
 
@@ -44,10 +46,18 @@ setdefaulttimeout(20)
 agi = AGI()
 
 phone_number = sys.argv[1]
-black_list_file = '{0}/var/spool/asterisk/blacklist/oml_backlist.txt'.format(ASTERISK_LOCATION)
+black_list_key = 'OML:BLACKLIST'
+redis_connection = redis.Redis(
+    host=os.getenv('REDIS_HOSTNAME'),  # settings.REDIS_HOSTNAME
+    port=6379,  # settings.CONSTANCE_REDIS_CONNECTION['port'],
+    decode_responses=True)
 
-with open(black_list_file, 'r') as f:
-    is_black_listed = int(f.read().find(phone_number) != -1)
+try:
+    is_black_listed = int(redis_connection.sismember(black_list_key, phone_number))
+except redis.exceptions.RedisError as e:
+    write_time_stderr("Error executing redis command SISMEMBER: {0}".format(e))
+    # Si falla el servicio devuelvo codigo de error
+    is_black_listed = BLACKLIST_ERROR_CODE
 
 try:
     agi.set_variable('BLACKLIST', str(is_black_listed))
