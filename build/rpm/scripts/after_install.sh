@@ -35,7 +35,9 @@ echo "Writing oml_res_odbc.conf file"
 sed -i "s/^username.*/username => ${PGUSER}/g" ${ASTERISK_LOCATION}/etc/asterisk/oml_res_odbc.conf
 
 echo "Linking postgresql ODBC library"
+if [ ! -f /usr/lib64/psqlodbcw.so ]; then
 ln -s /usr/pgsql-11/lib/psqlodbcw.so /usr/lib64/psqlodbcw.so
+fi
 
 echo "Changing permisions of ${ASTERISK_LOCATION}"
 chown -R omnileads. ${ASTERISK_LOCATION}
