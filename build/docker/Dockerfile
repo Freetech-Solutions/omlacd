@@ -1,5 +1,5 @@
 # vim:set ft=dockerfile:
-FROM freetechsolutions/omlacd-builder:latest as builder
+FROM freetechsolutions/omlacd-builder:test-rethinkdb as builder
 
 FROM python:3.7-slim as production
 
