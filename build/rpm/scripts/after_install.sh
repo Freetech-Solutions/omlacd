@@ -36,7 +36,7 @@ sed -i "s/^username.*/username => ${PGUSER}/g" ${ASTERISK_LOCATION}/etc/asterisk
 
 echo "Linking postgresql ODBC library"
 if [ ! -f /usr/lib64/psqlodbcw.so ]; then
-ln -s /usr/pgsql-11/lib/psqlodbcw.so /usr/lib64/psqlodbcw.so
+  ln -s /usr/pgsql-11/lib/psqlodbcw.so /usr/lib64/psqlodbcw.so
 fi
 
 echo "Changing permisions of ${ASTERISK_LOCATION}"
