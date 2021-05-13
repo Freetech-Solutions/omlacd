@@ -21,8 +21,8 @@ sed -i "s/amiuser/${AMI_USER}/g" ${ASTERISK_LOCATION}/etc/asterisk/oml_manager.c
 sed -i "s/amipassword/${AMI_PASSWORD}/g" ${ASTERISK_LOCATION}/etc/asterisk/oml_manager.conf
 
 echo "Writting the IP in pjsip files"
-sed -i "0,/external_media_address=.*/s//external_media_address=${EXTERN_IP}/g" ${ASTERISK_LOCATION}/etc/asterisk/oml_pjsip_transports.conf
-sed -i "0,/external_signaling_address=.*/s//external_signaling_address=${EXTERN_IP}/g" ${ASTERISK_LOCATION}/etc/asterisk/oml_pjsip_transports.conf
+sed -i "s/external_media_address=extern_ip_nat/external_media_address=${EXTERN_IP}/g" ${ASTERISK_LOCATION}/etc/asterisk/oml_pjsip_transports.conf
+sed -i "s/external_signaling_address=extern_ip_nat/external_media_address=${EXTERN_IP}/g" ${ASTERISK_LOCATION}/etc/asterisk/oml_pjsip_transports.conf
 
 echo "Writing the odbc.ini file with database variables"
 sed -i "s/^Servername.*/Servername          = ${PGHOST}/g" /etc/odbc.ini
