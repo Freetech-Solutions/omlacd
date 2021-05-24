@@ -2,7 +2,7 @@
 
 SRC=/usr/src
 COMPONENT_REPO=https://gitlab.com/omnileads/omlacd.git
-COMPONENT_RELEASE=develop
+COMPONENT_RELEASE=${omlacd_version}
 
 # You have to set this temporal ENVVARS before RUN this script
 REDIS_HOST=${}
