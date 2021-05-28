@@ -10,4 +10,5 @@
 source/astconf/oml_sip_registrations.conf
 source/astconf/oml_sip_trunks.conf
 source/astconf/websockets.log
-source/sounds/
+deploy/first_boot_installer.sh
+
