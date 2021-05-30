@@ -9,7 +9,6 @@ REDIS_HOST=${}
 POSTGRESQL_HOST=${}
 POSTGRESQL_PORT=5432
 KAMAILIO_HOST=${}
-RTPENGINE_HOST=${}
 POSTGRESQL_DB=${}
 POSTGRESQL_OMLUSER=${}
 POSTGRESQL_OMLPASS=${}
@@ -49,7 +48,6 @@ echo "******************************************* config and install ***********
 sed -i "s/asterisk_hostname=asterisk/asterisk_hostname=$PRIVATE_IV4/g" ./inventory
 sed -i "s/kamailio_hostname=kamailio/kamailio_hostname=$KAMAILIO_HOST/g" ./inventory
 sed -i "s/redis_hostname=redis/redis_hostname=$REDIS_HOST/g" ./inventory
-sed -i "s/rtpengine_hostname=rtpengine/rtpengine_hostname=$RTPENGINE_HOST/g" ./inventory
 sed -i "s/postgres_hostname=postgres/postgres_hostname=$POSTGRESQL_HOST/g" ./inventory
 sed -i "s/postgres_port=5432/postgres_port=$POSTGRESQL_PORT/g" ./inventory
 sed -i "s/postgres_database=omnileads/postgres_database=$POSTGRESQL_DB/g" ./inventory
@@ -60,8 +58,8 @@ sed -i "s/ami_password=C12H17N2O4P_o98o98/ami_password=$OMLAPP_AMI_PASS/g" ./inv
 
 ansible-playbook asterisk.yml -i inventory --extra-vars "asterisk_version=$(cat ../.package_version)"
 
-echo "******************** Restart rtpengine ***************************"
-echo "******************** Restart rtpengine ***************************"
+echo "******************** Restart asterisk ***************************"
+echo "******************** Restart asterisk ***************************"
 systemctl start asterisk
 
 echo "********************************** sngrep SIP sniffer install *********************************"
