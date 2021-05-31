@@ -11,4 +11,4 @@ source/astconf/oml_sip_registrations.conf
 source/astconf/oml_sip_trunks.conf
 source/astconf/websockets.log
 deploy/first_boot_installer.sh
-
+build/rpm/.env
