@@ -120,3 +120,55 @@
     register: s3_download
     failed_when:
       - "s3_download.rc != 0 or 'scriptlet failure' in s3_download.stderr"
+  
+  # Creo archivos custom & override en fresh-install
+  - name: Create _custom & _override astconf files
+    file: 
+      path: "{{ asterisk_location }}/etc/asterisk/{{ item }}"
+      state: touch
+      mode: 0664
+      owner: omnileads
+    with_items:
+    - oml_amd_custom.conf
+    - oml_dahdi_custom.conf
+    - oml_extensions_bridgecall_custom.conf
+    - oml_extensions_commonsub_custom.conf
+    - oml_extensions_custom.conf
+    - oml_extensions_globals_custom.conf
+    - oml_extensions_inr_custom.conf
+    - oml_extensions_ivr_custom.conf
+    - oml_extensions_modules_custom.conf
+    - oml_extensions_outr_custom.conf
+    - oml_extensions_postcall_custom.conf
+    - oml_extensions_precall_custom.conf
+    - oml_extensions_tc_custom.conf
+    - oml_func_odbc_custom.conf
+    - oml_http_custom.conf
+    - oml_manager_custom.conf
+    - oml_pjsip_custom.conf
+    - oml_pjsip_wizard_custom.conf
+    - oml_queues_custom.conf
+    - oml_res_odbc_custom.conf
+    - oml_sip_general_custom.conf
+    - oml_sip_registrations_custom.conf
+    - oml_sip_trunks_custom.conf
+    - oml_amd_override.conf
+    - oml_dahdi_override.conf
+    - oml_extensions_bridgecall_override.conf
+    - oml_extensions_commonsub_override.conf
+    - oml_extensions_globals_override.conf
+    - oml_extensions_modules_override.conf
+    - oml_extensions_outr_override.conf
+    - oml_extensions_override.conf
+    - oml_extensions_postcall_override.conf
+    - oml_extensions_precall_override.conf
+    - oml_func_odbc_override.conf
+    - oml_http_override.conf
+    - oml_manager_override.conf
+    - oml_pjsip_override.conf
+    - oml_pjsip_wizard_override.conf
+    - oml_queues_override.conf
+    - oml_res_odbc_override.conf
+    - oml_sip_general_override.conf
+    - oml_sip_registrations_override.conf
+    - oml_sip_trunks_override.conf
