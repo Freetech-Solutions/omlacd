@@ -172,3 +172,6 @@
     - oml_sip_general_override.conf
     - oml_sip_registrations_override.conf
     - oml_sip_trunks_override.conf
+    - oml_voicemail_custom.conf
+    - oml_voicemail_override.conf
+  
