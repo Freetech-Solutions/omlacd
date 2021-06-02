@@ -4,7 +4,7 @@ set -e
 ASTERISK_LOCATION="/opt/omnileads/asterisk"
 ASTERISK_LOCATION_SED="\/opt\/omnileads\/asterisk"
 ASTERISK_AUDIO_PROMPTS=https://downloads.asterisk.org/pub/telephony/sounds/asterisk-core-sounds-en-g722-current.tar.gz
-ASTERISK_AUDIO_PROMPTS_EXTRAS=https://downloads.asterisk.org/pub/telephony/sounds/asterisk-extra-sounds-en-g722-current.tar.gz
+OMNILEADS_AUDIO_PROMPTS=
 
 if [ ! -f /usr/sbin/asterisk ]; then
   echo "Linking asterisk binary asterisk to /usr/sbin"
@@ -53,7 +53,7 @@ fi
 if [ ! -d $ASTERISK_LOCATION/var/lib/asterisk/sounds/oml ]; then
   cd /usr/src
   echo "Download OMniLeads sounds"
-  wget $ASTERISK_AUDIO_PROMPTS
+  wget $OMNILEADS_AUDIO_PROMPTS
   tar xzvf asterisk-oml-sounds-current.tar.gz -C $ASTERISK_LOCATION/var/lib/asterisk/sounds/
   rm -f asterisk-oml-sounds-current.tar.gz
 fi
