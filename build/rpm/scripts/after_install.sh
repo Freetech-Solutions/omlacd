@@ -4,7 +4,7 @@ set -e
 ASTERISK_LOCATION="/opt/omnileads/asterisk"
 ASTERISK_LOCATION_SED="\/opt\/omnileads\/asterisk"
 ASTERISK_AUDIO_PROMPTS=https://downloads.asterisk.org/pub/telephony/sounds/asterisk-core-sounds-en-g722-current.tar.gz
-OMNILEADS_AUDIO_PROMPTS=
+OMNILEADS_AUDIO_PROMPTS=https://fts-public-packages.s3-sa-east-1.amazonaws.com/asterisk/asterisk-oml-sounds-current.tar.gz
 
 if [ ! -f /usr/sbin/asterisk ]; then
   echo "Linking asterisk binary asterisk to /usr/sbin"
