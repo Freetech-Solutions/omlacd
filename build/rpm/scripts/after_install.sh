@@ -3,6 +3,8 @@ set -e
 # Script that runs after asterisk install
 ASTERISK_LOCATION="/opt/omnileads/asterisk"
 ASTERISK_LOCATION_SED="\/opt\/omnileads\/asterisk"
+ASTERISK_AUDIO_PROMPTS=https://downloads.asterisk.org/pub/telephony/sounds/asterisk-core-sounds-en-g722-current.tar.gz
+ASTERISK_AUDIO_PROMPTS_EXTRAS=https://downloads.asterisk.org/pub/telephony/sounds/asterisk-extra-sounds-en-g722-current.tar.gz
 
 if [ ! -f /usr/sbin/asterisk ]; then
   echo "Linking asterisk binary asterisk to /usr/sbin"
@@ -37,6 +39,23 @@ sed -i "s/^username.*/username => ${PGUSER}/g" ${ASTERISK_LOCATION}/etc/asterisk
 echo "Linking postgresql ODBC library"
 if [ ! -f /usr/lib64/psqlodbcw.so ]; then
   ln -s /usr/pgsql-11/lib/psqlodbcw.so /usr/lib64/psqlodbcw.so
+fi
+
+if [ ! -d $ASTERISK_LOCATION/var/lib/asterisk/sounds/en ]; then
+  cd /usr/src
+  echo "Download en Asterisk sounds"
+  wget $ASTERISK_AUDIO_PROMPTS
+  mkdir $ASTERISK_LOCATION/var/lib/asterisk/sounds/en
+  tar xzvf asterisk-core-sounds-en-g722-current.tar.gz -C $ASTERISK_LOCATION/var/lib/asterisk/sounds/en
+  rm -f asterisk-core-sounds-en-g722-current.tar.gz
+fi
+
+if [ ! -d $ASTERISK_LOCATION/var/lib/asterisk/sounds/oml ]; then
+  cd /usr/src
+  echo "Download OMniLeads sounds"
+  wget $ASTERISK_AUDIO_PROMPTS
+  tar xzvf asterisk-oml-sounds-current.tar.gz -C $ASTERISK_LOCATION/var/lib/asterisk/sounds/
+  rm -f asterisk-oml-sounds-current.tar.gz
 fi
 
 echo "Changing permisions of ${ASTERISK_LOCATION}"
