@@ -95,14 +95,13 @@ echo "Installing the requirements packages"
 pip3 install wheel
 pip3 install -r build/docker/acdbuilder/requirements.txt --exists-action 'w'
 
-echo "Adding conf, agis, logrotate and sounds omnileads"
+echo "Adding conf, agis, logrotate and legacy scripts omnileads"
 cp -a source/astconf/* ${ASTERISK_LOCATION}/etc/asterisk/
 cp -a source/agis/* ${ASTERISK_LOCATION}/var/lib/asterisk/agi-bin/
-cp -a source/sounds/* ${ASTERISK_LOCATION}/var/lib/asterisk/sounds/
 cp -a source/scripts/* ${VIRTUALENV_LOCATION}
 
 echo "Packing the rpm"
-fpm -s dir -d libxslt -d python3 -d uriparser -d net-tools -d unixODBC -t rpm -n asterisk -v ${PACKAGE_VERSION} \
+fpm -s dir -d libxslt -d python3 -d uriparser -d net-tools -d unixODBC -d wget -t rpm -n asterisk -v ${PACKAGE_VERSION} \
   --rpm-user omnileads \
   --rpm-group omnileads \
   --before-install build/rpm/scripts/before_install.sh \
