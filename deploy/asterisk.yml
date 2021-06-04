@@ -154,6 +154,7 @@
     - oml_sip_trunks_custom.conf
     - oml_amd_override.conf
     - oml_dahdi_override.conf
+    - oml_extensions_override.conf
     - oml_extensions_bridgecall_override.conf
     - oml_extensions_commonsub_override.conf
     - oml_extensions_globals_override.conf
