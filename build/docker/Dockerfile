@@ -1,11 +1,11 @@
 # vim:set ft=dockerfile:
-FROM freetechsolutions/omlacd-builder:test-rethinkdb as builder
+FROM freetechsolutions/omlacd-builder:latest as builder
 
 FROM python:3.7-slim as production
 
 RUN mkdir /src \
     && apt-get update -qq \
-    && apt-get install -y libbinutils libedit2 libncursesw5 \
+    && apt-get install -y libbinutils libedit2 libncursesw5 wget\
     && apt autoremove -y
 
 # Todos los paquetes de asterisk
@@ -29,7 +29,6 @@ RUN cp -a /usr/local/lib/python3.7/site-packages/pyst2 /src/ && \
 COPY source/astconf/* /etc/asterisk/
 COPY source/agis/* /var/lib/asterisk/agi-bin/
 COPY source/odbc/*.ini /etc/
-COPY source/sounds/* /var/lib/asterisk/sounds/
 COPY source/scripts/ /opt/omnileads/asterisk/virtualenv/scripts/
 COPY build/docker/docker-entrypoint.sh /docker-entrypoint.sh
 

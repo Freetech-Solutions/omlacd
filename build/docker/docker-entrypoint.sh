@@ -2,6 +2,8 @@
 
 # run as user asterisk by default
 ASTERISK_USER=${ASTERISK_USER:-asterisk}
+ASTERISK_AUDIO_PROMPTS=https://downloads.asterisk.org/pub/telephony/sounds/asterisk-core-sounds-en-g722-current.tar.gz
+OMNILEADS_AUDIO_PROMPTS=https://fts-public-packages.s3-sa-east-1.amazonaws.com/asterisk/asterisk-oml-sounds-current.tar.gz
 PUBLIC_IP=$(curl http://ipinfo.io/ip)
 
 set -ex
@@ -38,6 +40,67 @@ if [ "$1" == "" ]; then
   else
     /usr/sbin/adduser --gecos "" --no-create-home --uid 1000 --disabled-password ${ASTERISK_USER} || exit
   fi
+
+  touch oml_amd_custom.conf
+  touch oml_dahdi_custom.conf
+  touch oml_extensions_bridgecall_custom.conf
+  touch oml_extensions_commonsub_custom.conf
+  touch oml_extensions_custom.conf
+  touch oml_extensions_globals_custom.conf
+  touch oml_extensions_inr_custom.conf
+  touch oml_extensions_ivr_custom.conf
+  touch oml_extensions_modules_custom.conf
+  touch oml_extensions_outr_custom.conf
+  touch oml_extensions_postcall_custom.conf
+  touch oml_extensions_precall_custom.conf
+  touch oml_extensions_tc_custom.conf
+  touch oml_func_odbc_custom.conf
+  touch oml_http_custom.conf
+  touch oml_manager_custom.conf
+  touch oml_pjsip_custom.conf
+  touch oml_pjsip_wizard_custom.conf
+  touch oml_queues_custom.conf
+  touch oml_res_odbc_custom.conf
+  touch oml_sip_general_custom.conf
+  touch oml_sip_registrations_custom.conf
+  touch oml_sip_trunks_custom.conf
+  touch oml_amd_override.conf
+  touch oml_dahdi_override.conf
+  touch oml_extensions_override.conf
+  touch oml_extensions_bridgecall_override.conf
+  touch oml_extensions_commonsub_override.conf
+  touch oml_extensions_globals_override.conf
+  touch oml_extensions_modules_override.conf
+  touch oml_extensions_outr_override.conf
+  touch oml_extensions_override.conf
+  touch oml_extensions_postcall_override.conf
+  touch oml_extensions_precall_override.conf
+  touch oml_func_odbc_override.conf
+  touch oml_http_override.conf
+  touch oml_manager_override.conf
+  touch oml_pjsip_override.conf
+  touch oml_pjsip_wizard_override.conf
+  touch oml_queues_override.conf
+  touch oml_res_odbc_override.conf
+  touch oml_sip_general_override.conf
+  touch oml_sip_registrations_override.conf
+  touch oml_sip_trunks_override.conf
+  touch oml_voicemail_custom.conf
+  touch oml_voicemail_override.conf
+
+  cd /usr/src
+  echo "Download en Asterisk sounds"
+  wget $ASTERISK_AUDIO_PROMPTS
+  mkdir -p /var/lib/asterisk/sounds/en
+  tar xzvf asterisk-core-sounds-en-g722-current.tar.gz -C /var/lib/asterisk/sounds/en
+  rm -f asterisk-core-sounds-en-g722-current.tar.gz
+
+  cd /usr/src
+  echo "Download OMniLeads sounds"
+  wget $OMNILEADS_AUDIO_PROMPTS
+  tar xzvf asterisk-oml-sounds-current.tar.gz -C /var/lib/asterisk/sounds/
+  rm -f asterisk-oml-sounds-current.tar.gz
+
   chown -R 1000:1000 /var/*/asterisk \
                      /usr/*/asterisk \
                      /etc/asterisk
