@@ -6,7 +6,6 @@ localhost ansible_connection=local
 ## WARNING: if you use hostnames you manage the hostname resolve ###
 omnileads_hostname=omnileads
 redis_hostname=redis
-rethinkdb_hostname=rethinkdb
 postgres_hostname=postgres
 postgres_port=5432
 postgres_database=omnileads
