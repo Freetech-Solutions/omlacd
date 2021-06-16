@@ -68,7 +68,6 @@
         {% endif %}
         OMNILEADS_HOSTNAME={{ omnileads_hostname }}
         REDIS_HOSTNAME={{ redis_hostname }}
-        RETHINKDB_HOSTNAME={{ rethinkdb_hostname }}
         PGHOST={{ postgres_hostname }}
         PGPORT={{ postgres_port }}
         PGUSER={{ postgres_user }}
