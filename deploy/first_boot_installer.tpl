@@ -34,7 +34,7 @@ if [[ $CALLREC_DEVICE_TYPE == "s3" ]]; then
   S3_ACCESS_KEY=${s3_access_key}
   S3_SECRET_KEY=${s3_secret_key} 
   S3URL=${s3url}
-  S3_BUCKET_NAME=${s3_bucket_name}
+  BUCKET_NAME=${s3_bucket_name}
 fi
 
 echo "************************ disable SElinux *************************"
