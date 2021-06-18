@@ -18,6 +18,7 @@ POSTGRESQL_PORT=${postgres_port}
 POSTGRESQL_DB=${postgres_database}
 POSTGRESQL_OMLUSER=${postgres_user}
 POSTGRESQL_OMLPASS=${postgres_password}
+PGSQL_CLOUD=${pgsql_cloud}
 # AMI conection from omlapp
 OMLAPP_AMI_USER=${ami_user}
 OMLAPP_AMI_PASS=${ami_password}
@@ -33,34 +34,8 @@ if [[ $CALLREC_DEVICE_TYPE == "s3" ]]; then
   S3_ACCESS_KEY=${s3_access_key}
   S3_SECRET_KEY=${s3_secret_key} 
   S3URL=${s3url}
-  S3_BUCKET_NAME${s3_bucket_name}
+  S3_BUCKET_NAME=${s3_bucket_name}
 fi
-
-echo "************************ block_device mount *************************"
-echo "************************ block_device mount *************************"
- 
-case $CALLREC_DEVICE_TYPE in
-  s3)
-    echo "s3 callrec device \n"
-    yum install -y epel-release && yum install -y s3fs-fuse
-    echo "$S3_ACCESS_KEY:$S3_SECRET_KEY" > ~/.passwd-s3fs
-    chmod 600 ~/.passwd-s3fs
-    if [ ! -d $CALLREC_DIR_DST ]; then 
-      mkdir -p $CALLREC_DIR_DST
-    fi  
-    echo "$BUCKET_NAME:/$TENANT_NAME $CALLREC_DIR_DST fuse.s3fs _netdev,allow_other,use_path_request_style,url=$S3URL 0 0" >> /etc/fstab
-    mount -a
-    ;;
-  nfs)
-    echo "NFS callrec device \n"
-    mkdir -p $CALLREC_DIR_DST
-    echo "$NFS_NETADDR:$CALLREC_DIR_TPM $CALLREC_DIR_DST nfs auto,nofail,noatime,nolock,intr,tcp,actimeo=1800 0 0" >> /etc/fstab
-    mount -a
-    ;;
-  *)
-    echo "callrec on local filesystem \n"
-    ;;
- esac
 
 echo "************************ disable SElinux *************************"
 echo "************************ disable SElinux *************************"
@@ -104,6 +79,43 @@ sed -i "s/ami_password=C12H17N2O4P_o98o98/ami_password=$OMLAPP_AMI_PASS/g" ./inv
 
 ansible-playbook asterisk.yml -i inventory --extra-vars "asterisk_version=$(cat ../.package_version)"
 
+echo "************************ check if set SSLmode for PGSQL *************************"
+echo "************************ check if set SSLmode for PGSQL *************************"
+
+if [[ "$PGSQL_CLOUD"  == "true" ]]; then
+  echo "digitalocean requiere SSL to connect PGSQL"
+  echo "SSLMode       = require" >> /etc/odbc.ini
+fi
+
+echo "************************ block_device mount *************************"
+echo "************************ block_device mount *************************"
+ 
+case $CALLREC_DEVICE_TYPE in
+  s3)
+    echo "s3 callrec device \n"
+    yum install -y epel-release && yum install -y s3fs-fuse
+    echo "$S3_ACCESS_KEY:$S3_SECRET_KEY" > ~/.passwd-s3fs
+    chmod 600 ~/.passwd-s3fs
+       if [ ! -d $CALLREC_DIR_DST ]; then 
+      mkdir -p $CALLREC_DIR_DST
+      chown -R omnileads. $CALLREC_DIR_DST
+    fi  
+    echo "$BUCKET_NAME:/$TENANT_NAME $CALLREC_DIR_DST fuse.s3fs _netdev,allow_other,use_path_request_style,url=$S3URL 0 0" >> /etc/fstab
+    mount -a
+    ;;
+  nfs)
+    echo "NFS callrec device \n"
+        if [ ! -d $CALLREC_DIR_DST ]; then 
+      mkdir -p $CALLREC_DIR_DST
+      chown -R omnileads. $CALLREC_DIR_DST
+    fi  
+    echo "$NFS_NETADDR:$CALLREC_DIR_TPM $CALLREC_DIR_DST nfs auto,nofail,noatime,nolock,intr,tcp,actimeo=1800 0 0" >> /etc/fstab
+    mount -a
+    ;;
+  *)
+    echo "callrec on local filesystem \n"
+    ;;
+ esac
 
 echo "**************************** write callrec files move script ******************************"
 echo "**************************** write callrec files move script ******************************"
@@ -144,9 +156,9 @@ EOF
 
 echo "******************** Restart asterisk ***************************"
 echo "******************** Restart asterisk ***************************"
-systemctl start asterisk
 chown -R omnileads. /opt/omnileads/asterisk 
-chown -R omnileads.omnileads /opt/callrec
+chown -R omnileads. /opt/callrec
+systemctl start asterisk
 
 echo "********************************** sngrep SIP sniffer install *********************************"
 echo "********************************** sngrep SIP sniffer install *********************************"
