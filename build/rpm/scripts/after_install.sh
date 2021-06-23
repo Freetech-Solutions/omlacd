@@ -68,6 +68,11 @@ if [ ! -f libtinfo.so.5 ]; then
   ln -s libtinfo.so.6 libtinfo.so.5
 fi
 
+echo "edit logger.conf based on PGSQL run isolete"
+if [[ $PGHOST != "localhost" ]]; then
+  sed -i "s/^;queue_log_realtime_use_gmt=yes/queue_log_realtime_use_gmt=yes/g" ${ASTERISK_LOCATION}/etc/asterisk/logger.conf
+fi
+
 echo "Restarting and enabling asterisk-reloader"
 systemctl enable asterisk-reloader
 systemctl restart asterisk-reloader

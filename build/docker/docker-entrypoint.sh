@@ -23,6 +23,9 @@ if [ "$1" == "" ]; then
   sed -i "0,/external_media_address=.*/! s/external_media_address=.*/external_media_address=${DOCKER_IP}/" /etc/asterisk/oml_pjsip_transports.conf
   sed -i "0,/external_signaling_address=.*/! s/external_signaling_address=.*/external_signaling_address=${DOCKER_IP}/" /etc/asterisk/oml_pjsip_transports.conf
 
+  sed -i "s/^;queue_log_realtime_use_gmt=yes/queue_log_realtime_use_gmt=yes/g" /etc/asterisk/logger.conf
+
+
   echo "**[omlacd] Writing the odbc.ini file with database variables"
   sed -i "s/Servername.*/Servername         = ${PGHOST}/g" /etc/odbc.ini
   sed -i "s/^Database.*/Database            = ${PGDATABASE}/g" /etc/odbc.ini
