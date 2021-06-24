@@ -2,7 +2,7 @@
 
 # run as user asterisk by default
 ASTERISK_USER=${ASTERISK_USER:-asterisk}
-ASTERISK_AUDIO_PROMPTS=https://downloads.asterisk.org/pub/telephony/sounds/asterisk-core-sounds-en-g722-current.tar.gz
+ASTERISK_AUDIO_PROMPTS=https://downloads.asterisk.org/pub/telephony/sounds/asterisk-core-sounds-en-alaw-current.tar.gz
 OMNILEADS_AUDIO_PROMPTS=https://fts-public-packages.s3-sa-east-1.amazonaws.com/asterisk/asterisk-oml-sounds-current.tar.gz
 PUBLIC_IP=$(curl http://ipinfo.io/ip)
 
@@ -95,8 +95,8 @@ if [ "$1" == "" ]; then
   echo "Download en Asterisk sounds"
   wget $ASTERISK_AUDIO_PROMPTS
   mkdir -p /var/lib/asterisk/sounds/en
-  tar xzvf asterisk-core-sounds-en-g722-current.tar.gz -C /var/lib/asterisk/sounds/en
-  rm -f asterisk-core-sounds-en-g722-current.tar.gz
+  tar xzvf asterisk-core-sounds-en-alaw-current.tar.gz -C /var/lib/asterisk/sounds/en
+  rm -f asterisk-core-sounds-en-alaw-current.tar.gz
 
   cd /usr/src
   echo "Download OMniLeads sounds"

@@ -3,7 +3,7 @@ set -e
 # Script that runs after asterisk install
 ASTERISK_LOCATION="/opt/omnileads/asterisk"
 ASTERISK_LOCATION_SED="\/opt\/omnileads\/asterisk"
-ASTERISK_AUDIO_PROMPTS=https://downloads.asterisk.org/pub/telephony/sounds/asterisk-core-sounds-en-gsm-current.tar.gz
+ASTERISK_AUDIO_PROMPTS=https://downloads.asterisk.org/pub/telephony/sounds/asterisk-core-sounds-en-alaw-current.tar.gz
 OMNILEADS_AUDIO_PROMPTS=https://fts-public-packages.s3-sa-east-1.amazonaws.com/asterisk/asterisk-oml-sounds-current.tar.gz
 
 if [ ! -f /usr/sbin/asterisk ]; then
@@ -46,8 +46,8 @@ if [ ! -d $ASTERISK_LOCATION/var/lib/asterisk/sounds/en ]; then
   echo "Download en Asterisk sounds"
   wget $ASTERISK_AUDIO_PROMPTS
   mkdir $ASTERISK_LOCATION/var/lib/asterisk/sounds/en
-  tar xzvf asterisk-core-sounds-en-gsm-current.tar.gz -C $ASTERISK_LOCATION/var/lib/asterisk/sounds/en
-  rm -f asterisk-core-sounds-en-gsm-current.tar.gz
+  tar xzvf asterisk-core-sounds-en-alaw-current.tar.gz -C $ASTERISK_LOCATION/var/lib/asterisk/sounds/en
+  rm -f asterisk-core-sounds-en-alaw-current.tar.gz
 fi
 
 if [ ! -d $ASTERISK_LOCATION/var/lib/asterisk/sounds/oml ]; then
