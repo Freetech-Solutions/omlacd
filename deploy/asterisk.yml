@@ -1,0 +1,177 @@
+# Copyright (C) 2018 Freetech Solutions
+
+# This file is part of OMniLeads
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see http://www.gnu.org/licenses/.
+#
+---
+
+- name: Asterisk installation and configuration
+  hosts: prodenv-aio
+  vars:
+    cron_location: /var/spool/cron/omnileads
+    packages_url: https://fts-public-packages.s3.amazonaws.com
+    asterisk_package: "{{ packages_url }}/asterisk/asterisk-{{ asterisk_version }}.x86_64.rpm"
+    asterisk_location: /opt/omnileads/asterisk
+    postgresql_version: 11
+
+  tasks:
+
+  # Obtengo IP publica del nodo
+  - name: Get public IP address of node
+    shell: curl http://ipinfo.io/ip
+    register: publicip
+    when: extern_ip == "auto" and asterisk_out is defined
+
+  # Valido si lo que devolvió la tarea anterior es una IP
+  - name: Validate IP public obtained
+    shell: if [[ {{ publicip.stdout }} =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then echo 0; else echo 1; fi
+    args:
+      executable: /bin/bash
+    register: ip_val
+    failed_when: false
+    when: extern_ip == "auto" and asterisk_out is defined
+    tags: always
+
+  # Si no es una IP tiro este mensaje de error
+  - fail:
+      msg: "The public IP obtained is wrong, check in shell if you obtain a public IP with this command 'curl http://ipinfo.io/ip', after that please run the script again"
+    when: ip_val is not skipped and ip_val.stdout != '0'
+    tags: always
+
+  - name: Setting public_ip variable
+    set_fact: public_ip="{{ publicip.stdout }}"
+    when: extern_ip == "auto" and asterisk_out is defined
+
+  - name: Set of environments variables
+    copy:
+      dest: "/etc/profile.d/omnileads_envars.sh"
+      content: |
+        ASTERISK_LOCATION={{ asterisk_location }}
+        AMI_USER={{ ami_user }}
+        AMI_PASSWORD={{ ami_password }}
+        {% if extern_ip == "auto" %}
+        EXTERN_IP={{ public_ip }}
+        {% else %}
+        EXTERN_IP={{ extern_ip }}
+        {% endif %}
+        OMNILEADS_HOSTNAME={{ omnileads_hostname }}
+        REDIS_HOSTNAME={{ redis_hostname }}
+        PGHOST={{ postgres_hostname }}
+        PGPORT={{ postgres_port }}
+        PGUSER={{ postgres_user }}
+        PGDATABASE={{ postgres_database }}
+        PGPASSWORD={{ postgres_password }}
+
+        export AMI_USER AMI_PASSWORD ASTERISK_LOCATION EXTERN_IP REDIS_HOSTNAME RETHINKDB_HOSTNAME PGHOST PGPORT PGDATABASE PGUSER  PGPASSWORD OMNILEADS_HOSTNAME
+    when: asterisk_out is defined
+
+  - name: Install postgresql {{ postgresql_version }} packages (from s3 source)
+    yum: name={{ packages_url }}/postgresql/postgresql{{ postgresql_version}}{{ item }}.rpm state=latest update_cache=yes
+    with_items:
+      - -libs.x86_64
+      - -odbc.x86_64
+    retries: 3
+    delay: 3
+    register: s3_download
+    until: s3_download is success
+    when: asterisk_out is defined
+
+  # Chequeo si la version de asterisk instalada es {{ asterisk_version }}
+  - name: Check if asterisk OMniLeads package {{ asterisk_version }} is installed
+    shell: yum list installed |grep asterisk | awk -F " " '{print $2}' |awk -F "-" '{print $1}'
+    register: asterisk_installed
+    changed_when: false
+    tags: postinstall
+
+  # Se imprime que el asterisk OMniLeads configuration no esta instalado si la version actual es inferior a la requerida
+  - debug: msg="Asterisk {{ asterisk_version }} is not installed, proceeding to install"
+    when: asterisk_installed.stdout != asterisk_version
+    tags: postinstall
+
+  # Por lo contrario se imprime que ya está instalada la version mas actual
+  - debug: msg="Asterisk is already installed in version {{ asterisk_version }}, skipping installation steps"
+    when: asterisk_installed.stdout == asterisk_version
+    tags: postinstall
+
+  # Esta tarea es para eliminar paquete viejo
+  - name: Delete old asterisk OMniLeads package
+    yum: name=omnileads-asterisk state=absent
+    tags: postinstall
+    when: asterisk_installed.stdout != asterisk_version
+
+  # Se instala el paquete asterisk
+  - name: Install asterisk-{{ asterisk_version }} package (from s3 source)
+    command: yum install -y {{ asterisk_package }}
+    tags: postinstall
+    when: asterisk_installed.stdout != asterisk_version
+    register: s3_download
+    failed_when:
+      - "s3_download.rc != 0 or 'scriptlet failure' in s3_download.stderr"
+  
+  # Creo archivos custom & override en fresh-install
+  - name: Create _custom & _override astconf files
+    file: 
+      path: "{{ asterisk_location }}/etc/asterisk/{{ item }}"
+      state: touch
+      mode: 0664
+      owner: omnileads
+    with_items:
+    - oml_amd_custom.conf
+    - oml_dahdi_custom.conf
+    - oml_extensions_bridgecall_custom.conf
+    - oml_extensions_commonsub_custom.conf
+    - oml_extensions_custom.conf
+    - oml_extensions_globals_custom.conf
+    - oml_extensions_inr_custom.conf
+    - oml_extensions_ivr_custom.conf
+    - oml_extensions_modules_custom.conf
+    - oml_extensions_outr_custom.conf
+    - oml_extensions_postcall_custom.conf
+    - oml_extensions_precall_custom.conf
+    - oml_extensions_tc_custom.conf
+    - oml_func_odbc_custom.conf
+    - oml_http_custom.conf
+    - oml_manager_custom.conf
+    - oml_pjsip_custom.conf
+    - oml_pjsip_wizard_custom.conf
+    - oml_queues_custom.conf
+    - oml_res_odbc_custom.conf
+    - oml_sip_general_custom.conf
+    - oml_sip_registrations_custom.conf
+    - oml_sip_trunks_custom.conf
+    - oml_amd_override.conf
+    - oml_dahdi_override.conf
+    - oml_extensions_override.conf
+    - oml_extensions_bridgecall_override.conf
+    - oml_extensions_commonsub_override.conf
+    - oml_extensions_globals_override.conf
+    - oml_extensions_modules_override.conf
+    - oml_extensions_outr_override.conf
+    - oml_extensions_override.conf
+    - oml_extensions_postcall_override.conf
+    - oml_extensions_precall_override.conf
+    - oml_func_odbc_override.conf
+    - oml_http_override.conf
+    - oml_manager_override.conf
+    - oml_pjsip_override.conf
+    - oml_pjsip_wizard_override.conf
+    - oml_queues_override.conf
+    - oml_res_odbc_override.conf
+    - oml_sip_general_override.conf
+    - oml_sip_registrations_override.conf
+    - oml_sip_trunks_override.conf
+    - oml_voicemail_custom.conf
+    - oml_voicemail_override.conf
+  
