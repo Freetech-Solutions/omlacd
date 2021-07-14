@@ -1,41 +1,68 @@
 #!/bin/bash
 
+########################## README ############ README ############# README #########################
+########################## README ############ README ############# README #########################
+# El script first_boot_installer tiene como finalidad desplegar el componente sobre una instancia
+# de linux exclusiva. Las variables que utiliza son "variables de entorno" de la instancia que está
+# por lanzar el script como acto seguido al primer boot del sistema operativo.
+# Dichas variables podrán ser provisionadas por un archivo .env (ej: Vagrant) o bien utilizando este
+# script como plantilla de terraform.
+#
+# En el caso de necesitar ejecutar este script manualmente sobre el user_data de una instancia cloud
+# o bien sobre una instancia onpremise a través de una conexión ssh, entonces se deberá copiar
+# esta plantilla hacia un archivo ignorado por git: first_boot_installer.sh para luego sobre
+# dicha copia descomentar las líneas que comienzan con la cadena "export" para posteriormente
+# introducir el valor deseado a cada variable.
+########################## README ############ README ############# README #########################
+########################## README ############ README ############# README #########################
+
+# *********************************** SET ENV VARS **************************************************
+# The infrastructure environment:
+# onpremise | digitalocean | linode | vultr
+#export oml_infras_stage=
+
+# Component gitlab branch
+#export oml_acd_release=
+
+# OMniLeads tenant NAME
+#export oml_tenant_name=
+
+# OMLApp netaddr
+#export oml_app_host=
+# REDIS netaddr
+#export oml_redis_host=
+# POSTGRESQL netaddr and port
+#export oml_pgsql_host=
+#export oml_pgsql_port=
+# POSTGRESQL user, pass & DB params
+#export oml_pgsql_db=
+#export oml_pgsql_user=
+#export oml_pgsql_password=
+# IF PGSQL run on cloud cluster set this to true
+#export oml_pgsql_cloud=NULL
+# AMI conection from omlapp
+#export oml_ami_user=
+#export oml_ami_password=
+# call recordings store params: NULL | s3 | nfs
+#export oml_callrec_device=
+
+# NFS addr when you select NFS like store for callrec
+#export nfs_host=
+
+# S3 params when you select S3 like store for callrec
+#export s3_access_key=
+#export s3_secret_key=
+#export s3url=
+#export s3_bucket_name=
+# *********************************** SET ENV VARS **************************************************
+
+
 SRC=/usr/src
 COMPONENT_REPO=https://gitlab.com/omnileads/omlacd.git
-COMPONENT_RELEASE=${omlacd_version}
 COMPONENT_REPO_DIR=omlacd
 
 CALLREC_DIR_TMP=/opt/omnileads/asterisk/var/spool/asterisk/monitor
 CALLREC_DIR_DST=/opt/callrec
-
-# You have to set this VARS before RUN this script
-TENANT_NAME=${tenant}
-
-OMLAPP_HOST=${omlapp_host}
-REDIS_HOST=${redis_host}
-POSTGRESQL_HOST=${postgres_host}
-POSTGRESQL_PORT=${postgres_port}
-POSTGRESQL_DB=${postgres_database}
-POSTGRESQL_OMLUSER=${postgres_user}
-POSTGRESQL_OMLPASS=${postgres_password}
-PGSQL_CLOUD=${pgsql_cloud}
-# AMI conection from omlapp
-OMLAPP_AMI_USER=${ami_user}
-OMLAPP_AMI_PASS=${ami_password}
-# call recordings store params 
-CALLREC_DEVICE_TYPE=${callrec_device} # s3 or nfs
-
-# NFS addr when you select NFS like store for callrec
-if [[ $CALLREC_DEVICE_TYPE == "nfs" ]]; then
-  NFS_NETADDR=${nfs_netaddr}
-fi
-# S3 params when you select S3 like store for callrec
-if [[ $CALLREC_DEVICE_TYPE == "s3" ]]; then
-  S3_ACCESS_KEY=${s3_access_key}
-  S3_SECRET_KEY=${s3_secret_key} 
-  S3URL=${s3url}
-  BUCKET_NAME=${s3_bucket_name}
-fi
 
 echo "************************ disable SElinux *************************"
 echo "************************ disable SElinux *************************"
@@ -47,6 +74,7 @@ systemctl stop firewalld > /dev/null 2>&1
 
 echo "************************ yum install *************************"
 echo "************************ yum install *************************"
+yum update -y
 yum install -y epel-release git python3 python3-pip
 
 echo "************************ install ansible *************************"
@@ -61,55 +89,56 @@ echo "************************ clone REPO *************************"
 cd $SRC
 git clone $COMPONENT_REPO
 cd omlacd
-git checkout $COMPONENT_RELEASE
+git checkout ${oml_acd_release}
 cd deploy
 
 echo "******************************************* config and install *****************************************"
 echo "******************************************* config and install *****************************************"
 echo "******************************************* config and install *****************************************"
-sed -i "s/omnileads_hostname=omnileads/omnileads_hostname=$OMLAPP_HOST/g" ./inventory
-sed -i "s/redis_hostname=redis/redis_hostname=$REDIS_HOST/g" ./inventory
-sed -i "s/postgres_hostname=postgres/postgres_hostname=$POSTGRESQL_HOST/g" ./inventory
-sed -i "s/postgres_port=5432/postgres_port=$POSTGRESQL_PORT/g" ./inventory
-sed -i "s/postgres_database=omnileads/postgres_database=$POSTGRESQL_DB/g" ./inventory
-sed -i "s/postgres_user=omnileads/postgres_user=$POSTGRESQL_OMLUSER/g" ./inventory
-sed -i "s/postgres_password=my_very_strong_pass/postgres_password=$POSTGRESQL_OMLPASS/g" ./inventory
-sed -i "s/ami_user=omnileads/ami_user=$OMLAPP_AMI_USER/g" ./inventory
-sed -i "s/ami_password=C12H17N2O4P_o98o98/ami_password=$OMLAPP_AMI_PASS/g" ./inventory
+sed -i "s/omnileads_hostname=omnileads/omnileads_hostname=${oml_app_host}/g" ./inventory
+sed -i "s/redis_hostname=redis/redis_hostname=${oml_redis_host}/g" ./inventory
+sed -i "s/postgres_hostname=postgres/postgres_hostname=${oml_pgsql_host}/g" ./inventory
+sed -i "s/postgres_port=5432/postgres_port=${oml_pgsql_port}/g" ./inventory
+sed -i "s/postgres_database=omnileads/postgres_database=${oml_pgsql_db}/g" ./inventory
+sed -i "s/postgres_user=omnileads/postgres_user=${oml_pgsql_user}/g" ./inventory
+sed -i "s/postgres_password=my_very_strong_pass/postgres_password=${oml_pgsql_password}/g" ./inventory
+sed -i "s/ami_user=omnileads/ami_user=${oml_ami_user}/g" ./inventory
+sed -i "s/ami_password=C12H17N2O4P_o98o98/ami_password=${oml_ami_password}/g" ./inventory
 
 ansible-playbook asterisk.yml -i inventory --extra-vars "asterisk_version=$(cat ../.package_version)"
 
 echo "************************ check if set SSLmode for PGSQL *************************"
 echo "************************ check if set SSLmode for PGSQL *************************"
 
-if [[ "$PGSQL_CLOUD"  == "true" ]]; then
+if [[ "${oml_pgsql_cloud}"  == "true" ]]; then
   echo "digitalocean requiere SSL to connect PGSQL"
   echo "SSLMode       = require" >> /etc/odbc.ini
 fi
 
 echo "************************ block_device mount *************************"
 echo "************************ block_device mount *************************"
- 
-case $CALLREC_DEVICE_TYPE in
-  s3)
+
+case ${oml_callrec_device} in
+  s3-do)
     echo "s3 callrec device \n"
-    yum install -y epel-release && yum install -y s3fs-fuse
-    echo "$S3_ACCESS_KEY:$S3_SECRET_KEY" > ~/.passwd-s3fs
+    yum install -y s3fs-fuse lsof
+    echo "${s3_access_key}:${s3_secret_key} " > ~/.passwd-s3fs
     chmod 600 ~/.passwd-s3fs
-       if [ ! -d $CALLREC_DIR_DST ]; then 
+       if [ ! -d $CALLREC_DIR_DST ]; then
       mkdir -p $CALLREC_DIR_DST
       chown -R omnileads. $CALLREC_DIR_DST
-    fi  
-    echo "$BUCKET_NAME:/$TENANT_NAME $CALLREC_DIR_DST fuse.s3fs _netdev,allow_other,use_path_request_style,url=$S3URL 0 0" >> /etc/fstab
+    fi
+    echo "${ast_bucket_name} $CALLREC_DIR_DST fuse.s3fs _netdev,allow_other,use_path_request_style,url=${s3url} 0 0" >> /etc/fstab
     mount -a
     ;;
   nfs)
     echo "NFS callrec device \n"
-        if [ ! -d $CALLREC_DIR_DST ]; then 
+    yum install -y nfs-utils nfs-utils-lib lsof
+        if [ ! -d $CALLREC_DIR_DST ]; then
       mkdir -p $CALLREC_DIR_DST
       chown -R omnileads. $CALLREC_DIR_DST
-    fi  
-    echo "$NFS_NETADDR:$CALLREC_DIR_TPM $CALLREC_DIR_DST nfs auto,nofail,noatime,nolock,intr,tcp,actimeo=1800 0 0" >> /etc/fstab
+    fi
+    echo "${nfs_host}:$CALLREC_DIR_TMP $CALLREC_DIR_DST nfs auto,nofail,noatime,nolock,intr,tcp,actimeo=1800 0 0" >> /etc/fstab
     mount -a
     ;;
   *)
@@ -119,29 +148,28 @@ case $CALLREC_DEVICE_TYPE in
 
 echo "**************************** write callrec files move script ******************************"
 echo "**************************** write callrec files move script ******************************"
-cat > /opt/omnileads/mover_audios.sh <<'EOF'
+cat > /opt/omnileads/mover_audios.sh <<EOF
 #!/bin/bash
 
 # RAMDISK Watcher
-#
 # Revisa el contenido del ram0 y lo pasa a disco duro
-## Variables
+# Inicialización de variables
 
-Ano=$(date +%Y -d today)
-Mes=$(date +%m -d today)
-Dia=$(date +%d -d today)
-LSOF="/sbin/lsof"
-ALMACEN="/opt/callrec/$Ano-$Mes-$Dia"
+Ano=\$(date +%Y -d today)
+Mes=\$(date +%m -d today)
+Dia=\$(date +%d -d today)
+Lsof="/sbin/lsof"
+DirectorioFinal=$CALLREC_DIR_DST/\$Ano-\$Mes-\$Dia
 
-if [ ! -d $ALMACEN ]; then
-  mkdir -p $ALMACEN;
+if [ ! -d \$DirectorioFinal ];then
+  mkdir -p \$DirectorioFinal
 fi
 
-for i in $(ls /opt/omnileads/asterisk/var/spool/asterisk/monitor/$Ano-$Mes-$Dia/*.wav) ; do
-  $LSOF $i &> /dev/null
-  valor=$?
-  if [ $valor -ne 0 ] ; then
-    mv $i $ALMACEN
+for Grabacion in \$(ls $CALLREC_DIR_TMP/\$Ano-\$Mes-\$Dia/*.wav);do
+  \$Lsof \$Grabacion &> /dev/null
+  Resultado=\$?
+  if [ \$Resultado -ne 0 ];then
+    mv \$Grabacion \$DirectorioFinal
   fi
 done
 EOF
@@ -151,13 +179,13 @@ chmod +x /opt/omnileads/mover_audios.sh
 
 echo "****************************** add cron-line to trigger the call-recording move script **************************"
 cat > /etc/cron.d/MoverGrabaciones <<EOF
- */1 * * * * omnileads /opt/omnileads/mover_audios.sh
+*/1 * * * * omnileads /opt/omnileads/mover_audios.sh
 EOF
 
 echo "******************** Restart asterisk ***************************"
 echo "******************** Restart asterisk ***************************"
-chown -R omnileads. /opt/omnileads/asterisk 
-chown -R omnileads. /opt/callrec
+chown -R omnileads. /opt/omnileads/asterisk
+chown -R omnileads. $CALLREC_DIR_DST
 systemctl start asterisk
 
 echo "********************************** sngrep SIP sniffer install *********************************"
