@@ -95,6 +95,14 @@
     changed_when: false
     tags: postinstall
 
+  # Chequeo si existen ya los archivos custom y override dialplan, para no pisarlos
+  - name: Check if custom and override files for dialplan exists
+    shell: "if [ $(ls -l {{ asterisk_location }}/etc/asterisk/oml_extensions_*_override.conf 2> /dev/null | wc -l) -gt 0 ] && [ $(ls -l {{ asterisk_location }}/etc/asterisk/oml_extensions_*_custom.conf 2> /dev/null | wc -l) -gt 0 ];then exit 1;else exit 0;fi"
+    changed_when: false
+    failed_when: false
+    register: ast_custom_exists
+    tags: always
+
   # Se imprime que el asterisk OMniLeads configuration no esta instalado si la version actual es inferior a la requerida
   - debug: msg="Asterisk {{ asterisk_version }} is not installed, proceeding to install"
     when: asterisk_installed.stdout != asterisk_version
@@ -119,10 +127,11 @@
     register: s3_download
     failed_when:
       - "s3_download.rc != 0 or 'scriptlet failure' in s3_download.stderr"
-  
+
   # Creo archivos custom & override en fresh-install
   - name: Create _custom & _override astconf files
-    file: 
+    when: ast_custom_exists.rc != 1
+    file:
       path: "{{ asterisk_location }}/etc/asterisk/{{ item }}"
       state: touch
       mode: 0664
@@ -174,4 +183,3 @@
     - oml_sip_trunks_override.conf
     - oml_voicemail_custom.conf
     - oml_voicemail_override.conf
-  
