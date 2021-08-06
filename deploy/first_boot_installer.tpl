@@ -43,7 +43,7 @@
 # AMI conection from omlapp
 #export oml_ami_user=
 #export oml_ami_password=
-# call recordings store params: NULL | s3 | nfs
+# call recordings store params: NULL | s3-do | nfs
 #export oml_callrec_device=
 
 # NFS addr when you select NFS like store for callrec
@@ -53,7 +53,7 @@
 #export s3_access_key=
 #export s3_secret_key=
 #export s3url=
-#export s3_bucket_name=
+#export ast_bucket_name=
 # *********************************** SET ENV VARS **************************************************
 
 
@@ -142,7 +142,12 @@ case ${oml_callrec_device} in
     mount -a
     ;;
   *)
-    echo "callrec on local filesystem \n"
+    echo "[ERROR] you must to define some net FS in order to put there callrec files"
+    echo "[ERROR] you must to define some net FS in order to put there callrec files"
+    echo "[ERROR] you must to define some net FS in order to put there callrec files"
+    echo "[ERROR] you must to define some net FS in order to put there callrec files"
+    echo "[ERROR] you must to define some net FS in order to put there callrec files"
+    exit 0
     ;;
  esac
 
