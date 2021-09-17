@@ -5,12 +5,12 @@ PACKAGE_VERSION=$(cat ../../.package_version)
 ASTERISK_LOCATION="/opt/omnileads/asterisk"
 VIRTUALENV_LOCATION="${ASTERISK_LOCATION}/virtualenv"
 
-if test -z ${ASTERISK_VERSION}; then
+if test -z ${ASTERISK_VERSION};then
   echo "${PROGNAME}: ASTERISK_VERSION required" >&2
   exit 1
 fi
 
-if [ ! -d /opt/omnileads/asterisk ]; then
+if [ ! -d /opt/omnileads/asterisk ];then
   echo "Downloading asterisk source"
   mkdir -p /usr/src/asterisk
   cd /usr/src/asterisk
@@ -97,6 +97,8 @@ pip3 install -r build/docker/acdbuilder/requirements.txt --exists-action 'w'
 
 echo "Adding conf, agis, logrotate and legacy scripts omnileads"
 cp -a source/astconf/* ${ASTERISK_LOCATION}/etc/asterisk/
+rm -rf ${ASTERISK_LOCATION}/etc/asterisk/*custom*
+rm -rf ${ASTERISK_LOCATION}/etc/asterisk/*override*
 cp -a source/agis/* ${ASTERISK_LOCATION}/var/lib/asterisk/agi-bin/
 cp -a source/scripts/* ${VIRTUALENV_LOCATION}
 
