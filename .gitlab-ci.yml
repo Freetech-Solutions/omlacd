@@ -1,5 +1,6 @@
 stages:
   - build
+  - deploy
 
 build-image:
   stage: build
@@ -17,8 +18,9 @@ build-image:
     - cd build/docker && bash build_image.sh
   only:
     - web
-    - /.*release.*$/
-    - /.*master.*$/
+    - merge_requests
+    #- /.*release.*$/
+    #- /.*master.*$/
 
 build-rpm:
   stage: build
@@ -28,5 +30,25 @@ build-rpm:
     - cd build/rpm && bash build_rpm.sh
   only:
     - web
-    - /.*release.*$/
-    - /.*master.*$/
+    - merge_requests
+    #- /.*release.*$/
+    #- /.*master.*$/
+
+deploy-acd-digitalocean:
+  stage: deploy
+  environment: DOCTL_DIGITALOCEAN_AIO
+  script:
+    - bash ~/git_cleanup.sh
+    - bash ~/.env_do
+    - sleep 30
+    - doctl compute droplet create --image $DIGITAL_OCEAN_AIO_IMG --size $DIGITAL_OCEAN_AIO_SIZE --region $DIGITAL_OCEAN_REGION --ssh-keys $TF_VAR_ssh_key_fingerprint --user-data-file ~/omlacd/deploy/first_boot_installer.sh omlgitlab-cicd-acd.$CI_JOB_ID
+    - sleep 60
+    - IP=$(doctl compute droplet list |grep omlgitlab-cicd-acd.$CI_JOB_ID |awk '{print $3}') && echo "$IP 2 run tests"
+    - until curl -sk --head  --request GET https://$IP |grep "302" > /dev/null; do echo "Environment still being installed, sleeping 80 seconds"; sleep 80; done; echo "Environment is up"
+    - doctl compute droplet delete -f omlgitlab-cicd-aio.$CI_JOB_ID
+  tags:
+    - deploy-acd
+  only:
+    - /.*deploy.*$/
+    - web
+    - merge_requests
