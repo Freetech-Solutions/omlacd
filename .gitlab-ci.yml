@@ -19,6 +19,7 @@ build-image:
   only:
     - web
     - merge_requests
+    - /.*pre-release.*$/
     #- /.*release.*$/
     #- /.*master.*$/
 
@@ -31,6 +32,7 @@ build-rpm:
   only:
     - web
     - merge_requests
+    - /.*pre-release.*$/
     #- /.*release.*$/
     #- /.*master.*$/
 
@@ -50,5 +52,6 @@ deploy-acd-digitalocean:
     - deploy-acd
   only:
     - /.*deploy.*$/
+    - /.*pre-release.*$/
     - web
     - merge_requests
