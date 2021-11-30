@@ -1,6 +1,6 @@
 #!/bin/bash
 
-########################## README ############ README ############# README #########################
+########################## README ############ README ############# README #######################
 ########################## README ############ README ############# README #########################
 # El script first_boot_installer tiene como finalidad desplegar el componente sobre una instancia
 # de linux exclusiva. Las variables que utiliza son "variables de entorno" de la instancia que está
@@ -43,7 +43,7 @@
 # AMI conection from omlapp
 #export oml_ami_user=
 #export oml_ami_password=
-# call recordings store params: NULL | s3-do | nfs
+# call recordings store params: NULL | s3 | nfs
 #export oml_callrec_device=
 
 # NFS addr when you select NFS like store for callrec
@@ -53,9 +53,11 @@
 #export s3_access_key=
 #export s3_secret_key=
 #export s3url=
-#export ast_bucket_name=
+#export s3_bucket_name=
 # *********************************** SET ENV VARS **************************************************
 
+SSM_AGENT_URL="https://s3.amazonaws.com/ec2-downloads-windows/SSMAgent/latest/linux_amd64/amazon-ssm-agent.rpm"
+S3FS="/bin/s3fs"
 
 SRC=/usr/src
 COMPONENT_REPO=https://gitlab.com/omnileads/omlacd.git
@@ -74,27 +76,44 @@ systemctl stop firewalld > /dev/null 2>&1
 
 echo "************************ yum install *************************"
 echo "************************ yum install *************************"
-yum update -y
-yum install -y epel-release git python3 python3-pip
 
-echo "************************ install ansible *************************"
-echo "************************ install ansible *************************"
+case ${oml_infras_stage} in
+   aws)
+     yum remove -y python3 python3-pip
+     yum install -y $SSM_AGENT_URL 
+     yum install -y patch libedit-devel libuuid-devel git
+     amazon-linux-extras install -y epel
+     amazon-linux-extras install python3 -y
+     systemctl start amazon-ssm-agent
+     ;;
+   *)
+     #yum update -y
+     yum -y install epel-release git python3 python3-pip libselinux-python3
+     ;;
+ esac
+
+# echo "************************ install ansible *************************"
+# echo "************************ install ansible *************************"
 pip3 install pip --upgrade
-pip3 install 'ansible==2.9.2'
+pip3 install boto boto3 botocore 'ansible==2.9.9' selinux
 export PATH="$HOME/.local/bin/:$PATH"
 
-echo "************************ clone REPO *************************"
-echo "************************ clone REPO *************************"
-echo "************************ clone REPO *************************"
+# if [[ "${oml_infras_stage}" == "aws" ]];then
+# ln -s /root/.local/lib/python3.6/site-packages/selinux /usr/lib64/python3.6/site-packages/
+# fi
+
+# echo "************************ clone REPO *************************"
+# echo "************************ clone REPO *************************"
+# echo "************************ clone REPO *************************"
 cd $SRC
 git clone $COMPONENT_REPO
 cd omlacd
 git checkout ${oml_acd_release}
 cd deploy
 
-echo "******************************************* config and install *****************************************"
-echo "******************************************* config and install *****************************************"
-echo "******************************************* config and install *****************************************"
+# echo "******************************************* config and install *****************************************"
+# echo "******************************************* config and install *****************************************"
+# echo "******************************************* config and install *****************************************"
 sed -i "s/omnileads_hostname=omnileads/omnileads_hostname=${oml_app_host}/g" ./inventory
 sed -i "s/redis_hostname=redis/redis_hostname=${oml_redis_host}/g" ./inventory
 sed -i "s/postgres_hostname=postgres/postgres_hostname=${oml_pgsql_host}/g" ./inventory
@@ -104,6 +123,26 @@ sed -i "s/postgres_user=omnileads/postgres_user=${oml_pgsql_user}/g" ./inventory
 sed -i "s/postgres_password=my_very_strong_pass/postgres_password=${oml_pgsql_password}/g" ./inventory
 sed -i "s/ami_user=omnileads/ami_user=${oml_ami_user}/g" ./inventory
 sed -i "s/ami_password=C12H17N2O4P_o98o98/ami_password=${oml_ami_password}/g" ./inventory
+
+
+if [[ "${oml_backup_filename}" != "NULL" ]];then
+sed -i "s%\#backup_file_name=%backup_file_name=${oml_backup_filename}%g" ./inventory
+fi
+if [[ "${s3_access_key}" != "NULL" ]];then
+sed -i "s%\#s3_access_key=%s3_access_key=${s3_access_key}%g" ./inventory
+fi
+if [[ "${s3_secret_key}" != "NULL" ]];then
+sed -i "s%\#s3_secret_key=%s3_secret_key=${s3_secret_key}%g" ./inventory
+fi
+if [[ "${ast_bucket_name}" != "NULL" ]];then
+sed -i "s%\#backup_bucket_name=%backup_bucket_name=${ast_bucket_name}%g" ./inventory
+fi
+if [[ "${s3url}" != "NULL" ]];then
+sed -i "s%\#s3url=%s3url=${s3url}%g" ./inventory
+fi
+if [[ "${oml_auto_restore}" != "NULL" ]];then
+sed -i "s/auto_restore=false/auto_restore=${oml_auto_restore}/g" ./inventory
+fi
 
 ansible-playbook asterisk.yml -i inventory --extra-vars "asterisk_version=$(cat ../.package_version)"
 
@@ -131,6 +170,18 @@ case ${oml_callrec_device} in
     echo "${ast_bucket_name} $CALLREC_DIR_DST fuse.s3fs _netdev,allow_other,use_path_request_style,url=${s3url} 0 0" >> /etc/fstab
     mount -a
     ;;
+  s3-aws)
+    echo "s3 callrec device \n"
+    yum install -y s3fs-fuse lsof
+    echo "${s3_access_key}:${s3_secret_key} " > ~/.passwd-s3fs
+    chmod 600 ~/.passwd-s3fs
+    if [ ! -d $CALLREC_DIR_DST ]; then
+      mkdir -p $CALLREC_DIR_DST
+      chown -R omnileads. $CALLREC_DIR_DST
+    fi
+    echo "${ast_bucket_name} $CALLREC_DIR_DST fuse.s3fs _netdev,allow_other 0 0" >> /etc/fstab
+    mount -a
+    ;;    
   nfs)
     echo "NFS callrec device \n"
     yum install -y nfs-utils nfs-utils-lib lsof
@@ -149,7 +200,7 @@ case ${oml_callrec_device} in
     echo "[ERROR] you must to define some net FS in order to put there callrec files"
     exit 0
     ;;
- esac
+esac
 
 echo "**************************** write callrec files move script ******************************"
 echo "**************************** write callrec files move script ******************************"
@@ -186,6 +237,10 @@ echo "****************************** add cron-line to trigger the call-recording
 cat > /etc/cron.d/MoverGrabaciones <<EOF
 */1 * * * * omnileads /opt/omnileads/mover_audios.sh
 EOF
+
+if [[ "${oml_auto_restore}" != "NULL" ]];then
+echo "59 23 * * * /opt/omnileads/utils/backup-restore.sh --backup --asterisk --target=/opt/callrec" >> /var/spool/cron/omnileads
+fi
 
 echo "******************** Restart asterisk ***************************"
 echo "******************** Restart asterisk ***************************"

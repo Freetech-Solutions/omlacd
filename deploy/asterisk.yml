@@ -22,6 +22,7 @@
   vars:
     cron_location: /var/spool/cron/omnileads
     packages_url: https://fts-public-packages.s3.amazonaws.com
+    oml_utilities_repo: https://gitlab.com/omnileads/omlutilities.git
     asterisk_package: "{{ packages_url }}/asterisk/asterisk-{{ asterisk_version }}.x86_64.rpm"
     asterisk_location: /opt/omnileads/asterisk
     postgresql_version: 11
@@ -77,8 +78,15 @@
         export AMI_USER AMI_PASSWORD ASTERISK_LOCATION EXTERN_IP REDIS_HOSTNAME RETHINKDB_HOSTNAME PGHOST PGPORT PGDATABASE PGUSER  PGPASSWORD OMNILEADS_HOSTNAME
     when: asterisk_out is defined
 
+  - name: Remove All postgresql packages 
+    command: yum remove -y postgresql11*
+    retries: 3
+    delay: 3
+    when: asterisk_out is defined
+
   - name: Install postgresql {{ postgresql_version }} packages (from s3 source)
-    yum: name={{ packages_url }}/postgresql/postgresql{{ postgresql_version}}{{ item }}.rpm state=latest update_cache=yes
+    #yum: name={{ packages_url }}/postgresql/postgresql{{ postgresql_version}}{{ item }}.rpm state=latest update_cache=yes
+    command: yum install -y {{ packages_url }}/postgresql/postgresql{{ postgresql_version}}{{ item }}.rpm
     with_items:
       - -libs.x86_64
       - -odbc.x86_64
@@ -115,7 +123,8 @@
 
   # Esta tarea es para eliminar paquete viejo
   - name: Delete old asterisk OMniLeads package
-    yum: name=omnileads-asterisk state=absent
+    #yum: name=omnileads-asterisk state=absent
+    command: yum remove -y {{ asterisk_package }}
     tags: postinstall
     when: asterisk_installed.stdout != asterisk_version
 
@@ -183,3 +192,72 @@
     - oml_sip_trunks_override.conf
     - oml_voicemail_custom.conf
     - oml_voicemail_override.conf
+    when: (backup_file_name is not defined) or (asterisk_out is not defined)
+
+# Create backup folder
+  - name: Create backup folder
+    file:
+      path: /opt/omnileads/backup
+      state: directory
+      owner: omnileads
+      group: omnileads
+      mode: 0640
+    when: 
+      - asterisk_out is defined  
+
+# Download backup-restore script
+  - name: Download backup-restore script
+    ansible.builtin.git:
+      repo: '{{ oml_utilities_repo }}'
+      dest: /opt/omnileads/utils
+      version: main  
+    when: 
+      - asterisk_out is defined        
+
+# Restore backup in case of IaC deploy 
+  - name: Restore backup when use infrasctructure as code - 1/2
+    vars:
+        ansible_python_interpreter: /usr/bin/python3
+    aws_s3:
+        s3_url: "{{ s3url }}"
+        aws_secret_key: "{{ s3_secret_key }}"
+        aws_access_key: "{{ s3_access_key }}"
+        bucket: "{{ backup_bucket_name }}"
+        object: "{{ backup_file_name }}.tar.gz"
+        dest: "/opt/omnileads/backup/{{ backup_file_name }}.tar.gz"
+        mode: get
+    delegate_to: localhost
+    register: backup_s3_download
+    until: backup_s3_download
+    when: 
+      - asterisk_out is defined
+      - backup_file_name is defined
+      - auto_restore == "true"
+      - ansible_distribution != "Amazon"
+
+  - name: Restore backup when use infrasctructure as code - 1/2
+    vars:
+        ansible_python_interpreter: /usr/bin/python3
+    aws_s3:
+        aws_secret_key: "{{ s3_secret_key }}"
+        aws_access_key: "{{ s3_access_key }}"
+        bucket: "{{ backup_bucket_name }}"
+        object: "{{ backup_file_name }}.tar.gz"
+        dest: "/opt/omnileads/backup/{{ backup_file_name }}.tar.gz"
+        mode: get
+    delegate_to: localhost
+    register: backup_s3_download
+    until: backup_s3_download
+    when: 
+      - asterisk_out is defined
+      - backup_file_name is defined
+      - auto_restore == "true"
+      - ansible_distribution == "Amazon"
+
+  - name: Restore backup when use infrasctructure as code - 2/2
+    command: bash -x /opt/omnileads/utils/backup-restore.sh --restore={{ backup_file_name }}.tar.gz --asterisk
+    until: backup_s3_download
+    when: 
+      - asterisk_out is defined
+      - backup_file_name is defined
+      - auto_restore == "true"
