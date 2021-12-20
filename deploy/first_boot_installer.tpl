@@ -53,7 +53,7 @@
 #export s3_access_key=
 #export s3_secret_key=
 #export s3url=
-#export s3_bucket_name=
+#export ast_bucket_name=
 # *********************************** SET ENV VARS **************************************************
 
 SSM_AGENT_URL="https://s3.amazonaws.com/ec2-downloads-windows/SSMAgent/latest/linux_amd64/amazon-ssm-agent.rpm"
