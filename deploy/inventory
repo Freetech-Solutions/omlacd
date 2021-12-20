@@ -1,5 +1,5 @@
 [prodenv-aio]
-localhost ansible_connection=local
+localhost ansible_connection=local 
 
 [prodenv-aio:vars]
 ## IP or hostnames of services that interact with asterisk       ###
@@ -22,6 +22,16 @@ extern_ip=auto
 # ami credentials
 ami_user=omnileads
 ami_password=C12H17N2O4P_o98o98
+
+#########################################################
+# Restore File in case of Infrastructure as code deploy #
+#########################################################
+#backup_file_name=
+#s3_access_key=
+#s3_secret_key=
+#backup_bucket_name=
+#s3url=
+auto_restore=false
 
 ### Don't change these variable ###
 asterisk_out=true
