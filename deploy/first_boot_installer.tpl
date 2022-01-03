@@ -27,6 +27,9 @@
 # OMniLeads tenant NAME
 #export oml_tenant_name=
 
+# Time Zone configuration (example: America/Argentina/Cordoba) 
+#export oml_tz=put_your_time_zone_here 
+
 # OMLApp netaddr
 #export oml_app_host=
 # REDIS netaddr
@@ -114,6 +117,7 @@ cd deploy
 # echo "******************************************* config and install *****************************************"
 # echo "******************************************* config and install *****************************************"
 # echo "******************************************* config and install *****************************************"
+sed -i "s%\TZ=set_your_timezone_here%TZ=${oml_tz}%g" ./inventory
 sed -i "s/omnileads_hostname=omnileads/omnileads_hostname=${oml_app_host}/g" ./inventory
 sed -i "s/redis_hostname=redis/redis_hostname=${oml_redis_host}/g" ./inventory
 sed -i "s/postgres_hostname=postgres/postgres_hostname=${oml_pgsql_host}/g" ./inventory
@@ -123,7 +127,6 @@ sed -i "s/postgres_user=omnileads/postgres_user=${oml_pgsql_user}/g" ./inventory
 sed -i "s/postgres_password=my_very_strong_pass/postgres_password=${oml_pgsql_password}/g" ./inventory
 sed -i "s/ami_user=omnileads/ami_user=${oml_ami_user}/g" ./inventory
 sed -i "s/ami_password=C12H17N2O4P_o98o98/ami_password=${oml_ami_password}/g" ./inventory
-
 
 if [[ "${oml_backup_filename}" != "NULL" ]];then
 sed -i "s%\#backup_file_name=%backup_file_name=${oml_backup_filename}%g" ./inventory
@@ -238,20 +241,26 @@ cat > /etc/cron.d/MoverGrabaciones <<EOF
 */1 * * * * omnileads /opt/omnileads/mover_audios.sh
 EOF
 
+echo "****************************** add cron-line to run backup and put into the bucket or NFS **************************"
 if [[ "${oml_auto_restore}" != "NULL" ]];then
 echo "59 23 * * * /opt/omnileads/utils/backup-restore.sh --backup --asterisk --target=/opt/callrec" >> /var/spool/cron/omnileads
 fi
 
-echo "******************** Restart asterisk ***************************"
-echo "******************** Restart asterisk ***************************"
+echo "***************************************** Activate cron callrec convert to mp3 *************************************"
+mkdir /opt/omnileads/log && touch /opt/omnileads/log/conversor.log
+chown omnileads.omnileads /opt/omnileads/log/conversor.log
+echo "0 1 * * * source /etc/profile.d/omnileads_envars.sh; /opt/omnileads/utils/conversor.sh 1 0 >> /opt/omnileads/log/conversor.log" >> /var/spool/cron/omnileads
+
+
+echo "************************************* Restart asterisk **************************************************ç"
 chown -R omnileads. /opt/omnileads/asterisk
 chown -R omnileads. $CALLREC_DIR_DST
 systemctl start asterisk
 
 echo "********************************** sngrep SIP sniffer install *********************************"
-echo "********************************** sngrep SIP sniffer install *********************************"
-yum install ncurses-devel make libpcap-devel pcre-devel \
-openssl-devel git gcc autoconf automake -y
+yum install -y ncurses-devel make libpcap-devel pcre-devel openssl-devel git gcc autoconf automake
 cd $SRC && git clone https://github.com/irontec/sngrep
 cd sngrep && ./bootstrap.sh && ./configure && make && make install
 ln -s /usr/local/bin/sngrep /usr/bin/sngrep
+
+reboot

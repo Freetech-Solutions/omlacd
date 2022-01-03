@@ -29,6 +29,10 @@
 
   tasks:
 
+  # Se setea el timezone
+  - name: Set timezone of server
+    timezone: name={{ TZ }}
+
   # Obtengo IP publica del nodo
   - name: Get public IP address of node
     shell: curl http://ipinfo.io/ip
