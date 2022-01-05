@@ -82,7 +82,7 @@
         export AMI_USER AMI_PASSWORD ASTERISK_LOCATION EXTERN_IP REDIS_HOSTNAME RETHINKDB_HOSTNAME PGHOST PGPORT PGDATABASE PGUSER  PGPASSWORD OMNILEADS_HOSTNAME
     when: asterisk_out is defined
 
-  - name: Remove All postgresql packages 
+  - name: Remove All postgresql packages
     command: yum remove -y postgresql11*
     retries: 3
     delay: 3
@@ -128,7 +128,7 @@
   # Esta tarea es para eliminar paquete viejo
   - name: Delete old asterisk OMniLeads package
     #yum: name=omnileads-asterisk state=absent
-    command: yum remove -y {{ asterisk_package }}
+    command: yum remove -y asterisk
     tags: postinstall
     when: asterisk_installed.stdout != asterisk_version
 
@@ -206,19 +206,19 @@
       owner: omnileads
       group: omnileads
       mode: 0640
-    when: 
-      - asterisk_out is defined  
+    when:
+      - asterisk_out is defined
 
 # Download backup-restore script
   - name: Download backup-restore script
     ansible.builtin.git:
       repo: '{{ oml_utilities_repo }}'
       dest: /opt/omnileads/utils
-      version: main  
-    when: 
-      - asterisk_out is defined        
+      version: main
+    when:
+      - asterisk_out is defined
 
-# Restore backup in case of IaC deploy 
+# Restore backup in case of IaC deploy
   - name: Restore backup when use infrasctructure as code - 1/2
     vars:
         ansible_python_interpreter: /usr/bin/python3
@@ -233,7 +233,7 @@
     delegate_to: localhost
     register: backup_s3_download
     until: backup_s3_download
-    when: 
+    when:
       - asterisk_out is defined
       - backup_file_name is defined
       - auto_restore == "true"
@@ -252,7 +252,7 @@
     delegate_to: localhost
     register: backup_s3_download
     until: backup_s3_download
-    when: 
+    when:
       - asterisk_out is defined
       - backup_file_name is defined
       - auto_restore == "true"
@@ -261,7 +261,7 @@
   - name: Restore backup when use infrasctructure as code - 2/2
     command: bash -x /opt/omnileads/utils/backup-restore.sh --restore={{ backup_file_name }}.tar.gz --asterisk
     until: backup_s3_download
-    when: 
+    when:
       - asterisk_out is defined
       - backup_file_name is defined
       - auto_restore == "true"
