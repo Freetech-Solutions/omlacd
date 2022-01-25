@@ -32,7 +32,7 @@ COPY source/odbc/*.ini /etc/
 COPY source/scripts/ /opt/omnileads/asterisk/virtualenv/scripts/
 COPY build/docker/docker-entrypoint.sh /docker-entrypoint.sh
 
-EXPOSE 5038/tcp 7088/tcp 5160-5163/udp 5060/udp
+EXPOSE 5162-5163/udp 40000-50000/udp
 
 ENTRYPOINT ["/docker-entrypoint.sh"]
 CMD [""]
