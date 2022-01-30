@@ -64,6 +64,8 @@
       dest: "/etc/profile.d/omnileads_envars.sh"
       content: |
         ASTERISK_LOCATION={{ asterisk_location }}
+        MONITORFORMAT=mp3
+        CALLREC_DEVICE={{ callrec_device }}
         AMI_USER={{ ami_user }}
         AMI_PASSWORD={{ ami_password }}
         {% if extern_ip == "auto" %}
@@ -78,8 +80,18 @@
         PGUSER={{ postgres_user }}
         PGDATABASE={{ postgres_database }}
         PGPASSWORD={{ postgres_password }}
+        {% if s3_bucket_name is defined %}
+        S3_STORAGE_ENABLED=true
+        S3_BUCKET_NAME={{ s3_bucket_name }}
+        {% if callrec_device != "s3-aws" %}
+        AWS_ACCESS_KEY_ID={{ s3_access_key }}
+        AWS_SECRET_ACCESS_KEY={{ s3_secret_key }}
+        S3_ENDPOINT={{ s3url }}
+        AWS_DEFAULT_REGION=us-east-1
+        {% endif %}
+        {% endif %}
 
-        export AMI_USER AMI_PASSWORD ASTERISK_LOCATION EXTERN_IP REDIS_HOSTNAME RETHINKDB_HOSTNAME PGHOST PGPORT PGDATABASE PGUSER  PGPASSWORD OMNILEADS_HOSTNAME
+        export ASTERISK_LOCATION  MONITORFORMAT CALLREC_DEVICE AMI_USER AMI_PASSWORD EXTERN_IP REDIS_HOSTNAME RETHINKDB_HOSTNAME PGHOST PGPORT PGDATABASE PGUSER  PGPASSWORD OMNILEADS_HOSTNAME {% if callrec_device != "local" %} S3_STORAGE_ENABLED S3_BUCKET_NAME {% if callrec_device != "s3-aws" %} S3_ENDPOINT AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY  AWS_DEFAULT_REGION {% endif %} {% endif %} 
     when: asterisk_out is defined
 
   - name: Remove All postgresql packages
@@ -205,7 +217,7 @@
       state: directory
       owner: omnileads
       group: omnileads
-      mode: 0640
+      mode: 0764
     when:
       - asterisk_out is defined
 
@@ -226,8 +238,8 @@
         s3_url: "{{ s3url }}"
         aws_secret_key: "{{ s3_secret_key }}"
         aws_access_key: "{{ s3_access_key }}"
-        bucket: "{{ backup_bucket_name }}"
-        object: "{{ backup_file_name }}.tar.gz"
+        bucket: "{{ s3_bucket_name }}"
+        object: "omlacd-backup/{{ backup_file_name }}.tar.gz"
         dest: "/opt/omnileads/backup/{{ backup_file_name }}.tar.gz"
         mode: get
     delegate_to: localhost
@@ -243,10 +255,8 @@
     vars:
         ansible_python_interpreter: /usr/bin/python3
     aws_s3:
-        aws_secret_key: "{{ s3_secret_key }}"
-        aws_access_key: "{{ s3_access_key }}"
-        bucket: "{{ backup_bucket_name }}"
-        object: "{{ backup_file_name }}.tar.gz"
+        bucket: "{{ s3_bucket_name }}"
+        object: "omlacd-backup/{{ backup_file_name }}.tar.gz"
         dest: "/opt/omnileads/backup/{{ backup_file_name }}.tar.gz"
         mode: get
     delegate_to: localhost
