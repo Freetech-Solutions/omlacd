@@ -1,11 +1,11 @@
 # vim:set ft=dockerfile:
 FROM freetechsolutions/omlacd-builder:latest as builder
 
-FROM python:3.7-slim as production
+FROM python:3.7-slim-buster as production
 
 RUN mkdir /src \
     && apt-get update -qq \
-    && apt-get install -y libbinutils libedit2 libncursesw5 wget\
+    && apt-get install -y libbinutils libedit2 libncursesw5 wget awscli \
     && apt autoremove -y
 
 # Todos los paquetes de asterisk
@@ -32,7 +32,9 @@ COPY source/odbc/*.ini /etc/
 COPY source/scripts/ /opt/omnileads/asterisk/virtualenv/scripts/
 COPY build/docker/docker-entrypoint.sh /docker-entrypoint.sh
 
-EXPOSE 5038/tcp 7088/tcp 5160-5163/udp 5060/udp
+RUN useradd -M -u 1000 asterisk 
+
+EXPOSE 5162-5163/udp 40000-50000/udp
 
 ENTRYPOINT ["/docker-entrypoint.sh"]
 CMD [""]
