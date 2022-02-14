@@ -25,15 +25,17 @@ extern_ip=auto
 ami_user=omnileads
 ami_password=C12H17N2O4P_o98o98
 
+callrec_device=local
+
 #########################################################
-# Restore File in case of Infrastructure as code deploy #
+# S3 BUCKET in case of Infrastructure as code deploy       #
 #########################################################
+auto_restore=false
 #backup_file_name=
 #s3_access_key=
 #s3_secret_key=
-#backup_bucket_name=
+#s3_bucket_name=
 #s3url=
-auto_restore=false
 
 ### Don't change these variable ###
 asterisk_out=true

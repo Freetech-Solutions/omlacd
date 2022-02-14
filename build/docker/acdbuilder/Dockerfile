@@ -1,4 +1,4 @@
-FROM python:3.7-slim as builder
+FROM python:3.7-slim-buster as builder
 
 ENV LANG en_US.utf8
 ENV NOTVISIBLE "in users profile"
