@@ -31,6 +31,9 @@
 # Time Zone configuration (example: America/Argentina/Cordoba) 
 #export oml_tz=put_your_time_zone_here 
 
+# Time Zone configuration (example: America/Argentina/Cordoba) 
+#export oml_tz=put_your_time_zone_here 
+
 # OMLApp netaddr
 #export oml_app_host=
 # REDIS netaddr
