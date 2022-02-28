@@ -8,6 +8,9 @@ DirectorioFinal=/opt/callrec/$Ano-$Mes-$Dia
 
 case ${CALLREC_DEVICE} in
     nfs)
+    	if [ ! -d $DirectorioFinal ];then
+          mkdir $DirectorioFinal
+        fi
         mv ${ASTERISK_LOCATION}/var/spool/asterisk/monitor/$Ano-$Mes-$Dia/$1 $DirectorioFinal
         ;;
     s3-aws)
