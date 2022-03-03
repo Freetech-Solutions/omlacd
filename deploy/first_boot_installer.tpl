@@ -63,6 +63,11 @@
 #export s3_secret_key=
 #export s3url=
 
+# auto-restore custom and override and custom agis 
+#export oml_backup_filename=NULL
+# backup filename
+#export oml_auto_restore=NULL
+
 # *********************************** SET ENV VARS **************************************************
 
 SSM_AGENT_URL="https://s3.amazonaws.com/ec2-downloads-windows/SSMAgent/latest/linux_amd64/amazon-ssm-agent.rpm"
