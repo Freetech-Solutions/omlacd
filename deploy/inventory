@@ -2,6 +2,11 @@
 localhost ansible_connection=local 
 
 [prodenv-aio:vars]
+
+# Don't CHANGE ME !!!!
+component=asterisk
+
+
 ## IP or hostnames of services that interact with asterisk       ###
 ## WARNING: if you use hostnames you manage the hostname resolve ###
 omnileads_hostname=omnileads
@@ -28,7 +33,7 @@ ami_password=C12H17N2O4P_o98o98
 callrec_device=local
 
 #########################################################
-# S3 BUCKET in case of Infrastructure as code deploy       #
+# S3 BUCKET in case of Infrastructure as code deploy    #
 #########################################################
 auto_restore=false
 #backup_file_name=
@@ -36,6 +41,18 @@ auto_restore=false
 #s3_secret_key=
 #s3_bucket_name=
 #s3url=
+
+###################################
+# HA variables ####################
+###################################
+
+#deploy_ha=
+#ha_rol=
+#ha_vip=
+#ha_vip_nic=
+#ha_tenant=
+#ha_notification_email=
+#ha_node_main_host=
 
 ### Don't change these variable ###
 asterisk_out=true
