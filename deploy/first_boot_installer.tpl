@@ -18,7 +18,7 @@
 
 # *********************************** SET ENV VARS **************************************************
 # The infrastructure environment:
-# centos | amazon_linux
+# onpremise | amazon_linux
 #export oml_infras_stage=
 
 # Component gitlab branch
@@ -63,11 +63,11 @@
 #export s3_secret_key=
 #export s3url=
 
-# true | false
-#export oml_deploy_ha=
-# MASTER | BACKUP
+# Uncomment for HA
+#export oml_deploy_ha=true
+# node role values: main | backup
 #export oml_ha_rol=MASTER
-# Virtual IP HA
+# Virtual IP for HA cluster
 #export oml_ha_vip=IP_ADDR/PREFIX
 # NIC for VIP
 #export oml_ha_vip_nic=NIC
@@ -109,7 +109,7 @@ case ${oml_infras_stage} in
      amazon-linux-extras install python3 -y
      systemctl start amazon-ssm-agent
      ;;
-   centos)
+   onpremise)
      yum -y install epel-release git python3 python3-pip libselinux-python3 awscli
      ;;
  esac
@@ -231,5 +231,3 @@ echo "********************************** sngrep SIP sniffer install ************
 cd $SRC && git clone https://github.com/irontec/sngrep
 cd sngrep && ./bootstrap.sh && ./configure && make && make install
 ln -s /usr/local/bin/sngrep /usr/bin/sngrep
-
-reboot
