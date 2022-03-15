@@ -173,7 +173,7 @@ sed -i "s%\#s3url=%s3url=${s3url}%g" ./inventory
 fi
 
 if [[ "${oml_deploy_ha}" == "true" ]];then
-sed -i "s/#deploy_ha=/deploy_ha=true/g" ./inventory
+sed -i "s/deploy_ha=false/deploy_ha=true/g" ./inventory
 sed -i "s/#ha_rol=/ha_rol=${oml_ha_rol}/g" ./inventory
 sed -i "s%\#ha_vip=%ha_vip=${oml_ha_vip}%g" ./inventory
 sed -i "s/#ha_vip_nic=/ha_vip_nic=${oml_ha_vip_nic}/g" ./inventory
