@@ -46,7 +46,7 @@ auto_restore=false
 # HA variables ####################
 ###################################
 
-deploy_ha=false
+#deploy_ha=true
 #ha_rol=
 #ha_vip=
 #ha_vip_nic=
