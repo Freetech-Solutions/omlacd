@@ -275,3 +275,53 @@
       - asterisk_out is defined
       - backup_file_name is defined
       - auto_restore == "true"
+
+###########################################################  HA Deploy ###########################################################
+###########################################################  HA Deploy ###########################################################
+
+
+  - name: Install High Availability TOOLs
+    yum:
+      name: "{{ item }}"
+      state: present
+    with_items:
+      - keepalived
+    when: deploy_ha is defined
+
+  - name: Keepalived config provissioning 
+    template: src=templates/keepalived.j2 dest=/etc/keepalived/keepalived.conf
+    when: deploy_ha is defined
+
+  - name: check_component.sh script provissioning 
+    template: src=templates/check_ha.j2 dest=/usr/bin/check_ha.sh
+    when: deploy_ha is defined
+        
+  - name: Set X permission to check_ha.sh script
+    ansible.builtin.file:
+      path: /usr/bin/check_ha.sh
+      owner: omnileads
+      group: omnileads
+      mode: '0744'
+    when: deploy_ha is defined  
+
+  - name: Start Systemd High Availability TOOLs
+    command: systemctl start {{ item }}.service
+    with_items:
+      - keepalived
+    when: deploy_ha is defined
+
+  - name: Enable Systemd  High Availability TOOLs
+    command: systemctl enable {{ item }}.service
+    with_items:
+      - keepalived
+    when: deploy_ha is defined
+
+  - name  : Modify oml_pjsip_transports.conf High Availability
+    lineinfile: 
+      dest: '{{ asterisk_location }}/etc/asterisk/oml_pjsip_transports.conf' 
+      regexp: '{{ item.regexp }}'
+      line: '{{ item.line }}'
+    loop: 
+      - { regexp: "^bind=0.0.0.0:5160", line: "bind={{ ha_vip }}:5160" }
+      - { regexp: "^bind=0.0.0.0:5161", line: "bind={{ ha_vip }}:5060" }
+    when: deploy_ha is defined

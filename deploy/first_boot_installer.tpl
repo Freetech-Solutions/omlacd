@@ -18,7 +18,7 @@
 
 # *********************************** SET ENV VARS **************************************************
 # The infrastructure environment:
-# centos | amazon_linux
+# onpremise | amazon_linux
 #export oml_infras_stage=
 
 # Component gitlab branch
@@ -63,10 +63,20 @@
 #export s3_secret_key=
 #export s3url=
 
-# auto-restore custom and override and custom agis 
-#export oml_backup_filename=NULL
-# backup filename
-#export oml_auto_restore=NULL
+# Uncomment for HA
+#export oml_deploy_ha=true
+# node role values: main | backup
+#export oml_ha_rol=MASTER
+# Virtual IP for HA cluster
+#export oml_ha_vip=IP_ADDR/PREFIX
+# NIC for VIP
+#export oml_ha_vip_nic=NIC
+# Tenant name
+#export oml_ha_tenant=
+# Email for failover notifications
+#export oml_ha_email=
+# Host NETADDR main node
+#export oml_ha_node_main_host=10.10.10.4
 
 # *********************************** SET ENV VARS **************************************************
 
@@ -99,31 +109,31 @@ case ${oml_infras_stage} in
      amazon-linux-extras install python3 -y
      systemctl start amazon-ssm-agent
      ;;
-   centos)
+   onpremise)
      yum -y install epel-release git python3 python3-pip libselinux-python3 awscli
      ;;
  esac
 
 yum install -y ncurses-devel make libpcap-devel pcre-devel openssl-devel git gcc autoconf automake lame gsm
 
-# echo "************************ install ansible *************************"
-# echo "************************ install ansible *************************"
+echo "************************ install ansible *************************"
+echo "************************ install ansible *************************"
 pip3 install pip --upgrade
 pip3 install boto boto3 botocore 'ansible==2.9.9' selinux awscli
 export PATH="$HOME/.local/bin/:$PATH"
 
-# echo "************************ clone REPO *************************"
-# echo "************************ clone REPO *************************"
-# echo "************************ clone REPO *************************"
+echo "************************ clone REPO *************************"
+echo "************************ clone REPO *************************"
+echo "************************ clone REPO *************************"
 cd $SRC
 git clone $COMPONENT_REPO
 cd omlacd
 git checkout ${oml_acd_release}
 cd deploy
 
-# echo "******************************************* config and install *****************************************"
-# echo "******************************************* config and install *****************************************"
-# echo "******************************************* config and install *****************************************"
+echo "******************************************* config and install *****************************************"
+echo "******************************************* config and install *****************************************"
+echo "******************************************* config and install *****************************************"
 sed -i "s%\TZ=set_your_timezone_here%TZ=${oml_tz}%g" ./inventory
 sed -i "s/omnileads_hostname=omnileads/omnileads_hostname=${oml_app_host}/g" ./inventory
 sed -i "s/redis_hostname=redis/redis_hostname=${oml_redis_host}/g" ./inventory
@@ -160,6 +170,18 @@ sed -i "s%\#s3_bucket_name=%s3_bucket_name=${s3_bucket_name}%g" ./inventory
 fi
 if [[ "${s3url}" != "NULL" ]];then
 sed -i "s%\#s3url=%s3url=${s3url}%g" ./inventory
+fi
+
+if [[ "${oml_deploy_ha}" == "true" ]];then
+sed -i "s/#deploy_ha=true/deploy_ha=true/g" ./inventory
+sed -i "s/#ha_rol=/ha_rol=${oml_ha_rol}/g" ./inventory
+sed -i "s%\#ha_vip=%ha_vip=${oml_ha_vip}%g" ./inventory
+sed -i "s/#ha_vip_nic=/ha_vip_nic=${oml_ha_vip_nic}/g" ./inventory
+sed -i "s/#ha_notification_email=/ha_notification_email=${oml_ha_email}/g" ./inventory
+sed -i "s/#ha_tenant=/ha_tenant=${oml_ha_tenant}/g" ./inventory
+sed -i "s/#ha_node_main_host=/ha_node_main_host=${oml_ha_node_main_host}/g" ./inventory
+
+echo "net.ipv4.ip_nonlocal_bind = 1"  >> /etc/sysctl.conf
 fi
 
 ansible-playbook asterisk.yml -i inventory --extra-vars "asterisk_version=$(cat ../.package_version)"
@@ -209,5 +231,3 @@ echo "********************************** sngrep SIP sniffer install ************
 cd $SRC && git clone https://github.com/irontec/sngrep
 cd sngrep && ./bootstrap.sh && ./configure && make && make install
 ln -s /usr/local/bin/sngrep /usr/bin/sngrep
-
-reboot
