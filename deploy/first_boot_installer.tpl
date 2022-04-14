@@ -24,15 +24,15 @@
 # Component gitlab branch
 #export oml_acd_release=
 
-# Put here the public NAT ipaddr 
+# Put here the public NAT ipaddr
 # in case of NULL the ip will be auto-discover
 #export oml_nat_ipaddr=NULL
 
-# Time Zone configuration (example: America/Argentina/Cordoba) 
-#export oml_tz=put_your_time_zone_here 
+# Time Zone configuration (example: America/Argentina/Cordoba)
+#export oml_tz=put_your_time_zone_here
 
-# Time Zone configuration (example: America/Argentina/Cordoba) 
-#export oml_tz=put_your_time_zone_here 
+# Time Zone configuration (example: America/Argentina/Cordoba)
+#export oml_tz=put_your_time_zone_here
 
 # OMLApp netaddr
 #export oml_app_host=
@@ -50,7 +50,7 @@
 # AMI to connect from omlapp
 #export oml_ami_user=
 #export oml_ami_password=
-# call recordings store params: NULL | s3-aws | s3-do | s3-minio | nfs 
+# call recordings store params: NULL | s3-aws | s3-do | s3-minio | nfs
 #export oml_callrec_device=
 
 # NFS addr when you select NFS like store for callrec
@@ -66,7 +66,7 @@
 # Uncomment for HA
 #export oml_deploy_ha=true
 # node role values: main | backup
-#export oml_ha_rol=MASTER
+#export oml_ha_rol=
 # Virtual IP for HA cluster
 #export oml_ha_vip=IP_ADDR/PREFIX
 # NIC for VIP
@@ -103,7 +103,7 @@ echo "************************ yum install *************************"
 case ${oml_infras_stage} in
    amazon_linux)
      yum remove -y python3 python3-pip
-     yum install -y $SSM_AGENT_URL 
+     yum install -y $SSM_AGENT_URL
      yum install -y patch libedit-devel libuuid-devel git
      amazon-linux-extras install -y epel
      amazon-linux-extras install python3 -y
@@ -207,6 +207,12 @@ case ${oml_callrec_device} in
       fi
     echo "${nfs_host}:$CALLREC_DIR_TMP $CALLREC_DIR_DST nfs auto,nofail,noatime,nolock,intr,tcp,actimeo=1800 0 0" >> /etc/fstab
     mount -a
+    if [ "${oml_deploy_ha}" != "true" ];then
+      echo "0 1 * * * source /etc/profile.d/omnileads_envars.sh; /opt/omnileads/utils/conversor.sh 1 0 >> /opt/omnileads/log/conversor.log" >> /var/spool/cron/omnileads
+    fi
+    if [ "${oml_deploy_ha}" == "true" ] &&  [ "${oml_ha_rol}"  == "main" ];then
+      echo "0 1 * * * source /etc/profile.d/omnileads_envars.sh; /opt/omnileads/utils/conversor.sh 1 0 >> /opt/omnileads/log/conversor.log" >> /var/spool/cron/omnileads
+    fi
     ;;
   *)
     exit 0
