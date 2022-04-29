@@ -32,6 +32,7 @@ vrrp_instance {{ component }}_{{ ha_tenant }} {
     virtual_router_id 51
     priority {% if ha_rol == "main" %} 100 {% else %} 50 {% endif %} 
     advert_int 1
+    notify_master "/usr/bin/asterisk_transition.sh"
     authentication {
         auth_type PASS
         auth_pass 1111
