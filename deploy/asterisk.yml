@@ -295,14 +295,21 @@
   - name: check_component.sh script provissioning 
     template: src=templates/check_ha.j2 dest=/usr/bin/check_ha.sh
     when: deploy_ha is defined
-        
+
+  - name: asterisk_transition.sh script provissioning 
+    template: src=templates/asterisk_transition.sh dest=/usr/bin/asterisk_transition.sh
+    when: deploy_ha is defined
+
   - name: Set X permission to check_ha.sh script
-    ansible.builtin.file:
-      path: /usr/bin/check_ha.sh
+    file:
       owner: omnileads
       group: omnileads
       mode: '0744'
-    when: deploy_ha is defined  
+      path: /usr/bin/{{ item }}
+    with_items: 
+      - check_ha.sh
+      - asterisk_transition.sh
+    when: deploy_ha is defined     
 
   - name: Start Systemd High Availability TOOLs
     command: systemctl start {{ item }}.service

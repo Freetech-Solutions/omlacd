@@ -17,66 +17,67 @@
 ########################## README ############ README ############# README #########################
 
 # *********************************** SET ENV VARS **************************************************
-# The infrastructure environment:
-# onpremise | amazon_linux
+#### The infrastructure environment:
+#### onpremise | amazon_linux
 #export oml_infras_stage=
 
-# Component gitlab branch
+#### Component gitlab branch
 #export oml_acd_release=
 
-# Put here the public NAT ipaddr
-# in case of NULL the ip will be auto-discover
+#### Put here the public NAT ipaddr
+#### in case of NULL the ip will be auto-discover
 #export oml_nat_ipaddr=NULL
 
-# Time Zone configuration (example: America/Argentina/Cordoba)
+#### Time Zone configuration (example: America/Argentina/Cordoba)
 #export oml_tz=put_your_time_zone_here
 
-# Time Zone configuration (example: America/Argentina/Cordoba)
-#export oml_tz=put_your_time_zone_here
-
-# OMLApp netaddr
+#### OMLApp netaddr
 #export oml_app_host=
-# REDIS netaddr
+#### REDIS netaddr
 #export oml_redis_host=
-# POSTGRESQL netaddr and port
+#### POSTGRESQL netaddr and port
 #export oml_pgsql_host=
 #export oml_pgsql_port=
-# POSTGRESQL user, pass & DB params
+#### POSTGRESQL user, pass & DB params
 #export oml_pgsql_db=
 #export oml_pgsql_user=
 #export oml_pgsql_password=
-# IF PGSQL run on cloud cluster set this to true
+#### IF PGSQL run on cloud cluster set this to true
 #export oml_pgsql_cloud=NULL
-# AMI to connect from omlapp
+#### AMI to connect from omlapp
 #export oml_ami_user=
 #export oml_ami_password=
-# call recordings store params: NULL | s3-aws | s3-do | s3-minio | nfs
+#### call recordings store params: NULL | s3-aws | s3-do | s3-minio | nfs
 #export oml_callrec_device=
 
-# NFS addr when you select NFS like store for callrec
+#### NFS addr when you select NFS like store for callrec
 #export nfs_host=
 
-# S3 params when you select S3 like store for callrec
+#### S3 params when you select S3 like store for callrec
 #export s3_bucket_name=
-# in case use not AWS s3 bucket:
+#### in case use not AWS s3 bucket:
 #export s3_access_key=
 #export s3_secret_key=
 #export s3url=
 
-# Uncomment for HA
+#### Restore custom files in case of IaC
+#### NULL or true
+#export oml_auto_restore=NULL
+#### NULL or backup filename
+#export oml_backup_filename=NULL
+
+##### Uncomment ALL for HA
 #export oml_deploy_ha=true
-# node role values: main | backup
+##### node role values: main | backup
 #export oml_ha_rol=
-# Virtual IP for HA cluster
-#export oml_ha_vip=IP_ADDR/PREFIX
-# NIC for VIP
-#export oml_ha_vip_nic=NIC
-# Tenant name
+##### Virtual IP for HA cluster
+#export oml_ha_vip=
+##### NIC for VIP eth0 enp0s3 wl01 ...
+#export oml_ha_vip_nic=
+##### Tenant name
 #export oml_ha_tenant=
-# Email for failover notifications
+##### Email for failover notifications
 #export oml_ha_email=
-# Host NETADDR main node
-#export oml_ha_node_main_host=10.10.10.4
 
 # *********************************** SET ENV VARS **************************************************
 
