@@ -46,6 +46,7 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends --no-i
     uuid \
     uuid-dev \
     xmlstarlet \
+    libjansson-dev \
     wget
 
 apt-get purge -y --auto-remove
@@ -64,17 +65,19 @@ curl -vsL http://downloads.asterisk.org/pub/telephony/asterisk/old-releases/aste
 git clone https://github.com/felipem1210/asterisk-res_json
 ./asterisk-res_json/install.sh
 
+#contrib/scripts/install_prereq install
 contrib/scripts/get_mp3_source.sh
 
 ./configure --with-jansson-bundled
+#./configure 
 make menuselect/menuselect menuselect-tree menuselect.makeopts
 
 # disable BUILD_NATIVE to avoid platform issues
 menuselect/menuselect --disable BUILD_NATIVE menuselect.makeopts
-
+menuselect/menuselect --enable NOISY_BUILD menuselect.makeopts 
 # enable good things
 menuselect/menuselect --enable BETTER_BACKTRACES menuselect.makeopts
-menuselect/menuselect --enable chan_ooh323 menuselect.makeopts
+#menuselect/menuselect --enable chan_ooh323 menuselect.makeopts
 menuselect/menuselect --enable BETTER_BACKTRACES menuselect.makeopts
 menuselect/menuselect --enable format_mp3 menuselect.makeopts
 # codecs
