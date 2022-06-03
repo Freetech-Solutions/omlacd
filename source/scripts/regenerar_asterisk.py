@@ -32,6 +32,8 @@ import base64
 import tarfile
 import shutil
 
+from asterisk_ami import AMIManager
+
 ASTERISK_LOCATION = os.environ.get('ASTERISK_LOCATION') or ''
 OML_SERVER = os.environ.get('OMNILEADS_HOSTNAME') or 'localhost'
 WSURL = f'wss://{OML_SERVER}/consumers/stream/asterisk/conf/updater'
@@ -104,22 +106,31 @@ class RegenerarConfiguracion(object):
     def __init__(self, logger):
         super().__init__()
         self.logger = logger
+        self.ami_manager = AMIManager(logger)
 
     def procesa_stream(self, stream_data):
         # TODO: Refactorizar para dividir responsabilidades
         lista_data = self._json_string_a_lista(stream_data)
+        audio_custom_modificado = False
         for archivo in lista_data:
             if archivo['type'] == 'CONF_FILE':
                 if self._escribe_archivo_conf(archivo):
                     self._comando_regeneracion_asterisk(archivo['archivo'])
             elif archivo['type'] == 'AUDIO_CUSTOM' and archivo['action'] == 'COPY':
                 self._escribe_audio_custom(archivo)
+                audio_custom_modificado = True
             elif archivo['type'] == 'AUDIO_CUSTOM' and archivo['action'] == 'DELETE':
                 self._delete_audio_custom(archivo)
+                audio_custom_modificado = True
             elif archivo['type'] == 'ASTERISK_SOUNDS' and archivo['action'] == 'COPY':
                 self._escribe_asterisk_sounds(archivo)
             elif archivo['type'] == 'ASTERISK_PLAY_LIST_DIR' and archivo['action'] == 'DELETE':
                 self._delete_playlist_files(archivo)
+
+        if audio_custom_modificado:
+            self.ami_manager.connect()
+            self.ami_manager.module_reload()
+            self.ami_manager.disconnect()
 
     def _escribe_archivo_conf(self, archivo_info):
         nombre_archivo = archivo_info['archivo']
