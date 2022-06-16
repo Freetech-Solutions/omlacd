@@ -230,55 +230,8 @@
     when:
       - asterisk_out is defined
 
-# Restore backup in case of IaC deploy
-  - name: Restore backup when use infrasctructure as code - 1/2
-    vars:
-        ansible_python_interpreter: /usr/bin/python3
-    aws_s3:
-        s3_url: "{{ s3url }}"
-        aws_secret_key: "{{ s3_secret_key }}"
-        aws_access_key: "{{ s3_access_key }}"
-        bucket: "{{ s3_bucket_name }}"
-        object: "omlacd-backup/{{ backup_file_name }}.tar.gz"
-        dest: "/opt/omnileads/backup/{{ backup_file_name }}.tar.gz"
-        mode: get
-    delegate_to: localhost
-    register: backup_s3_download
-    until: backup_s3_download
-    when:
-      - asterisk_out is defined
-      - backup_file_name is defined
-      - auto_restore == "true"
-      - ansible_distribution != "Amazon"
-
-  - name: Restore backup when use infrasctructure as code - 1/2
-    vars:
-        ansible_python_interpreter: /usr/bin/python3
-    aws_s3:
-        bucket: "{{ s3_bucket_name }}"
-        object: "omlacd-backup/{{ backup_file_name }}.tar.gz"
-        dest: "/opt/omnileads/backup/{{ backup_file_name }}.tar.gz"
-        mode: get
-    delegate_to: localhost
-    register: backup_s3_download
-    until: backup_s3_download
-    when:
-      - asterisk_out is defined
-      - backup_file_name is defined
-      - auto_restore == "true"
-      - ansible_distribution == "Amazon"
-
-  - name: Restore backup when use infrasctructure as code - 2/2
-    command: bash -x /opt/omnileads/utils/backup-restore.sh --restore={{ backup_file_name }}.tar.gz --asterisk
-    until: backup_s3_download
-    when:
-      - asterisk_out is defined
-      - backup_file_name is defined
-      - auto_restore == "true"
-
 ###########################################################  HA Deploy ###########################################################
 ###########################################################  HA Deploy ###########################################################
-
 
   - name: Install High Availability TOOLs
     yum:
