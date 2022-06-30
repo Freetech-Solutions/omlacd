@@ -2,3 +2,4 @@ redis==3.5.3
 -e git+https://github.com/SrMoreno/pyst2@master#egg=pyst2
 websocket-client==0.58.0
 requests==2.27.1
+rethinkdb==2.4.8
