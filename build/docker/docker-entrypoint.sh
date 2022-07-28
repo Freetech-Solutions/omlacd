@@ -26,157 +26,146 @@ if [ "$1" == "" ]; then
   sed -i "s/^Port.*/Port                    = ${PGPORT}/g" /etc/odbc.ini
 
   cd /etc/asterisk
-  if [ ! -e  "oml_amd_custom.conf" ]; then 
-    touch oml_amd_custom.conf 
+  if [ ! -e  "oml_amd_custom.conf" ]; then
+    touch oml_amd_custom.conf
   fi
-  if [ ! -e  "oml_dahdi_custom.conf" ]; then 
-    touch oml_dahdi_custom.conf 
+  if [ ! -e  "oml_dahdi_custom.conf" ]; then
+    touch oml_dahdi_custom.conf
   fi
-  if [ ! -e  "oml_extensions_bridgecall_custom.conf" ]; then 
-    touch oml_extensions_bridgecall_custom.conf 
+  if [ ! -e  "oml_extensions_bridgecall_custom.conf" ]; then
+    touch oml_extensions_bridgecall_custom.conf
   fi
-  if [ ! -e  "oml_extensions_commonsub_custom.conf" ]; then 
-    touch oml_extensions_commonsub_custom.conf 
+  if [ ! -e  "oml_extensions_commonsub_custom.conf" ]; then
+    touch oml_extensions_commonsub_custom.conf
   fi
-  if [ ! -e  "oml_extensions_custom.conf" ]; then 
-    touch oml_extensions_custom.conf 
+  if [ ! -e  "oml_extensions_custom.conf" ]; then
+    touch oml_extensions_custom.conf
   fi
-  if [ ! -e  "oml_extensions_globals_custom.conf" ]; then 
-    touch oml_extensions_globals_custom.conf 
+  if [ ! -e  "oml_extensions_globals_custom.conf" ]; then
+    touch oml_extensions_globals_custom.conf
   fi
   if [ ! -e  "oml_extensions_inr_custom.conf" ]; then
-    touch oml_extensions_inr_custom.conf 
+    touch oml_extensions_inr_custom.conf
   fi
-  if [ ! -e  "oml_extensions_ivr_custom.conf" ]; then 
-    touch oml_extensions_ivr_custom.conf 
+  if [ ! -e  "oml_extensions_ivr_custom.conf" ]; then
+    touch oml_extensions_ivr_custom.conf
   fi
-  if [ ! -e  "oml_extensions_modules_custom.conf" ]; then 
-    touch oml_extensions_modules_custom.conf 
+  if [ ! -e  "oml_extensions_modules_custom.conf" ]; then
+    touch oml_extensions_modules_custom.conf
   fi
-  if [ ! -e  "oml_extensions_outr_custom.conf" ]; then 
-    touch oml_extensions_outr_custom.conf 
+  if [ ! -e  "oml_extensions_outr_custom.conf" ]; then
+    touch oml_extensions_outr_custom.conf
   fi
-  if [ ! -e  "oml_extensions_postcall_custom.conf" ]; then 
-    touch oml_extensions_postcall_custom.conf 
+  if [ ! -e  "oml_extensions_postcall_custom.conf" ]; then
+    touch oml_extensions_postcall_custom.conf
   fi
-  if [ ! -e  "oml_extensions_precall_custom.conf" ]; then 
-    touch oml_extensions_precall_custom.conf 
+  if [ ! -e  "oml_extensions_precall_custom.conf" ]; then
+    touch oml_extensions_precall_custom.conf
   fi
-  if [ ! -e  "oml_extensions_tc_custom.conf" ]; then 
-    touch oml_extensions_tc_custom.conf 
+  if [ ! -e  "oml_extensions_tc_custom.conf" ]; then
+    touch oml_extensions_tc_custom.conf
   fi
-  if [ ! -e  "oml_func_odbc_custom.conf" ]; then 
-    touch oml_func_odbc_custom.conf 
+  if [ ! -e  "oml_func_odbc_custom.conf" ]; then
+    touch oml_func_odbc_custom.conf
   fi
-  if [ ! -e  "oml_http_custom.conf" ]; then 
-    touch oml_http_custom.conf 
+  if [ ! -e  "oml_http_custom.conf" ]; then
+    touch oml_http_custom.conf
   fi
-  if [ ! -e  "oml_manager_custom.conf" ]; then 
-    touch oml_manager_custom.conf 
+  if [ ! -e  "oml_manager_custom.conf" ]; then
+    touch oml_manager_custom.conf
   fi
-  if [ ! -e  "oml_pjsip_custom.conf" ]; then 
-    touch oml_pjsip_custom.conf 
+  if [ ! -e  "oml_pjsip_custom.conf" ]; then
+    touch oml_pjsip_custom.conf
   fi
-  if [ ! -e  "oml_pjsip_wizard_custom.conf" ]; then 
-    touch oml_pjsip_wizard_custom.conf 
+  if [ ! -e  "oml_pjsip_wizard_custom.conf" ]; then
+    touch oml_pjsip_wizard_custom.conf
   fi
-  if [ ! -e  "oml_queues_custom.conf" ]; then 
-    touch oml_queues_custom.conf 
+  if [ ! -e  "oml_queues_custom.conf" ]; then
+    touch oml_queues_custom.conf
   fi
-  if [ ! -e  "oml_res_odbc_custom.conf" ]; then 
-    touch oml_res_odbc_custom.conf 
+  if [ ! -e  "oml_res_odbc_custom.conf" ]; then
+    touch oml_res_odbc_custom.conf
   fi
-  if [ ! -e  "oml_sip_general_custom.conf" ]; then 
-    touch oml_sip_general_custom.conf 
+  if [ ! -e  "oml_sip_general_custom.conf" ]; then
+    touch oml_sip_general_custom.conf
   fi
-  if [ ! -e  "oml_sip_registrations_custom.conf" ]; then 
-    touch oml_sip_registrations_custom.conf 
+  if [ ! -e  "oml_sip_registrations_custom.conf" ]; then
+    touch oml_sip_registrations_custom.conf
   fi
-  if [ ! -e  "oml_sip_trunks_custom.conf" ]; then 
-    touch oml_sip_trunks_custom.conf 
+  if [ ! -e  "oml_sip_trunks_custom.conf" ]; then
+    touch oml_sip_trunks_custom.conf
   fi
-  if [ ! -e  "oml_amd_override.conf" ]; then 
-    touch oml_amd_override.conf 
+  if [ ! -e  "oml_amd_override.conf" ]; then
+    touch oml_amd_override.conf
   fi
-  if [ ! -e  "oml_dahdi_override.conf" ]; then 
-    touch oml_dahdi_override.conf 
+  if [ ! -e  "oml_dahdi_override.conf" ]; then
+    touch oml_dahdi_override.conf
   fi
-  if [ ! -e  "oml_extensions_override.conf" ]; then 
-    touch oml_extensions_override.conf 
+  if [ ! -e  "oml_extensions_override.conf" ]; then
+    touch oml_extensions_override.conf
   fi
-  if [ ! -e  "oml_extensions_bridgecall_override.conf" ]; then 
-    touch oml_extensions_bridgecall_override.conf 
+  if [ ! -e  "oml_extensions_bridgecall_override.conf" ]; then
+    touch oml_extensions_bridgecall_override.conf
   fi
-  if [ ! -e  "oml_extensions_commonsub_override.conf" ]; then 
-    touch oml_extensions_commonsub_override.conf 
+  if [ ! -e  "oml_extensions_commonsub_override.conf" ]; then
+    touch oml_extensions_commonsub_override.conf
   fi
-  if [ ! -e  "oml_extensions_globals_override.conf" ]; then 
-    touch oml_extensions_globals_override.conf 
+  if [ ! -e  "oml_extensions_globals_override.conf" ]; then
+    touch oml_extensions_globals_override.conf
   fi
-  if [ ! -e  "oml_extensions_modules_override.conf" ]; then 
-    touch oml_extensions_modules_override.conf 
+  if [ ! -e  "oml_extensions_modules_override.conf" ]; then
+    touch oml_extensions_modules_override.conf
   fi
-  if [ ! -e  "oml_extensions_outr_override.conf" ]; then 
-    touch oml_extensions_outr_override.conf 
+  if [ ! -e  "oml_extensions_outr_override.conf" ]; then
+    touch oml_extensions_outr_override.conf
   fi
-  if [ ! -e  "oml_extensions_override.conf" ]; then 
-    touch oml_extensions_override.conf 
+  if [ ! -e  "oml_extensions_override.conf" ]; then
+    touch oml_extensions_override.conf
   fi
-  if [ ! -e  "oml_extensions_postcall_override.conf" ]; then 
-    touch oml_extensions_postcall_override.conf 
+  if [ ! -e  "oml_extensions_postcall_override.conf" ]; then
+    touch oml_extensions_postcall_override.conf
   fi
-  if [ ! -e  "oml_extensions_precall_override.conf" ]; then 
-    touch oml_extensions_precall_override.conf 
+  if [ ! -e  "oml_extensions_precall_override.conf" ]; then
+    touch oml_extensions_precall_override.conf
   fi
-  if [ ! -e  "oml_func_odbc_override.conf" ]; then 
-    touch oml_func_odbc_override.conf 
+  if [ ! -e  "oml_func_odbc_override.conf" ]; then
+    touch oml_func_odbc_override.conf
   fi
-  if [ ! -e  "oml_http_override.conf" ]; then 
-    touch oml_http_override.conf 
+  if [ ! -e  "oml_http_override.conf" ]; then
+    touch oml_http_override.conf
   fi
-  if [ ! -e  "oml_manager_override.conf" ]; then 
-    touch oml_manager_override.conf 
+  if [ ! -e  "oml_manager_override.conf" ]; then
+    touch oml_manager_override.conf
   fi
-  if [ ! -e  "oml_pjsip_override.conf" ]; then 
-    touch oml_pjsip_override.conf 
+  if [ ! -e  "oml_pjsip_override.conf" ]; then
+    touch oml_pjsip_override.conf
   fi
-  if [ ! -e  "oml_pjsip_wizard_override.conf" ]; then 
-    touch oml_pjsip_wizard_override.conf 
+  if [ ! -e  "oml_pjsip_wizard_override.conf" ]; then
+    touch oml_pjsip_wizard_override.conf
   fi
-  if [ ! -e  "oml_queues_override.conf" ]; then 
-    touch oml_queues_override.conf 
+  if [ ! -e  "oml_queues_override.conf" ]; then
+    touch oml_queues_override.conf
   fi
-  if [ ! -e  "oml_res_odbc_override.conf" ]; then 
-    touch oml_res_odbc_override.conf 
+  if [ ! -e  "oml_res_odbc_override.conf" ]; then
+    touch oml_res_odbc_override.conf
   fi
-  if [ ! -e  "oml_sip_general_override.conf" ]; then 
-    touch oml_sip_general_override.conf 
+  if [ ! -e  "oml_sip_general_override.conf" ]; then
+    touch oml_sip_general_override.conf
   fi
-  if [ ! -e  "oml_sip_registrations_override.conf" ]; then 
-    touch oml_sip_registrations_override.conf 
+  if [ ! -e  "oml_sip_registrations_override.conf" ]; then
+    touch oml_sip_registrations_override.conf
   fi
-  if [ ! -e  "oml_sip_trunks_override.conf" ]; then 
-    touch oml_sip_trunks_override.conf 
+  if [ ! -e  "oml_sip_trunks_override.conf" ]; then
+    touch oml_sip_trunks_override.conf
   fi
-  if [ ! -e  "oml_voicemail_custom.conf" ]; then 
-    touch oml_voicemail_custom.conf 
+  if [ ! -e  "oml_voicemail_custom.conf" ]; then
+    touch oml_voicemail_custom.conf
   fi
-  if [ ! -e  "oml_voicemail_override.conf" ]; then 
-    touch oml_voicemail_override.conf 
+  if [ ! -e  "oml_voicemail_override.conf" ]; then
+    touch oml_voicemail_override.conf
   fi
 
-  cd /usr/src
-  echo "Download en Asterisk sounds"
-  wget $ASTERISK_AUDIO_PROMPTS
-  mkdir -p /var/lib/asterisk/sounds/en
-  tar xzvf asterisk-core-sounds-en-alaw-current.tar.gz -C /var/lib/asterisk/sounds/en
-  rm -f asterisk-core-sounds-en-alaw-current.tar.gz
 
-  cd /usr/src
-  echo "Download OMniLeads sounds"
-  wget $OMNILEADS_AUDIO_PROMPTS
-  tar xzvf asterisk-oml-sounds-current.tar.gz -C /var/lib/asterisk/sounds/
-  rm -f asterisk-oml-sounds-current.tar.gz
 
   chown -R 1000:1000 /var/*/asterisk \
                      /usr/*/asterisk \
