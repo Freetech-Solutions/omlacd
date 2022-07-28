@@ -4,6 +4,7 @@
 /source/astconf/*_custom*
 /source/astconf/*_override*
 /source/sounds
+sounds
 /src
 /source/astconf/oml_pjsip_agents.conf
 /source/astconf/oml_pjsip_trunks.conf
