@@ -47,7 +47,6 @@ container-image:
 
 build-rpm:
   stage: build
-  variables:
   image: freetechsolutions/fpm-ansible:centos7
   script:
     - cd build/rpm && bash build_rpm.sh
