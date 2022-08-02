@@ -44,7 +44,7 @@ container-image:
   rules:
     - if: $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME == "develop"
     - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "develop"
-    - if: CI_PIPELINE_SOURCE == "web"
+    - if: $CI_PIPELINE_SOURCE == "web"
 
 build-rpm:
   stage: build
@@ -54,7 +54,7 @@ build-rpm:
   rules:
     - if: $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME == "develop"
     - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "develop"
-    - if: CI_PIPELINE_SOURCE == "web"
+    - if: $CI_PIPELINE_SOURCE == "web"
     
     #- /.*release.*$/
     #- /.*master.*$/
