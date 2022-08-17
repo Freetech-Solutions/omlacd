@@ -1,5 +1,5 @@
 [prodenv-aio]
-localhost ansible_connection=local 
+localhost ansible_connection=local
 
 [prodenv-aio:vars]
 
@@ -16,6 +16,7 @@ postgres_port=5432
 postgres_database=omnileads
 postgres_user=omnileads
 postgres_password=my_very_strong_pass
+postgres_ssl=false
 
 TZ=set_your_timezone_here
 
