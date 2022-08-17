@@ -231,7 +231,7 @@
       - asterisk_out is defined
 
   #Se modifica la ip en la que escucha postgres para postgres interno no hace falta
-  - name: Modify postgresql listen address
+  - name: Uncomment SSL require odbc.ini
     replace:
       path: '/etc/odbc.ini'
       regexp: "#SSLmode"
