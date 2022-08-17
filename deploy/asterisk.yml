@@ -234,8 +234,8 @@
   - name: Modify postgresql listen address
     lineinfile:
       path: '/etc/odbc.ini'
-      regexp: "^postgres_ssl=false"
-      line: "postgres_ssl=true"
+      regexp: "#SSLmode"
+      line: "SSLmode"
       state: present
     when: postgres_ssl == "true"
 
