@@ -42,6 +42,8 @@
 #export oml_pgsql_db=
 #export oml_pgsql_user=
 #export oml_pgsql_password=
+# - values: NULL or true
+#export oml_pgsql_ssl=
 #### IF PGSQL run on cloud cluster set this to true
 #export oml_pgsql_cloud=NULL
 #### AMI to connect from omlapp
@@ -143,6 +145,9 @@ sed -i "s/postgres_port=5432/postgres_port=${oml_pgsql_port}/g" ./inventory
 sed -i "s/postgres_database=omnileads/postgres_database=${oml_pgsql_db}/g" ./inventory
 sed -i "s/postgres_user=omnileads/postgres_user=${oml_pgsql_user}/g" ./inventory
 sed -i "s/postgres_password=my_very_strong_pass/postgres_password=${oml_pgsql_password}/g" ./inventory
+if [[ "${oml_pgsql_ssl}" != "NULL" ]];then
+sed -i "s/postgres_ssl=false/postgres_ssl=true/g" ./inventory
+fi
 sed -i "s/ami_user=omnileads/ami_user=${oml_ami_user}/g" ./inventory
 sed -i "s/ami_password=C12H17N2O4P_o98o98/ami_password=${oml_ami_password}/g" ./inventory
 

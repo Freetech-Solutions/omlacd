@@ -91,7 +91,7 @@
         {% endif %}
         {% endif %}
 
-        export ASTERISK_LOCATION  MONITORFORMAT CALLREC_DEVICE AMI_USER AMI_PASSWORD EXTERN_IP REDIS_HOSTNAME RETHINKDB_HOSTNAME PGHOST PGPORT PGDATABASE PGUSER  PGPASSWORD OMNILEADS_HOSTNAME {% if callrec_device != "local" %} S3_STORAGE_ENABLED S3_BUCKET_NAME {% if callrec_device != "s3-aws" %} S3_ENDPOINT AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY  AWS_DEFAULT_REGION {% endif %} {% endif %} 
+        export ASTERISK_LOCATION  MONITORFORMAT CALLREC_DEVICE AMI_USER AMI_PASSWORD EXTERN_IP REDIS_HOSTNAME RETHINKDB_HOSTNAME PGHOST PGPORT PGDATABASE PGUSER  PGPASSWORD OMNILEADS_HOSTNAME {% if callrec_device != "local" %} S3_STORAGE_ENABLED S3_BUCKET_NAME {% if callrec_device != "s3-aws" %} S3_ENDPOINT AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY  AWS_DEFAULT_REGION {% endif %} {% endif %}
     when: asterisk_out is defined
 
   - name: Remove All postgresql packages
@@ -230,6 +230,22 @@
     when:
       - asterisk_out is defined
 
+  #Se modifica la ip en la que escucha postgres para postgres interno no hace falta
+  - name: Modify postgresql listen address
+    lineinfile:
+      path: 'etc/odbc.ini'
+      regexp: "^postgres_ssl=false"
+      line: "postgres_ssl=true"
+      state: present
+    when: postgres_ssl == "true"
+
+  # Restarteamos servicio
+  - name: Restart Asterisk service
+    service:
+      name: asterisk
+      state: restarted
+      enabled: yes
+
 ###########################################################  HA Deploy ###########################################################
 ###########################################################  HA Deploy ###########################################################
 
@@ -241,15 +257,15 @@
       - keepalived
     when: deploy_ha is defined
 
-  - name: Keepalived config provissioning 
+  - name: Keepalived config provissioning
     template: src=templates/keepalived.j2 dest=/etc/keepalived/keepalived.conf
     when: deploy_ha is defined
 
-  - name: check_component.sh script provissioning 
+  - name: check_component.sh script provissioning
     template: src=templates/check_ha.j2 dest=/usr/bin/check_ha.sh
     when: deploy_ha is defined
 
-  - name: asterisk_transition.sh script provissioning 
+  - name: asterisk_transition.sh script provissioning
     template: src=templates/asterisk_transition.sh dest=/usr/bin/asterisk_transition.sh
     when: deploy_ha is defined
 
@@ -259,10 +275,10 @@
       group: omnileads
       mode: '0744'
       path: /usr/bin/{{ item }}
-    with_items: 
+    with_items:
       - check_ha.sh
       - asterisk_transition.sh
-    when: deploy_ha is defined     
+    when: deploy_ha is defined
 
   - name: Start Systemd High Availability TOOLs
     command: systemctl start {{ item }}.service
@@ -277,11 +293,11 @@
     when: deploy_ha is defined
 
   - name  : Modify oml_pjsip_transports.conf High Availability
-    lineinfile: 
-      dest: '{{ asterisk_location }}/etc/asterisk/oml_pjsip_transports.conf' 
+    lineinfile:
+      dest: '{{ asterisk_location }}/etc/asterisk/oml_pjsip_transports.conf'
       regexp: '{{ item.regexp }}'
       line: '{{ item.line }}'
-    loop: 
+    loop:
       - { regexp: "^bind=0.0.0.0:5160", line: "bind={{ ha_vip }}:5160" }
       - { regexp: "^bind=0.0.0.0:5161", line: "bind={{ ha_vip }}:5060" }
     when: deploy_ha is defined
