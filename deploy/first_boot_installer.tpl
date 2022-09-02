@@ -92,32 +92,8 @@ COMPONENT_REPO_DIR=omlacd
 CALLREC_DIR_TMP=/opt/omnileads/asterisk/var/spool/asterisk/monitor
 CALLREC_DIR_DST=/opt/callrec
 
-echo "************************ disable SElinux *************************"
-echo "************************ disable SElinux *************************"
-sed -i 's/^SELINUX=.*/SELINUX=disabled/' /etc/sysconfig/selinux
-sed -i 's/^SELINUX=.*/SELINUX=disabled/' /etc/selinux/config
-setenforce 0
-systemctl disable firewalld > /dev/null 2>&1
-systemctl stop firewalld > /dev/null 2>&1
-
-echo "************************ yum install *************************"
-echo "************************ yum install *************************"
-
-case ${oml_infras_stage} in
-   amazon_linux)
-     yum remove -y python3 python3-pip
-     yum install -y $SSM_AGENT_URL
-     yum install -y patch libedit-devel libuuid-devel git
-     amazon-linux-extras install -y epel
-     amazon-linux-extras install python3 -y
-     systemctl start amazon-ssm-agent
-     ;;
-   onpremise)
-     yum -y install epel-release git python3 python3-pip libselinux-python3 awscli
-     ;;
- esac
-
-yum install -y ncurses-devel make libpcap-devel pcre-devel openssl-devel git gcc autoconf automake lame gsm
+apt update
+apt install -y liburiparser1 liburiparser-dev sngrep
 
 echo "************************ install ansible *************************"
 echo "************************ install ansible *************************"
@@ -191,57 +167,5 @@ echo "net.ipv4.ip_nonlocal_bind = 1"  >> /etc/sysctl.conf
 fi
 
 ansible-playbook asterisk.yml -i inventory --extra-vars "asterisk_version=$(cat ../.package_version)"
-
-echo "************************ check if set SSLmode for PGSQL *************************"
-echo "************************ check if set SSLmode for PGSQL *************************"
-
-if [[ "${oml_pgsql_cloud}"  == "true" ]]; then
-  echo "digitalocean requiere SSL to connect PGSQL"
-  echo "SSLMode       = require" >> /etc/odbc.ini
-fi
-
-echo "************************ block_device mount *************************"
-echo "************************ block_device mount *************************"
-
-case ${oml_callrec_device} in
-  nfs)
-    echo "NFS callrec device \n"
-    yum install -y nfs-utils nfs-utils-lib lsof
-      if [ ! -d $CALLREC_DIR_DST ]; then
-          mkdir -p $CALLREC_DIR_DST
-          chown -R omnileads. $CALLREC_DIR_DST
-      fi
-    echo "${nfs_host}:$CALLREC_DIR_TMP $CALLREC_DIR_DST nfs auto,nofail,noatime,nolock,intr,tcp,actimeo=1800 0 0" >> /etc/fstab
-    mount -a
-    if [ "${oml_deploy_ha}" != "true" ];then
-      echo "0 1 * * * source /etc/profile.d/omnileads_envars.sh; /opt/omnileads/utils/conversor.sh 1 0 >> /opt/omnileads/log/conversor.log" >> /var/spool/cron/omnileads
-    fi
-    if [ "${oml_deploy_ha}" == "true" ] &&  [ "${oml_ha_rol}"  == "main" ];then
-      echo "0 1 * * * source /etc/profile.d/omnileads_envars.sh; /opt/omnileads/utils/conversor.sh 1 0 >> /opt/omnileads/log/conversor.log" >> /var/spool/cron/omnileads
-    fi
-    ;;
-  *)
-    exit 0
-    ;;
-esac
-
-echo "********************* Activate cron callrec mv & convert to mp3 and backup *****************"
-echo "********************* Activate cron callrec mv & convert to mp3 and backup *****************"
-mkdir /opt/omnileads/log && touch /opt/omnileads/log/conversor.log
-chown omnileads.omnileads -R /opt/omnileads/log
-
-echo "50 23 * * * source /etc/profile.d/omnileads_envars.sh && /opt/omnileads/utils/backup-restore.sh --backup --asterisk" >> /var/spool/cron/omnileads
-
-echo "******************** Restart asterisk ***************************"
-echo "******************** Restart asterisk ***************************"
-chown -R omnileads. /opt/omnileads/
-systemctl enable asterisk
-systemctl restart asterisk
-
-echo "********************************** sngrep SIP sniffer install *********************************"
-echo "********************************** sngrep SIP sniffer install *********************************"
-cd $SRC && git clone https://github.com/irontec/sngrep
-cd sngrep && ./bootstrap.sh && ./configure && make && make install
-ln -s /usr/local/bin/sngrep /usr/bin/sngrep
 
 reboot
