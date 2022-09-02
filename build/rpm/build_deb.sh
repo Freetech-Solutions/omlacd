@@ -20,12 +20,9 @@ if [ ! -d /opt/omnileads/asterisk ];then
   # 1.5 jobs per core works out okay
   : ${JOBS:=$(( $(nproc) + $(nproc) / 2 ))}
 
-  echo "Downloads some packages"
-  #yum -y groupinstall core base "Development Tools"
-  #yum -y install make wget openssl-devel ncurses-devel  newt-devel libxml2-devel kernel-devel gcc gcc-c++ sqlite-devel libxslt-devel libxslt uriparser
-
   echo "Compilling asterisk"
   # Execute asterisk prerequisites packages installation script
+  DEBIAN_FRONTEND=noninteractive contrib/scripts/install_prereq install
 
   # Add res_json install tasks
   git clone https://github.com/felipem1210/asterisk-res_json
@@ -52,16 +49,15 @@ if [ ! -d /opt/omnileads/asterisk ];then
   make config
   ldconfig
 
-  # # Install codec g729
-  # echo "Adding codec g729"
-  # mkdir -p /usr/src/codecs \
-  #   && cd /usr/src/codecs \
-  #   && wget https://${AWS_BUCKET}.s3.amazonaws.com/codec_g729.so \
-  #   && chmod 755 codec_g729.so \
-  #   && cp *.so ${ASTERISK_LOCATION}/lib64/asterisk/modules/
-  # cd /
-  # rm -rf /usr/src/asterisk \
-  #        /usr/src/codecs
+  # Install codec g729
+  echo "Adding codec g729"
+  mkdir -p /usr/src/codecs \
+    && cd /usr/src/codecs \
+    && wget https://${AWS_BUCKET}.s3.amazonaws.com/codec_g729.so \
+    && chmod 755 codec_g729.so \
+    && cp *.so ${ASTERISK_LOCATION}/lib64/asterisk/modules/
+  cd /
+  rm -rf /usr/src/asterisk /usr/src/codecs
 fi
 
 cd /builds/omnileads/omlacd
@@ -102,7 +98,7 @@ cp -a source/agis/* ${ASTERISK_LOCATION}/var/lib/asterisk/agi-bin/
 cp -a source/scripts/* ${VIRTUALENV_LOCATION}
 
 echo "Packing the deb"
-fpm -s dir -d python3 -d libxslt1-dev -d libxslt1 -d unixodbc -d wget -d liburiparser1 -t deb -n asterisk -v ${PACKAGE_VERSION} \
+fpm -s dir -t deb -n asterisk -v ${PACKAGE_VERSION} \
   --deb-user omnileads \
   --deb-group omnileads \
   --before-install build/rpm/scripts/before_install.sh \

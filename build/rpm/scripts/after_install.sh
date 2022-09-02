@@ -36,10 +36,10 @@ sed -i "s/^Port.*/Port                = ${PGPORT}/g" /etc/odbc.ini
 echo "Writing oml_res_odbc.conf file"
 sed -i "s/^username.*/username => ${PGUSER}/g" ${ASTERISK_LOCATION}/etc/asterisk/oml_res_odbc.conf
 
-echo "Linking postgresql ODBC library"
-if [ ! -f /usr/lib64/psqlodbcw.so ]; then
-  ln -s /usr/pgsql-11/lib/psqlodbcw.so /usr/lib64/psqlodbcw.so
-fi
+# echo "Linking postgresql ODBC library"
+# if [ ! -f /usr/lib64/psqlodbcw.so ]; then
+#   ln -s /usr/pgsql-11/lib/psqlodbcw.so /usr/lib64/psqlodbcw.so
+# fi
 
 if [ ! -d $ASTERISK_LOCATION/var/lib/asterisk/sounds/en ]; then
   cd /usr/src
@@ -58,15 +58,15 @@ if [ ! -d $ASTERISK_LOCATION/var/lib/asterisk/sounds/oml ]; then
   rm -f asterisk-oml-sounds-current.tar.gz
 fi
 
-echo "Changing permisions of ${ASTERISK_LOCATION}"
-chown -R omnileads. ${ASTERISK_LOCATION}
-rm -rf /etc/logrotate.d/omnileads
+# echo "Changing permisions of ${ASTERISK_LOCATION}"
+# chown -R omnileads. ${ASTERISK_LOCATION}
+# rm -rf /etc/logrotate.d/omnileads
 
-cd /usr/lib64/
-echo "Check if libtinfo.so.5 library is created"
-if [ ! -f libtinfo.so.5 ]; then
-  ln -s libtinfo.so.6 libtinfo.so.5
-fi
+# cd /usr/lib64/
+# echo "Check if libtinfo.so.5 library is created"
+# if [ ! -f libtinfo.so.5 ]; then
+#   ln -s libtinfo.so.6 libtinfo.so.5
+# fi
 
 echo "edit logger.conf based on PGSQL run isolete"
 if [[ $PGHOST != "localhost" ]]; then

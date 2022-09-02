@@ -9,9 +9,6 @@ ENV ANSIBLE_VERSION 2.9.2
 #ENV RPMFUSION_NONFREE=https://download1.rpmfusion.org/nonfree/el/rpmfusion-nonfree-release-8.noarch.rpm
 #ENV SDL2_LIBRARY=http://rpmfind.net/linux/epel/7/x86_64/Packages/s/SDL2-2.0.10-1.el7.x86_64.rpm
 
-ENV LANG en_US.UTF-8
-ENV LC_ALL en_US.UTF-8
-
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt update
 
@@ -21,7 +18,8 @@ RUN apt -y install ruby-dev \
 
 RUN apt update && \
     apt install -y git \
-    curl \ wget \
+    curl \
+    wget \
     libnewt-dev \
     libssl-dev \
     libncurses5-dev \
@@ -34,15 +32,6 @@ RUN apt update && \
     unixodbc \
     python3-pip \
     python3-venv
-
-    #####################
-    # Asterisk packages #
-    #####################
-    #  dh-autoreconf \
-    #  sqlite-devel \
-    #  subversion \
-    #  unixODBC \
-    #  unzip \
 
 RUN pip3 install "awscli==$AWS_CLI_VERSION"
 RUN pip3 install --upgrade pip
