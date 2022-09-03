@@ -33,6 +33,15 @@
   - name: Set timezone of server
     timezone: name={{ TZ }}
 
+  - name: Asterisk dependencies
+    apt:
+      name:
+        - liburiparser1
+        - liburiparser-dev
+        - unixodbc
+        - sngrep
+      state: present
+
   # Obtengo IP publica del nodo
   - name: Get public IP address of node
     shell: curl http://ipinfo.io/ip
@@ -121,7 +130,7 @@
 
   # Chequeo si existen ya los archivos custom y override dialplan, para no pisarlos
   - name: Check if custom and override files for dialplan exists
-    shell: "if [ $(ls -l {{ asterisk_location }}/etc/asterisk/oml_extensions_*_override.conf 2> /dev/null | wc -l) -gt 0 ] && [ $(ls -l {{ asterisk_location }}/etc/asterisk/oml_extensions_*_custom.conf 2> /dev/null | wc -l) -gt 0 ];then exit 1;else exit 0;fi"
+    shell: "if [ $(ls -l {{ asterisk_location }}/etc/asterisk/custom/oml_extensions_*_override.conf 2> /dev/null | wc -l) -gt 0 ] && [ $(ls -l {{ asterisk_location }}/etc/asterisk/custom/oml_extensions_*_custom.conf 2> /dev/null | wc -l) -gt 0 ];then exit 1;else exit 0;fi"
     changed_when: false
     failed_when: false
     register: ast_custom_exists
@@ -145,13 +154,13 @@
   #   when: asterisk_installed.stdout != asterisk_version
 
   # Se instala el paquete asterisk
-  - name: Install asterisk-{{ asterisk_version }} package (from s3 source)
+  - name: Download asterisk-{{ asterisk_version }} package (from s3 source)
     get_url:
       url: "{{ asterisk_package }}"
       dest: /tmp/
     register: s3_download
 
-  - name: install asterisk
+  - name: Install asterisk package {{ asterisk_version }}
     command: apt install /tmp/asterisk_{{ asterisk_version }}_amd64.deb
 
   - name: Create custom conf files folder
@@ -254,7 +263,7 @@
 
   - name: Modify NAT public IP PJSIP Asterisk
     lineinfile:
-      dest: "{{ asterisk_location }}/etc/asterisk/oml_pjsip_transports.conf"
+      dest: '{{ asterisk_location }}/etc/asterisk/oml_pjsip_transports.conf'
       regexp: '{{ item.regexp }}'
       line: '{{ item.line }}'
     loop:
@@ -263,7 +272,7 @@
 
   - name: Asterisk AMI User & Pass
     replace:
-      path: "{{ asterisk_location }}/etc/asterisk/oml_manager.conf"
+      path: '{{ asterisk_location }}/etc/asterisk/oml_manager.conf'
       regexp: '{{ item.regexp }}'
       replace: '{{ item.line }}'
     loop:
@@ -272,19 +281,19 @@
 
   - name: Callrec Path
     lineinfile:
-      dest: "{{ asterisk_location }}/etc/asterisk/oml_extensions_globals.conf"
+      dest: '{{ asterisk_location }}/etc/asterisk/oml_extensions_globals.conf'
       regexp: "^OMLRECPATH.*"
-      replace: "OMLRECPATH={{ asterisk_location }}/var/spool/asterisk/monitor
+      replace: "OMLRECPATH={{ asterisk_location }}/var/spool/asterisk/monitor"
 
   - name: Asterisk AMI User & Pass
     replace:
-      path: "{{ asterisk_location }}/etc/asterisk/logger.conf"
+      path: '{{ asterisk_location }}/etc/asterisk/logger.conf'
       regexp: "^;queue_log_realtime_use_gmt=yes"
-      replace:"^queue_log_realtime_use_gmt=yes"
+      replace: "queue_log_realtime_use_gmt=yes"
 
   - name: Modify Asterisk res_odbc.conf
     lineinfile:
-      path: "{{ asterisk_location }}/etc/asterisk/oml_res_odbc.conf"
+      path: '{{ asterisk_location }}/etc/asterisk/oml_res_odbc.conf'
       regexp: "^username.*"
       line: "username => {{ postgres_user }}"
       state: present
@@ -296,79 +305,12 @@
       replace: "SSLmode"
     when: postgres_ssl == "true"
 
-# Restarteamos servicio
+  # Restarteamos servicio
   - name: Restart Asterisk service
     service:
       name: asterisk
       state: restarted
       enabled: yes
-
-# ### Edit odbc.ini params INIT ##################
-#   - name: Modify odbc.ini Servername
-#     lineinfile:
-#       path: /etc/odbc.ini
-#       regexp: "^Servername.*"
-#       line: "Servername = {{ postgres_hostname }}"
-#       state: present
-#
-#   - name: Modify odbc.ini DB Name
-#     lineinfile:
-#       path: /etc/odbc.ini
-#       regexp: "^Database.*"
-#       line: "Database = {{ postgres_database }}"
-#       state: present
-#
-#   - name: Modify odbc.ini DB User
-#     lineinfile:
-#       path: /etc/odbc.ini
-#       regexp: "^UserName.*"
-#       line: "UserName = {{ postgres_user }}"
-#       state: present
-#
-#   - name: Modify odbc.ini DB Pass
-#     lineinfile:
-#       path: /etc/odbc.ini
-#       regexp: "^Password.*"
-#       line: "Password = {{ postgres_password }}"
-#       state: present
-#
-#   - name: Modify odbc.ini PG Port
-#     lineinfile:
-#       path: /etc/odbc.ini
-#       regexp: "^Port.*"
-#       line: "Port = '{{ postgres_port }}'"
-#       state: present
-### Edit odbc.ini params FIN ##################
-
-### Edit /etc/asterisk files INIT ##################
-  # - name: Asterisk NAT Public IP pjsip
-  #   lineinfile:
-  #     path: "{{ asterisk_location }}/etc/asterisk/oml_pjsip_transports.conf"
-  #     regexp: "external_media_address=extern_ip_nat"
-  #     line: "external_media_address={{ extern_ip }}"
-  #     state: present
-  #
-  # - name: Asterisk NAT Public IP pjsip
-  #   lineinfile:
-  #     path: "{{ asterisk_location }}/etc/asterisk/oml_pjsip_transports.conf"
-  #     regexp: "external_signaling_address=extern_ip_nat"
-  #     line: "external_signaling_address={{ extern_ip }}"
-  #     state: present
-  #
-  # - name: Asterisk AMI user
-  #   lineinfile:
-  #     path: "{{ asterisk_location }}/etc/asterisk/oml_manager.conf"
-  #     regexp: "external_signaling_address=extern_ip_nat"
-  #     line: "external_signaling_address={{ extern_ip }}"
-  #     state: present
-  #
-  # - name: Asterisk AMI pass
-  #   lineinfile:
-  #     path: "{{ asterisk_location }}/etc/asterisk/oml_pjsip_transports.conf"
-  #     regexp: "external_signaling_address=extern_ip_nat"
-  #     line: "external_signaling_address={{ extern_ip }}"
-  #     state: present
-  #
 
 ###########################################################  HA Deploy ###########################################################
 ###########################################################  HA Deploy ###########################################################
