@@ -249,17 +249,27 @@
       - asterisk_out is defined
 
 ### Edit odbc.ini params INIT ##################
-  - name: Modify postgresql.conf High Availability
-    lineinfile:
-      dest: '/etc/odbc.ini'
-      regexp: '{{ item.regexp }}'
-      line: '{{ item.line }}'
-    loop:
-      - { regexp: "^Servername.*", line: "Servername = {{ postgres_hostname }}" }
-      - { regexp: "^Database.*", line: "Database = {{ postgres_database }}" }
-      - { regexp: "^UserName.*", line: "UserName = {{ postgres_user }}" }
-      - { regexp: "^Password.*", line: "Password = {{ postgres_password }}" }
-      - { regexp: "^Port.*", line: "Port = '{{ postgres_port }}'" }
+  # - name: Modify postgresql.conf High Availability
+  #   lineinfile:
+  #     dest: '/etc/odbc.ini'
+  #     regexp: '{{ item.regexp }}'
+  #     line: '{{ item.line }}'
+  #   loop:
+  #     - { regexp: "^Servername.*", line: "Servername = {{ postgres_hostname }}" }
+  #     - { regexp: "^Database.*", line: "Database = {{ postgres_database }}" }
+  #     - { regexp: "^UserName.*", line: "UserName = {{ postgres_user }}" }
+  #     - { regexp: "^Password.*", line: "Password = {{ postgres_password }}" }
+  #     - { regexp: "^Port.*", line: "Port = '{{ postgres_port }}'" }
+
+  - name: odbc.ini template render
+    template:
+      src: templates/odbc.ini
+      dest: /etc/odbc.ini
+
+  - name: odbcinst.ini file copy
+    template:
+      src: templates/odbcinst.ini
+      dest: /etc/odbcinst.ini
 
   - name: Modify NAT public IP PJSIP Asterisk
     lineinfile:
@@ -274,18 +284,18 @@
     replace:
       path: '{{ asterisk_location }}/etc/asterisk/oml_manager.conf'
       regexp: '{{ item.regexp }}'
-      replace: '{{ item.line }}'
+      replace: '{{ item.replace }}'
     loop:
-      - { regexp: "amiuser", replace: "{{ oml_ami_user }}" }
-      - {regexp: "amiuser", replace: "{{ oml_ami_user }}" }
+      - { regexp: "amiuser", replace: "{{ ami_user }}" }
+      - { regexp: "amipassword", replace: "{{ ami_password }}" }
 
-  - name: Callrec Path
-    lineinfile:
-      dest: '{{ asterisk_location }}/etc/asterisk/oml_extensions_globals.conf'
-      regexp: "^OMLRECPATH.*"
+  - name: Asterisk Callrec Folder
+    replace:
+      path: '{{ asterisk_location }}/etc/asterisk/oml_extensions_globals.conf'
+      regexp: "OMLRECPATH=/var/spool/asterisk/monitor"
       replace: "OMLRECPATH={{ asterisk_location }}/var/spool/asterisk/monitor"
 
-  - name: Asterisk AMI User & Pass
+  - name: Asterisk logger GMT Setting
     replace:
       path: '{{ asterisk_location }}/etc/asterisk/logger.conf'
       regexp: "^;queue_log_realtime_use_gmt=yes"
@@ -324,15 +334,21 @@
     when: deploy_ha is defined
 
   - name: Keepalived config provissioning
-    template: src=templates/keepalived.j2 dest=/etc/keepalived/keepalived.conf
+    template:
+      src: templates/keepalived.j2
+      dest: /etc/keepalived/keepalived.conf
     when: deploy_ha is defined
 
   - name: check_component.sh script provissioning
-    template: src=templates/check_ha.j2 dest=/usr/bin/check_ha.sh
+    template:
+      src: templates/check_ha.j2
+      dest: /usr/bin/check_ha.sh
     when: deploy_ha is defined
 
   - name: asterisk_transition.sh script provissioning
-    template: src=templates/asterisk_transition.sh dest=/usr/bin/asterisk_transition.sh
+    template:
+      src: templates/asterisk_transition.sh
+      dest: /usr/bin/asterisk_transition.sh
     when: deploy_ha is defined
 
   - name: Set X permission to check_ha.sh script
