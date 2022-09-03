@@ -39,6 +39,7 @@
         - liburiparser1
         - liburiparser-dev
         - unixodbc
+        - odbc-postgresql
         - sngrep
       state: present
 
