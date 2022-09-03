@@ -150,15 +150,23 @@
       url: "{{ asterisk_package }}"
       dest: /tmp/
     register: s3_download
-  
+
   - name: install asterisk
     command: apt install /tmp/asterisk_{{ asterisk_version }}_amd64.deb
+
+  - name: Create custom conf files folder
+    file:
+      path:  "{{ asterisk_location }}/etc/asterisk/custom"
+      state: directory
+      owner: omnileads
+      group: omnileads
+      mode: 0764
 
   # Creo archivos custom & override en fresh-install
   - name: Create _custom & _override astconf files
     when: ast_custom_exists.rc != 1
     file:
-      path: "{{ asterisk_location }}/etc/asterisk/{{ item }}"
+      path: "{{ asterisk_location }}/etc/asterisk/custom/{{ item }}"
       state: touch
       mode: 0664
       owner: omnileads
@@ -231,7 +239,56 @@
     when:
       - asterisk_out is defined
 
-  #Se modifica la ip en la que escucha postgres para postgres interno no hace falta
+### Edit odbc.ini params INIT ##################
+  - name: Modify postgresql.conf High Availability
+    lineinfile:
+      dest: '/etc/odbc.ini'
+      regexp: '{{ item.regexp }}'
+      line: '{{ item.line }}'
+    loop:
+      - { regexp: "^Servername.*", line: "Servername = {{ postgres_hostname }}" }
+      - { regexp: "^Database.*", line: "Database = {{ postgres_database }}" }
+      - { regexp: "^UserName.*", line: "UserName = {{ postgres_user }}" }
+      - { regexp: "^Password.*", line: "Password = {{ postgres_password }}" }
+      - { regexp: "^Port.*", line: "Port = '{{ postgres_port }}'" }
+
+  - name: Modify NAT public IP PJSIP Asterisk
+    lineinfile:
+      dest: "{{ asterisk_location }}/etc/asterisk/oml_pjsip_transports.conf"
+      regexp: '{{ item.regexp }}'
+      line: '{{ item.line }}'
+    loop:
+      - { regexp: "external_media_address=extern_ip_nat", line: "external_media_address={{ extern_ip }}" }
+      - { regexp: "external_signaling_address=extern_ip_nat", line: "external_signaling_address={{ extern_ip }}" }
+
+  - name: Asterisk AMI User & Pass
+    replace:
+      path: "{{ asterisk_location }}/etc/asterisk/oml_manager.conf"
+      regexp: '{{ item.regexp }}'
+      replace: '{{ item.line }}'
+    loop:
+      - { regexp: "amiuser", replace: "{{ oml_ami_user }}" }
+      - {regexp: "amiuser", replace: "{{ oml_ami_user }}" }
+
+  - name: Callrec Path
+    lineinfile:
+      dest: "{{ asterisk_location }}/etc/asterisk/oml_extensions_globals.conf"
+      regexp: "^OMLRECPATH.*"
+      replace: "OMLRECPATH={{ asterisk_location }}/var/spool/asterisk/monitor
+
+  - name: Asterisk AMI User & Pass
+    replace:
+      path: "{{ asterisk_location }}/etc/asterisk/logger.conf"
+      regexp: "^;queue_log_realtime_use_gmt=yes"
+      replace:"^queue_log_realtime_use_gmt=yes"
+
+  - name: Modify Asterisk res_odbc.conf
+    lineinfile:
+      path: "{{ asterisk_location }}/etc/asterisk/oml_res_odbc.conf"
+      regexp: "^username.*"
+      line: "username => {{ postgres_user }}"
+      state: present
+
   - name: Uncomment SSL require odbc.ini
     replace:
       path: '/etc/odbc.ini'
@@ -239,12 +296,79 @@
       replace: "SSLmode"
     when: postgres_ssl == "true"
 
-  # Restarteamos servicio
+# Restarteamos servicio
   - name: Restart Asterisk service
     service:
       name: asterisk
       state: restarted
       enabled: yes
+
+# ### Edit odbc.ini params INIT ##################
+#   - name: Modify odbc.ini Servername
+#     lineinfile:
+#       path: /etc/odbc.ini
+#       regexp: "^Servername.*"
+#       line: "Servername = {{ postgres_hostname }}"
+#       state: present
+#
+#   - name: Modify odbc.ini DB Name
+#     lineinfile:
+#       path: /etc/odbc.ini
+#       regexp: "^Database.*"
+#       line: "Database = {{ postgres_database }}"
+#       state: present
+#
+#   - name: Modify odbc.ini DB User
+#     lineinfile:
+#       path: /etc/odbc.ini
+#       regexp: "^UserName.*"
+#       line: "UserName = {{ postgres_user }}"
+#       state: present
+#
+#   - name: Modify odbc.ini DB Pass
+#     lineinfile:
+#       path: /etc/odbc.ini
+#       regexp: "^Password.*"
+#       line: "Password = {{ postgres_password }}"
+#       state: present
+#
+#   - name: Modify odbc.ini PG Port
+#     lineinfile:
+#       path: /etc/odbc.ini
+#       regexp: "^Port.*"
+#       line: "Port = '{{ postgres_port }}'"
+#       state: present
+### Edit odbc.ini params FIN ##################
+
+### Edit /etc/asterisk files INIT ##################
+  # - name: Asterisk NAT Public IP pjsip
+  #   lineinfile:
+  #     path: "{{ asterisk_location }}/etc/asterisk/oml_pjsip_transports.conf"
+  #     regexp: "external_media_address=extern_ip_nat"
+  #     line: "external_media_address={{ extern_ip }}"
+  #     state: present
+  #
+  # - name: Asterisk NAT Public IP pjsip
+  #   lineinfile:
+  #     path: "{{ asterisk_location }}/etc/asterisk/oml_pjsip_transports.conf"
+  #     regexp: "external_signaling_address=extern_ip_nat"
+  #     line: "external_signaling_address={{ extern_ip }}"
+  #     state: present
+  #
+  # - name: Asterisk AMI user
+  #   lineinfile:
+  #     path: "{{ asterisk_location }}/etc/asterisk/oml_manager.conf"
+  #     regexp: "external_signaling_address=extern_ip_nat"
+  #     line: "external_signaling_address={{ extern_ip }}"
+  #     state: present
+  #
+  # - name: Asterisk AMI pass
+  #   lineinfile:
+  #     path: "{{ asterisk_location }}/etc/asterisk/oml_pjsip_transports.conf"
+  #     regexp: "external_signaling_address=extern_ip_nat"
+  #     line: "external_signaling_address={{ extern_ip }}"
+  #     state: present
+  #
 
 ###########################################################  HA Deploy ###########################################################
 ###########################################################  HA Deploy ###########################################################
@@ -301,4 +425,3 @@
       - { regexp: "^bind=0.0.0.0:5160", line: "bind={{ ha_vip }}:5160" }
       - { regexp: "^bind=0.0.0.0:5161", line: "bind={{ ha_vip }}:5060" }
     when: deploy_ha is defined
-

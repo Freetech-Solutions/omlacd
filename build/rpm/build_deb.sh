@@ -98,12 +98,10 @@ cp -a source/agis/* ${ASTERISK_LOCATION}/var/lib/asterisk/agi-bin/
 cp -a source/scripts/* ${VIRTUALENV_LOCATION}
 
 echo "Packing the deb"
-fpm -s dir -d liburiparser1 -d liburiparser-dev -t deb -n asterisk -v ${PACKAGE_VERSION} \
+fpm -s dir -d liburiparser1 -d liburiparser-dev -d unixodbc -t deb -n asterisk -v ${PACKAGE_VERSION} \
   --deb-user omnileads \
   --deb-group omnileads \
   --before-install build/rpm/scripts/before_install.sh \
-  --after-install build/rpm/scripts/after_install.sh \
-  --after-remove build/rpm/scripts/after_remove.sh \
   -f ${ASTERISK_LOCATION} \
      build/rpm/asterisk.service=/etc/systemd/system/asterisk.service \
      build/rpm/asterisk-reloader.service=/etc/systemd/system/asterisk-reloader.service \
