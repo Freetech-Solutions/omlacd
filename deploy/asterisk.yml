@@ -146,12 +146,13 @@
 
   # Se instala el paquete asterisk
   - name: Install asterisk-{{ asterisk_version }} package (from s3 source)
-    command: apt install -y {{ asterisk_package }}
-    tags: postinstall
-#    when: asterisk_installed.stdout != asterisk_version
+    get_url:
+      url: "{{ asterisk_package }}"
+      dest: /tmp/
     register: s3_download
-#    failed_when:
-#      - "s3_download.rc != 0 or 'scriptlet failure' in s3_download.stderr"
+  
+  - name: install asterisk
+    command: apt install /tmp/asterisk_{{ asterisk_version }}_amd64.deb
 
   # Creo archivos custom & override en fresh-install
   - name: Create _custom & _override astconf files
@@ -300,3 +301,4 @@
       - { regexp: "^bind=0.0.0.0:5160", line: "bind={{ ha_vip }}:5160" }
       - { regexp: "^bind=0.0.0.0:5161", line: "bind={{ ha_vip }}:5060" }
     when: deploy_ha is defined
+
