@@ -41,6 +41,7 @@
         - unixodbc
         - odbc-postgresql
         - sngrep
+        - awscli
       state: present
 
   # Obtengo IP publica del nodo
