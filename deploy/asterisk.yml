@@ -72,7 +72,7 @@
 
   - name: Set of environments variables
     copy:
-      dest: "/etc/profile.d/omnileads_envars.sh"
+      dest: "/etc/omnileads-asterisk.env"
       content: |
         ASTERISK_LOCATION={{ asterisk_location }}
         MONITORFORMAT=mp3
