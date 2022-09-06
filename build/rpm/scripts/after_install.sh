@@ -9,8 +9,8 @@ if [ ! -f /usr/sbin/asterisk ]; then
   echo "Linking asterisk binary asterisk to /usr/sbin"
   ln -s $ASTERISK_LOCATION/sbin/asterisk /usr/sbin/asterisk
 fi
-if [ -f /etc/profile.d/omnileads_envars.sh ]; then
-  source /etc/profile.d/omnileads_envars.sh
+if [ -f /etc/omnileads-asterisk.env ]; then
+  source /etc/omnileads-asterisk.env
 else
   echo "Omnileads envars not found, exiting"
   exit 1
