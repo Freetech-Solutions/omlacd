@@ -98,7 +98,8 @@ cp -a source/agis/* ${ASTERISK_LOCATION}/var/lib/asterisk/agi-bin/
 cp -a source/scripts/* ${VIRTUALENV_LOCATION}
 
 echo "Packing the deb"
-fpm -s dir -t deb -n asterisk -v ${PACKAGE_VERSION} \
+fpm -s dir -d liburiparser1 -d liburiparser-dev -d unixodb -d odbc-postgresql \
+  -t deb -n asterisk -v ${PACKAGE_VERSION} \
   --deb-user omnileads \
   --deb-group omnileads \
   --before-install build/rpm/scripts/before_install.sh \
@@ -107,7 +108,7 @@ fpm -s dir -t deb -n asterisk -v ${PACKAGE_VERSION} \
      build/rpm/asterisk.service=/etc/systemd/system/asterisk.service \
      build/rpm/asterisk-reloader.service=/etc/systemd/system/asterisk-reloader.service \
      source/logrotate/asterisk=/etc/logrotate.d/asterisk \
-  
+
 mv asterisk_${PACKAGE_VERSION}* /root
 echo "Uploading RPM to AWS repository"
 aws s3 cp /root/asterisk_${PACKAGE_VERSION}_amd64.deb s3://${AWS_BUCKET}/asterisk/asterisk_${PACKAGE_VERSION}_amd64.deb

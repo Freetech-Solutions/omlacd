@@ -36,13 +36,10 @@
   - name: Asterisk dependencies
     apt:
       name:
-        - liburiparser1
-        - liburiparser-dev
-        - unixodbc
-        - odbc-postgresql
         - sngrep
         - awscli
       state: present
+    when: asterisk_out is defined
 
   # Obtengo IP publica del nodo
   - name: Get public IP address of node
