@@ -5,14 +5,14 @@ After=syslog.target network-online.target
 [Service]
 Type=forking
 User=omnileads
-EnvironmentFile=/etc/omnileads-asterisk.env
+EnvironmentFile=/etc/omnileads/asterisk.env
 Environment=USER=omnileads
 LimitNOFILE=infinity
-ExecStartPre=/bin/bash -c 'source /opt/omnileads/asterisk/virtualenv/bin/activate'
+ExecStartPre=/bin/bash -c 'source /etc/asterisk/virtualenv/bin/activate'
 ExecStart=/usr/sbin/asterisk -U $USER -G $USER -g
 ExecReload=/usr/sbin/asterisk -x 'core restart gracefully'
 ExecStop=/usr/sbin/asterisk -x 'core stop now'
-PIDFile=/opt/omnileads/asterisk/var/run/asterisk/asterisk.pid
+PIDFile=/var/run/asterisk/asterisk.pid
 RuntimeDirectory=asterisk
 RuntimeDirectoryMode=755
 Restart=on-failure

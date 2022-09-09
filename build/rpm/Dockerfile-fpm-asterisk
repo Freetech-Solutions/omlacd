@@ -1,4 +1,4 @@
-FROM ubuntu:22.04
+FROM debian:bullseye
 
 ENV AWS_CLI_VERSION 1.18.5
 ENV ANSIBLE_VERSION 2.9.2
@@ -20,12 +20,12 @@ RUN apt update && \
     apt install -y git \
     curl \
     wget \
+    subversion \
     libnewt-dev \
     libssl-dev \
     libncurses5-dev \
     subversion \
     libsqlite3-dev \
-    build-essential \
     libjansson-dev \
     libxml2-dev \
     uuid-dev \
