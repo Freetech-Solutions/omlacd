@@ -19,6 +19,9 @@
 
 - name: Asterisk installation and configuration
   hosts: prodenv-aio
+  tags:
+    - telephone
+    - asterisk
   vars:
     cron_location: /var/spool/cron/omnileads
     packages_url: https://fts-public-packages.s3.amazonaws.com
