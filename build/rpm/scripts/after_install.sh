@@ -9,8 +9,8 @@ chown -R omnileads.omnileads /etc/asterisk
 chown -R omnileads.omnileads /var/{lib,log,spool}/asterisk
 chown -R omnileads.omnileads /usr/lib64/asterisk
 
-if [ -f /etc/omnileads/asterisk.env ]; then
-  source /etc/omnileads/asterisk.env
+if [ -f /etc/default/omnileads_asterisk.env ]; then
+  source /etc/default/omnileads_asterisk.env
 else
   echo "Omnileads envars not found, exiting"
   exit 1

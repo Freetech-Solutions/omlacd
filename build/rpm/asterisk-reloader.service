@@ -6,7 +6,7 @@ After=syslog.target network-online.target
 [Service]
 Type=simple
 User=omnileads
-EnvironmentFile=/etc/omnileads-asterisk.env
+EnvironmentFile=/etc/default/omnileads_asterisk.env
 ExecStartPre=/bin/bash -c 'source /etc/asterisk/virtualenv/bin/activate'
 ExecStart=/opt/omnileads/asterisk/virtualenv/bin/python3 /etc/asterisk/virtualenv/regenerar_asterisk.py
 ExecStop=/usr/bin/pkill -f "python3 regenerar_asterisk.py"

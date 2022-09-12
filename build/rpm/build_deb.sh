@@ -21,14 +21,14 @@ if [ ! -d /etc/asterisk ];then
 
   echo "Compilling asterisk"
   # Execute asterisk prerequisites packages installation script
-  DEBIAN_FRONTEND=noninteractive contrib/scripts/install_prereq install
+  #DEBIAN_FRONTEND=noninteractive contrib/scripts/install_prereq install
 
   # Add res_json install tasks
   git clone https://github.com/felipem1210/asterisk-res_json
   ./asterisk-res_json/install.sh
 
   # Configure
-  ./configure --with-jansson-bundled --libdir=/usr/lib64
+  ./configure --with-jansson-bundled
   make menuselect/menuselect menuselect-tree menuselect.makeopts
 
   # disable BUILD_NATIVE to avoid platform issues
@@ -36,6 +36,7 @@ if [ ! -d /etc/asterisk ];then
 
   # enable good things
   menuselect/menuselect --enable BETTER_BACKTRACES menuselect.makeopts
+
   menuselect/menuselect --disable res_xmpp.so pbx_lua.so pbx_spool.so \
   res_fax.so res_fax_spandsp.so pbx_dundi.so pbx_ael.so func_speex.so \
   chan_sip.so chan_skinny.so chan_oss.so chan_motif.so chan_mgcp.so  \
@@ -57,9 +58,9 @@ if [ ! -d /etc/asterisk ];then
   echo "Adding codec g729"
   mkdir -p /usr/src/codecs \
     && cd /usr/src/codecs \
-    && wget https://${AWS_BUCKET}.s3.amazonaws.com/codec_g729.so \
-    && chmod 755 codec_g729.so \
-    && cp *.so /user/lib/asterisk/modules/
+    && wget https://${AWS_BUCKET}.s3.amazonaws.com/codec_g729_ast18.so \
+    && chmod 755 codec_g729_ast18.so \
+    && cp codec_g729_ast18.so /user/lib/asterisk/modules/codec_g729.so
   cd /
   rm -rf /usr/src/asterisk /usr/src/codecs
 fi
@@ -114,9 +115,9 @@ fpm -s dir -d liburiparser1 -d liburiparser-dev -d unixodbc -d odbc-postgresql -
      /var/spool/asterisk \
      /var/log/asterisk \
      /usr/sbin/asterisk \
-     /usr/lib64/asterisk \
-     /usr/lib64/libasteriskpj.so.2=/usr/lib/x86_64-linux-gnu/libasteriskpj.so.2 \
-     /usr/lib64/libasteriskssl.so.1=/usr/lib/x86_64-linux-gnu/libasteriskssl.so.1 \
+     /usr/lib/asterisk \
+     /usr/lib/libasteriskpj.so.2=/usr/lib/x86_64-linux-gnu/libasteriskpj.so.2 \
+     /usr/lib/libasteriskssl.so.1=/usr/lib/x86_64-linux-gnu/libasteriskssl.so.1 \
      build/rpm/asterisk.service=/etc/systemd/system/omnileads-asterisk.service \
      build/rpm/asterisk-reloader.service=/etc/systemd/system/omnileads-asterisk-reloader.service \
      source/logrotate/asterisk=/etc/logrotate.d/asterisk \
