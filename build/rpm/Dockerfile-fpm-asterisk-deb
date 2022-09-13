@@ -33,6 +33,5 @@ RUN apt update && \
     python3-pip \
     python3-venv
 
-RUN pip3 install "awscli==$AWS_CLI_VERSION"
 RUN pip3 install --upgrade pip
-RUN pip3 install "ansible==$ANSIBLE_VERSION" --user
+RUN pip3 install "awscli==$AWS_CLI_VERSION"

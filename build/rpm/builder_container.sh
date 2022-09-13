@@ -1,4 +1,7 @@
 #!/bin/bash
+
+# ARG1 --- $1 = deb or rpm
+
 GREEN='\033[0;32m'
 RED='\033[0;31m'
 NC='\033[0m' # No Color
@@ -17,4 +20,4 @@ docker run -it --rm --name asterisk-fpm \
   --mount type=bind,source="$(pwd)"/../..,target=/builds/omnileads/omlacd \
   --env-file .env \
   --network=host --workdir=/builds/omnileads/omlacd/ \
-  freetechsolutions/fpm-asterisk:latest bash
+  freetechsolutions/fpm-asterisk-$1:latest bash
