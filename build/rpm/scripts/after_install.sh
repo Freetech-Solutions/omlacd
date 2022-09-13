@@ -7,7 +7,7 @@ OMNILEADS_AUDIO_PROMPTS=https://fts-public-packages.s3-sa-east-1.amazonaws.com/a
 usermod -aG audio,dialout omnileads
 chown -R omnileads.omnileads /etc/asterisk
 chown -R omnileads.omnileads /var/{lib,log,spool}/asterisk
-chown -R omnileads.omnileads /usr/lib64/asterisk
+chown -R omnileads.omnileads /usr/lib/asterisk
 
 if [ -f /etc/default/omnileads_asterisk.env ]; then
   source /etc/default/omnileads_asterisk.env

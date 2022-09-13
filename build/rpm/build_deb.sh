@@ -37,10 +37,10 @@ if [ ! -d /etc/asterisk ];then
   # enable good things
   menuselect/menuselect --enable BETTER_BACKTRACES menuselect.makeopts
 
-  menuselect/menuselect --disable res_xmpp.so pbx_lua.so pbx_spool.so \
-  res_fax.so res_fax_spandsp.so pbx_dundi.so pbx_ael.so func_speex.so \
-  chan_sip.so chan_skinny.so chan_oss.so chan_motif.so chan_mgcp.so  \
-  chan_alsa.so app_zapateller.so codec_speex.so menuselect.makeopts
+  menuselect/menuselect --disable res_xmpp pbx_lua pbx_spool \
+  res_fax res_fax_spandsp pbx_dundi pbx_ael func_speex \
+  chan_sip chan_skinny chan_oss chan_motif chan_mgcp  \
+  chan_alsa app_zapateller format_ogg_speex codec_speex menuselect.makeopts
 
 #  menuselect/menuselect --enable codec_opus menuselect.makeopts
 
@@ -103,9 +103,9 @@ rm -rf /etc/asterisk/*override*
 cp -a source/agis/* /var/lib/asterisk/agi-bin/
 cp -a source/scripts/* ${VIRTUALENV_LOCATION}
 
-echo "Packing the deb"
+echo "Packing asterisk like .deb"
 fpm -s dir -d liburiparser1 -d liburiparser-dev -d unixodbc -d odbc-postgresql -d libxslt1.1 \
-  -t deb -n asterisk -v ${PACKAGE_VERSION} \
+  -t deb --deb-no-default-config-files -n oml_asterisk -v ${PACKAGE_VERSION} \
   --deb-user omnileads \
   --deb-group omnileads \
   --before-install build/rpm/scripts/before_install.sh \
@@ -122,6 +122,6 @@ fpm -s dir -d liburiparser1 -d liburiparser-dev -d unixodbc -d odbc-postgresql -
      build/rpm/asterisk-reloader.service=/etc/systemd/system/omnileads-asterisk-reloader.service \
      source/logrotate/asterisk=/etc/logrotate.d/asterisk \
 
-mv asterisk_${PACKAGE_VERSION}* /root
-echo "Uploading RPM to AWS repository"
-aws s3 cp /root/asterisk_${PACKAGE_VERSION}_amd64.deb s3://${AWS_BUCKET}/asterisk/omnileads_asterisk_${PACKAGE_VERSION}_amd64.deb
+mv oml-asterisk_* /root
+echo "Uploading DEB to AWS repository"
+aws s3 cp /root/oml-asterisk_${PACKAGE_VERSION}_amd64.deb s3://${AWS_BUCKET}/asterisk/omnileads_asterisk_${PACKAGE_VERSION}_amd64.deb
