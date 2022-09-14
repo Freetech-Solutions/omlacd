@@ -93,7 +93,7 @@ source ${VIRTUALENV_LOCATION}/bin/activate
 pip3 install setuptools --upgrade
 echo "Installing the requirements packages"
 pip3 install wheel
-pip3 install -r build/docker/acdbuilder/requirements.txt --exists-action 'w'
+pip3 install -r build/docker/requirements.txt --exists-action 'w'
 
 echo "Adding conf, agis, logrotate and legacy scripts omnileads"
 cp -a source/astconf/* ${ASTERISK_LOCATION}/etc/asterisk/

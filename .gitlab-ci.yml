@@ -2,56 +2,79 @@ stages:
   - build
   - deploy
 
-build-image:
-  stage: build
+variables:
+  IMG_TAG: test
+
+workflow:
+  rules:
+    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == 'master'
+      variables:
+        IMG_TAG: latest
+    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == 'develop'
+      variables:
+        IMG_TAG: develop
+    - when: always       
+
+container-image:
   services:
-    - name: docker:dind
-      entrypoint: ["env", "-u", "DOCKER_HOST"]
-      command: ["dockerd-entrypoint.sh"]
-  variables:
-    DOCKER_HOST: tcp://docker:2375/
-    DOCKER_DRIVER: overlay2
-    # See https://github.com/docker-library/docker/pull/166
-    DOCKER_TLS_CERTDIR: ""
-  image: gitlab/dind
+    - docker:20.10.15-dind-alpine3.15
+  image: docker:20.10.15-alpine3.15
+  stage: build
+  before_script:
+    - apk add --no-cache docker-cli-buildx	
   script:
-    - cd build/docker && bash build_image.sh
-  only:
-    - web
-    - merge_requests
-    - /.*pre-release.*$/
-    #- /.*release.*$/
-    #- /.*master.*$/
+    - >-
+      docker buildx build
+      --file=build/docker/Dockerfile
+      --tag=dev
+      --target=dev
+      .
+    - >-
+      docker buildx build
+      --file=build/docker/Dockerfile
+      --tag=run
+      --target=run
+      .
+    - |-
+      if [ -n "${DOCKER_USER}" ] && [ -n "${DOCKER_PASSWORD}" ]; then
+        echo "${DOCKER_PASSWORD}" | docker login --username "${DOCKER_USER}" --password-stdin
+        docker tag run freetechsolutions/omlacd:$IMG_TAG
+        docker push docker.io/freetechsolutions/omlacd:$IMG_TAG
+      fi
+  rules:
+    - if: $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME == "develop"
+    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "develop"
+    - if: $CI_PIPELINE_SOURCE == "web"
 
 build-rpm:
   stage: build
-  variables:
   image: freetechsolutions/fpm-ansible:centos7
   script:
     - cd build/rpm && bash build_rpm.sh
-  only:
-    - web
-    - merge_requests
-    - /.*pre-release.*$/
+  rules:
+    - if: $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME == "develop"
+    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "develop"
+    - if: $CI_PIPELINE_SOURCE == "web"
+    
     #- /.*release.*$/
     #- /.*master.*$/
 
-deploy-acd-digitalocean:
-  stage: deploy
-  environment: DOCTL_DIGITALOCEAN_AIO
-  script:
-    - bash ~/git_cleanup.sh
-    - bash ~/.env_do
-    - sleep 30
-    - doctl compute droplet create --image $DIGITAL_OCEAN_AIO_IMG --size $DIGITAL_OCEAN_AIO_SIZE --region $DIGITAL_OCEAN_REGION --ssh-keys $TF_VAR_ssh_key_fingerprint --user-data-file ~/omlacd/deploy/first_boot_installer.sh omlgitlab-cicd-acd.$CI_JOB_ID
-    - sleep 60
-    - IP=$(doctl compute droplet list |grep omlgitlab-cicd-acd.$CI_JOB_ID |awk '{print $3}') && echo "$IP 2 run tests"
-    - until curl -sk --head  --request GET https://$IP |grep "302" > /dev/null; do echo "Environment still being installed, sleeping 80 seconds"; sleep 80; done; echo "Environment is up"
-    - doctl compute droplet delete -f omlgitlab-cicd-aio.$CI_JOB_ID
-  tags:
-    - deploy-acd
-  only:
-    - /.*deploy.*$/
-    - /.*pre-release.*$/
-    - web
-    - merge_requests
+# deploy-acd-digitalocean:
+#   stage: deploy
+#   environment: DOCTL_DIGITALOCEAN_AIO
+#   script:
+#     - bash ~/git_cleanup.sh
+#     - bash ~/.env_do
+#     - sleep 30
+#     - doctl compute droplet create --image $DIGITAL_OCEAN_AIO_IMG --size $DIGITAL_OCEAN_AIO_SIZE --region $DIGITAL_OCEAN_REGION --ssh-keys $TF_VAR_ssh_key_fingerprint --user-data-file ~/omlacd/deploy/first_boot_installer.sh omlgitlab-cicd-acd.$CI_JOB_ID
+#     - sleep 60
+#     - IP=$(doctl compute droplet list |grep omlgitlab-cicd-acd.$CI_JOB_ID |awk '{print $3}') && echo "$IP 2 run tests"
+#     - until curl -sk --head  --request GET https://$IP |grep "302" > /dev/null; do echo "Environment still being installed, sleeping 80 seconds"; sleep 80; done; echo "Environment is up"
+#     - doctl compute droplet delete -f omlgitlab-cicd-aio.$CI_JOB_ID
+#   tags:
+#     - deploy-acd
+#   only:
+#     - /.*deploy.*$/
+#     - /.*pre-release.*$/
+#     - web
+#     - merge_requests
