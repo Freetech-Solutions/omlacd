@@ -20,4 +20,4 @@ docker run -it --rm --name asterisk-fpm \
   --mount type=bind,source="$(pwd)"/../..,target=/builds/omnileads/omlacd \
   --env-file .env \
   --network=host --workdir=/builds/omnileads/omlacd/ \
-  freetechsolutions/fpm-asterisk-$1:latest bash
+  freetechsolutions/fpm-ansible:latest bash
