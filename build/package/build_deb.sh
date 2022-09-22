@@ -108,8 +108,8 @@ fpm -s dir -d liburiparser1 -d liburiparser-dev -d unixodbc -d odbc-postgresql -
   -t deb --deb-no-default-config-files -n oml-asterisk -v ${PACKAGE_VERSION} \
   --deb-user omnileads \
   --deb-group omnileads \
-  --before-install build/rpm/scripts/before_install.sh \
-  --after-install build/rpm/scripts/after_install.sh \
+  --before-install build/package/scripts/before_install.sh \
+  --after-install build/package/scripts/after_install.sh \
   -f /etc/asterisk \
      /var/lib/asterisk \
      /var/spool/asterisk \

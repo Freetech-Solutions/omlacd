@@ -96,6 +96,10 @@ make install
 #chown -R asterisk:asterisk /etc/asterisk \
 #                           /var/*/asterisk \
 #                           /usr/*/asterisk
+
+mkdir /etc/asterisk/custom
+
+chmod -R 750 /etc/asterisk/custom
 chmod -R 750 /var/spool/asterisk
 
 cd /

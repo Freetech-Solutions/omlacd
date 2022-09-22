@@ -7,7 +7,7 @@ ENV LANG en_US.utf8
 ENV NOTVISIBLE "in users profile"
 
 COPY build/docker/build-asterisk.sh ../../.asterisk_version build/docker/requirements.txt /
-RUN ASTERISK_VERSION=$(cat .asterisk_version) /build-asterisk.sh
+RUN ASTERISK_VERSION=$(cat .asterisk_version_deb) /build-asterisk.sh
 RUN apt update \
     && apt install -y libgsm1 git curl python3-psycopg2 gnupg \
     && pip3 install -r /requirements.txt \
@@ -27,7 +27,7 @@ RUN apt update \
     && rm -rf /usr/include/asterisk \
     && rm -rf /src/pyst2/ \
     && rm -rf /usr/lib/python3/dist-packages/psycopg2/ \
-    && rm -rf /lib/x86_64-linux-gnu/libkeyutils.so.1* 
+    && rm -rf /lib/x86_64-linux-gnu/libkeyutils.so.1*
 
 FROM python:3.10.4-slim-bullseye as run
 
@@ -63,9 +63,9 @@ COPY source/odbc/*.ini /etc/
 COPY source/scripts/* /opt/omnileads/asterisk/virtualenv/scripts/
 COPY build/docker/docker-entrypoint.sh /docker-entrypoint.sh
 
-RUN useradd -M -u 1000 asterisk 
+RUN useradd -M -u 1000 asterisk
 
-EXPOSE 5060/udp 5160/udp 40000-50000/udp
+EXPOSE 5060/udp 5160/udp 40000-400100/udp
 
 ENTRYPOINT ["/docker-entrypoint.sh"]
 CMD [""]
