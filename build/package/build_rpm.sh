@@ -110,8 +110,6 @@ fpm -s dir -d libxslt -d python3 -d uriparser -d net-tools -d unixODBC -d wget -
   --after-install build/rpm/scripts/after_install.sh \
   --after-remove build/rpm/scripts/after_remove.sh \
   -f ${ASTERISK_LOCATION} \
-     build/rpm/asterisk.service=/etc/systemd/system/asterisk.service \
-     build/rpm/asterisk-reloader.service=/etc/systemd/system/asterisk-reloader.service \
      source/logrotate/asterisk=/etc/logrotate.d/asterisk \
      source/odbc/odbc.ini=/etc/odbc.ini
 

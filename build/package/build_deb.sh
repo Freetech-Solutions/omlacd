@@ -1,6 +1,6 @@
 #!/bin/bash
 
-ASTERISK_VERSION=$(cat ../../.asterisk_version)
+ASTERISK_VERSION=$(cat ../../.asterisk_version_deb)
 PACKAGE_VERSION=$(cat ../../.package_version)
 VIRTUALENV_LOCATION="/etc/asterisk/virtualenv"
 
@@ -105,7 +105,7 @@ cp -a source/scripts/* ${VIRTUALENV_LOCATION}
 
 echo "Packing asterisk like .deb"
 fpm -s dir -d liburiparser1 -d liburiparser-dev -d unixodbc -d odbc-postgresql -d libxslt1.1 \
-  -t deb --deb-no-default-config-files -n oml_asterisk -v ${PACKAGE_VERSION} \
+  -t deb --deb-no-default-config-files -n oml-asterisk -v ${PACKAGE_VERSION} \
   --deb-user omnileads \
   --deb-group omnileads \
   --before-install build/rpm/scripts/before_install.sh \
@@ -118,10 +118,9 @@ fpm -s dir -d liburiparser1 -d liburiparser-dev -d unixodbc -d odbc-postgresql -
      /usr/lib/asterisk \
      /usr/lib/libasteriskpj.so.2=/usr/lib/x86_64-linux-gnu/libasteriskpj.so.2 \
      /usr/lib/libasteriskssl.so.1=/usr/lib/x86_64-linux-gnu/libasteriskssl.so.1 \
-     build/rpm/asterisk.service=/etc/systemd/system/omnileads-asterisk.service \
-     build/rpm/asterisk-reloader.service=/etc/systemd/system/omnileads-asterisk-reloader.service \
      source/logrotate/asterisk=/etc/logrotate.d/asterisk \
 
 mv oml-asterisk_* /root
 echo "Uploading DEB to AWS repository"
+echo ""
 aws s3 cp /root/oml-asterisk_${PACKAGE_VERSION}_amd64.deb s3://${AWS_BUCKET}/asterisk/omnileads_asterisk_${PACKAGE_VERSION}_amd64.deb

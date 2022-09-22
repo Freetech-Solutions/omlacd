@@ -31,11 +31,11 @@ if [ ! -d $ASTERISK_LOCATION/var/lib/asterisk/sounds/oml ]; then
 fi
 
 echo "Changing permisions of ${ASTERISK_LOCATION}"
-chown -R omnileads. ${ASTERISK_LOCATION}
+chown -R omnileads.omnileads /etc/asterisk
+chown -R omnileads.omnileads /var/lib/asterisk
+chown -R omnileads.omnileads /var/spool/asterisk
+chown -R omnileads.omnileads /usr/lib/asterisk
+chown -R omnileads.omnileads /usr/sbin/asterisk
+chown -R omnileads.omnileads /var/log/asterisk
+chown -R omnileads.omnileads /etc/logrotate.d/asterisk
 rm -rf /etc/logrotate.d/omnileads
-
-cd /usr/lib64/
-echo "Check if libtinfo.so.5 library is created"
-if [ ! -f libtinfo.so.5 ]; then
-  ln -s libtinfo.so.6 libtinfo.so.5
-fi
