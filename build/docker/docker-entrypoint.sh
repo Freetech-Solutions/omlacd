@@ -25,7 +25,8 @@ if [ "$1" == "" ]; then
   sed -i "s/^Password.*/Password            = ${PGPASSWORD}/g" /etc/odbc.ini
   sed -i "s/^Port.*/Port                    = ${PGPORT}/g" /etc/odbc.ini
 
-  cd /etc/asterisk
+  cd /etc/asterisk/custom
+  
   if [ ! -e  "oml_amd_custom.conf" ]; then
     touch oml_amd_custom.conf
   fi
