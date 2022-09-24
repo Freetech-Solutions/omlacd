@@ -1,7 +1,7 @@
 #!/bin/bash
 PROGNAME=$(basename $0)
 
-ASTERISK_VERSION=$(cat /opt/.asterisk_version)
+ASTERISK_VERSION=$(cat /opt/.asterisk_version_deb)
 
 if test -z ${ASTERISK_VERSION}; then
   echo "${PROGNAME}: ASTERISK_VERSION required" >&2
