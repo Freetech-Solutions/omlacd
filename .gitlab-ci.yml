@@ -3,7 +3,7 @@ stages:
   - deploy
 
 variables:
-  IMG_TAG: test
+  IMG_TAG=$(cat .asterisk_version_deb)
 
 workflow:
   rules:
