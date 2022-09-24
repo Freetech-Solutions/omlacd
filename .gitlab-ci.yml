@@ -3,7 +3,7 @@ stages:
   - deploy
 
 variables:
-  IMG_TAG: 'cat .websockets_versionS'
+  IMG_TAG: test
 
 workflow:
   rules:
