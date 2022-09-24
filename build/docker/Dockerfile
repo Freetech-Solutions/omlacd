@@ -6,7 +6,7 @@ FROM python:3.10.4-slim-bullseye as dev
 ENV LANG en_US.utf8
 ENV NOTVISIBLE "in users profile"
 
-COPY build/docker/build-asterisk.sh ../../.asterisk_version build/docker/requirements.txt /
+COPY build/docker/build-asterisk.sh ../../.asterisk_version_deb build/docker/requirements.txt /
 RUN ASTERISK_VERSION=$(cat .asterisk_version_deb) /build-asterisk.sh
 RUN apt update \
     && apt install -y libgsm1 git curl python3-psycopg2 gnupg \
@@ -65,7 +65,7 @@ COPY build/docker/docker-entrypoint.sh /docker-entrypoint.sh
 
 RUN useradd -M -u 1000 asterisk
 
-EXPOSE 5060/udp 5160/udp 40000-400100/udp
+EXPOSE 5060/udp 5160/udp 40000-50000/udp
 
 ENTRYPOINT ["/docker-entrypoint.sh"]
 CMD [""]
