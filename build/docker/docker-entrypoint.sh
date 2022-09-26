@@ -9,7 +9,8 @@ if [ "$1" == "" ]; then
   echo "**[omlacd] Setting localtime"
   rm -rf /etc/localtime
   ln -s /usr/share/zoneinfo/$TZ /etc/localtime
-  echo "**[omlacd] Writting the AMI credentials"
+  echo "**[omlacd] Writting the AMI config"
+  sed -i "s/bindaddr=127.0.0.1/bindaddr=$ASTERISK_HOSTNAME/g" /etc/asterisk/oml_manager.conf
   sed -i "s/amiuser/$AMI_USER/g" /etc/asterisk/oml_manager.conf
   sed -i "s/amipassword/$AMI_PASSWORD/g" /etc/asterisk/oml_manager.conf
 
