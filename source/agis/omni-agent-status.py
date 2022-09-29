@@ -1,4 +1,4 @@
-#!/opt/omnileads/asterisk/virtualenv/bin/python3
+#!/etc/asterisk/virtualenv/bin/python3
 
 # Copyright (C) 2018 Freetech Solutions
 
