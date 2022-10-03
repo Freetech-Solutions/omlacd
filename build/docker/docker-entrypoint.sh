@@ -6,9 +6,15 @@ set -ex
 COMMAND="/usr/sbin/asterisk -T -U asterisk -p -vvvvvvvf"
 
 if [ "$1" == "" ]; then
+
+  echo "**[omlacd] Initializing regenerar_asterisk script"
+  python3 /etc/asterisk/virtualenv/scripts/regenerar_asterisk.py &
+  sleep 4
+
   echo "**[omlacd] Setting localtime"
   rm -rf /etc/localtime
   ln -s /usr/share/zoneinfo/$TZ /etc/localtime
+
   echo "**[omlacd] Writting the AMI config"
   sed -i "s/bindaddr=127.0.0.1/bindaddr=$ASTERISK_HOSTNAME/g" /etc/asterisk/oml_manager.conf
   sed -i "s/amiuser/$AMI_USER/g" /etc/asterisk/oml_manager.conf
@@ -26,8 +32,7 @@ if [ "$1" == "" ]; then
   chown -R 1000:1000 /var/*/asterisk \
                      /usr/*/asterisk \
                      /etc/asterisk
-  echo "**[omlacd] Initializing regenerar_asterisk script"
-  python3 /etc/asterisk/virtualenv/scripts/regenerar_asterisk.py &
+
   echo "**[omlacd] Initializing asterisk"
 else
   echo "**[omlacd] Initializing regenerar_asterisk script"
