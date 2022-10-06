@@ -17,8 +17,7 @@ if [ "$1" == "" ]; then
 
   echo "**[omlacd] Writting the AMI config"
   sed -i "s/bindaddr=127.0.0.1/bindaddr=$ASTERISK_HOSTNAME/g" /etc/asterisk/oml_manager.conf
-  sed -i "s/amiuser/$AMI_USER/g" /etc/asterisk/oml_manager.conf
-  sed -i "s/amipassword/$AMI_PASSWORD/g" /etc/asterisk/oml_manager.conf
+  sed -i "s/amiuser/$AMI_USER/g" /etc/asterisk/oml_manager.con
 
   sed -i "s/^;queue_log_realtime_use_gmt=yes/queue_log_realtime_use_gmt=yes/g" /etc/asterisk/logger.conf
 
@@ -29,6 +28,10 @@ if [ "$1" == "" ]; then
   sed -i "s/^Password.*/Password            = ${PGPASSWORD}/g" /etc/odbc.ini
   sed -i "s/^Port.*/Port                    = ${PGPORT}/g" /etc/odbc.ini
 
+  if [ "$PGCLOUD" == "true" ]; then
+    sed -i "s/#SSLmode=require/SSLmode=require/g" /etc/odbc.ini
+  fi
+  
   chown -R 1000:1000 /var/*/asterisk \
                      /usr/*/asterisk \
                      /etc/asterisk
