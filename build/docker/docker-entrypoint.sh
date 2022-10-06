@@ -27,7 +27,7 @@ if [ "$1" == "" ]; then
   sed -i "s/^Password.*/Password            = ${PGPASSWORD}/g" /etc/odbc.ini
   sed -i "s/^Port.*/Port                    = ${PGPORT}/g" /etc/odbc.ini
   if [ "$PGCLOUD" == "true" ]; then
-    sed -i "s/#SSLmode=require/SSLmode=require/g" /etc/odbc.ini
+    sed -i "s/#SSLmode/SSLmode/g" /etc/odbc.ini
   fi
 
   chown -R 1000:1000 /var/*/asterisk \
