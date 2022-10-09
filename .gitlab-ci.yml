@@ -32,7 +32,7 @@ container-image:
     - >-
       docker buildx build
       --file=build/docker/Dockerfile
-      --tag=run
+      --tag=$(cat .package_version)
       --target=run
       .
     - |-
