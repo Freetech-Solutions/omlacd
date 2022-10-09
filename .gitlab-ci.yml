@@ -3,7 +3,7 @@ stages:
   - deploy
 
 variables:
-  IMG_TAG: test
+  IMG_TAG: $(cat .package_version)
 
 workflow:
   rules:
@@ -32,7 +32,7 @@ container-image:
     - >-
       docker buildx build
       --file=build/docker/Dockerfile
-      --tag=$(cat .package_version)
+      --tag=run
       --target=run
       .
     - |-
