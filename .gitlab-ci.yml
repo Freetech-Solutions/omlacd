@@ -46,19 +46,6 @@ container-image:
     - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "develop"
     - if: $CI_PIPELINE_SOURCE == "web"
 
-# build-deb:
-#   stage: build
-#   image: freetechsolutions/fpm-asterisk-deb:latest
-#   script:
-#     - cd build/package && bash build_deb.sh
-#   rules:
-#     - if: $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME == "develop"
-#     - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "develop"
-#     - if: $CI_PIPELINE_SOURCE == "web"
-
-    #- /.*release.*$/
-    #- /.*master.*$/
-
 # deploy-acd-digitalocean:
 #   stage: deploy
 #   environment: DOCTL_DIGITALOCEAN_AIO
