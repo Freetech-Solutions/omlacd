@@ -2,9 +2,6 @@ stages:
   - build
   - deploy
 
-variables:
-  IMG_TAG: $(cat .package_version)
-
 workflow:
   rules:
     - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == 'master'
@@ -38,9 +35,7 @@ container-image:
     - |-
       if [ -n "${DOCKER_USER}" ] && [ -n "${DOCKER_PASSWORD}" ]; then
         echo "${DOCKER_PASSWORD}" | docker login --username "${DOCKER_USER}" --password-stdin
-        docker tag run freetechsolutions/omlacd:$IMG_TAG
         docker tag run freetechsolutions/omlacd:latest
-        docker push docker.io/freetechsolutions/omlacd:$IMG_TAG
         docker push docker.io/freetechsolutions/omlacd:latest
       fi
   rules:
