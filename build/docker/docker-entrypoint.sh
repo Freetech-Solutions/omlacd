@@ -6,7 +6,7 @@ COMMAND="/usr/sbin/asterisk -T -U asterisk -p -vvvvvvvf"
 if [ "$1" == "" ]; then
 
   echo "**[omlacd] Initializing regenerar_asterisk script"
-  python3 /etc/asterisk/virtualenv/scripts/regenerar_asterisk.py &
+  python3 /opt/asterisk/virtualenv/scripts/regenerar_asterisk.py &
   sleep 4
 
   echo "**[omlacd] Setting localtime"
@@ -38,7 +38,7 @@ if [ "$1" == "" ]; then
 
 else
   echo "**[omlacd] Initializing regenerar_asterisk script"
-  python3 /etc/asterisk/virtualenv/scripts/regenerar_asterisk.py &
+  python3 /opt/asterisk/virtualenv/scripts/regenerar_asterisk.py &
   echo "**[omlacd] Initializing asterisk"
 fi
 
