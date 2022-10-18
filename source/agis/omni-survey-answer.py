@@ -1,4 +1,4 @@
-#!/etc/asterisk/virtualenv/bin/python3
+#!/opt/asterisk/virtualenv/bin/python3
 
 # -*- coding: utf-8 -*-
 

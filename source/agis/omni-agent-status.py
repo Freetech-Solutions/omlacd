@@ -1,4 +1,4 @@
-#!/etc/asterisk/virtualenv/bin/python3
+#!/opt/asterisk/virtualenv/bin/python3
 
 # Copyright (C) 2018 Freetech Solutions
 
