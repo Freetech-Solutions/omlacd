@@ -18,6 +18,10 @@ if [ "$1" == "" ]; then
   sed -i "s/amiuser/$AMI_USER/g" /etc/asterisk/oml_manager.conf
   sed -i "s/amipassword/$AMI_PASSWORD/g" /etc/asterisk/oml_manager.conf
 
+  if [[ "${HOMER_ENABLE}" == "true" ]]; then
+    sed -i "s/homer_host:homer_port/$HOMERHOST:$HOMERPORT/g" /etc/asterisk/hep.conf
+  fi
+
   sed -i "s/^;queue_log_realtime_use_gmt=yes/queue_log_realtime_use_gmt=yes/g" /etc/asterisk/logger.conf
 
   echo "**[omlacd] Writing the odbc.ini file with database variables"
