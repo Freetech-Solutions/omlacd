@@ -22,6 +22,8 @@ if [ "$1" == "" ]; then
 
   sed -i "s/50000/40999/g" /etc/asterisk/rtp.conf
 
+  sed -i "s/extern_ip_nat/$PUBLIC_IP/g" /etc/asterisk/oml_pjsip_transports.conf
+
   if [[ "${HOMER_ENABLE}" == "true" ]]; then
     sed -i "s/homer_host:homer_port/$HOMERHOST:$HOMERPORT/g" /etc/asterisk/hep.conf
   fi
