@@ -87,7 +87,6 @@ menuselect/menuselect --disable app_voicemail menuselect.makeopts
 menuselect/menuselect --disable app_minivm menuselect.makeopts
 menuselect/menuselect --disable cdr_adaptive_odbc menuselect.makeopts
 menuselect/menuselect --disable res_crypto menuselect.makeopts
-menuselect/menuselect --disable chan_oss menuselect.makeopts
 menuselect/menuselect --disable pbx_ael menuselect.makeopts
 menuselect/menuselect --disable pbx_dundi menuselect.makeopts
 menuselect/menuselect --disable app_festival menuselect.makeopts
@@ -98,12 +97,8 @@ menuselect/menuselect --disable cdr_odbc menuselect.makeopts
 menuselect/menuselect --disable chan_mgcp menuselect.makeopts
 menuselect/menuselect --disable res_monitor menuselect.makeopts
 menuselect/menuselect --disable res_adsi menuselect.makeopts
-menuselect/menuselect --disable app_image menuselect.makeopts
-menuselect/menuselect --disable app_nbscat menuselect.makeopts
 menuselect/menuselect --disable app_adsiprog menuselect.makeopts
 menuselect/menuselect --disable app_getcpeid menuselect.makeopts
-menuselect/menuselect --disable app_ices menuselect.makeopts
-menuselect/menuselect --disable app_url menuselect.makeopts
 menuselect/menuselect --disable app_jack menuselect.makeopts
 menuselect/menuselect --disable format_ogg_vorbis menuselect.makeopts
 menuselect/menuselect --disable res_srtp menuselect.makeopts
@@ -135,6 +130,7 @@ chmod -R 750 /var/spool/asterisk
 cd /
 
 echo "Download en Asterisk sounds"
+mkdir -p /var/lib/asterisk/sounds/en
 curl -s $ASTERISK_AUDIO_PROMPTS | tar xvz -C /var/lib/asterisk/sounds/en
 rm -f asterisk-core-sounds-en-alaw-current.tar.gz
 
@@ -143,6 +139,7 @@ mkdir -p /var/lib/asterisk/sounds/oml
 curl -s $OMNILEADS_AUDIO_PROMPTS | tar xvz -C /var/lib/asterisk/sounds/oml
 rm -f asterisk-oml-sounds-current.tar.gz
 
+chmod -R 750 /var/lib/asterisk/sounds
 
 # remove *-dev packages
 devpackages=`dpkg -l|grep '\-dev'|awk '{print $2}'|xargs`
