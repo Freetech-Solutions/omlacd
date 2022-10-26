@@ -3,6 +3,8 @@
 set -ex
 COMMAND="/usr/sbin/asterisk -T -U asterisk -p -vvvvvvvf"
 
+PUBLIC_IP=$(curl http://ipinfo.io/ip)
+
 if [ "$1" == "" ]; then
 
   echo "**[omlacd] Initializing regenerar_asterisk script"
@@ -17,6 +19,8 @@ if [ "$1" == "" ]; then
   sed -i "s/bindaddr=127.0.0.1/bindaddr=$ASTERISK_HOSTNAME/g" /etc/asterisk/oml_manager.conf
   sed -i "s/amiuser/$AMI_USER/g" /etc/asterisk/oml_manager.conf
   sed -i "s/amipassword/$AMI_PASSWORD/g" /etc/asterisk/oml_manager.conf
+
+  sed -i "s/50000/40999/g" /etc/asterisk/rtp.conf
 
   if [[ "${HOMER_ENABLE}" == "true" ]]; then
     sed -i "s/homer_host:homer_port/$HOMERHOST:$HOMERPORT/g" /etc/asterisk/hep.conf

@@ -2,6 +2,8 @@
 PROGNAME=$(basename $0)
 
 ASTERISK_VERSION=$(cat .asterisk_version_deb)
+ASTERISK_AUDIO_PROMPTS=https://downloads.asterisk.org/pub/telephony/sounds/asterisk-core-sounds-en-alaw-current.tar.gz
+OMNILEADS_AUDIO_PROMPTS=https://fts-public-packages.s3-sa-east-1.amazonaws.com/asterisk/asterisk-oml-sounds-current.tar.gz
 
 if test -z ${ASTERISK_VERSION}; then
   echo "${PROGNAME}: ASTERISK_VERSION required" >&2
@@ -75,10 +77,46 @@ menuselect/menuselect --enable BETTER_BACKTRACES menuselect.makeopts
 # codecs
 menuselect/menuselect --enable codec_gsm menuselect.makeopts
 
-# we don't need any sounds in docker, they will be mounted as volume
 menuselect/menuselect --disable-category MENUSELECT_CORE_SOUNDS menuselect.makeopts
 menuselect/menuselect --disable-category MENUSELECT_MOH menuselect.makeopts
 menuselect/menuselect --disable-category MENUSELECT_EXTRA_SOUNDS menuselect.makeopts
+
+menuselect/menuselect --disable cel_custom menuselect.makeopts
+menuselect/menuselect --disable cdr_custom menuselect.makeopts
+menuselect/menuselect --disable app_voicemail menuselect.makeopts
+menuselect/menuselect --disable app_minivm menuselect.makeopts
+menuselect/menuselect --disable cdr_adaptive_odbc menuselect.makeopts
+menuselect/menuselect --disable res_crypto menuselect.makeopts
+menuselect/menuselect --disable chan_oss menuselect.makeopts
+menuselect/menuselect --disable pbx_ael menuselect.makeopts
+menuselect/menuselect --disable pbx_dundi menuselect.makeopts
+menuselect/menuselect --disable app_festival menuselect.makeopts
+menuselect/menuselect --disable cdr_sqlite3_custom menuselect.makeopts
+menuselect/menuselect --disable cel_sqlite3_custom menuselect.makeopts
+menuselect/menuselect --disable cdr_manager menuselect.makeopts
+menuselect/menuselect --disable cdr_odbc menuselect.makeopts
+menuselect/menuselect --disable chan_mgcp menuselect.makeopts
+menuselect/menuselect --disable res_monitor menuselect.makeopts
+menuselect/menuselect --disable res_adsi menuselect.makeopts
+menuselect/menuselect --disable app_image menuselect.makeopts
+menuselect/menuselect --disable app_nbscat menuselect.makeopts
+menuselect/menuselect --disable app_adsiprog menuselect.makeopts
+menuselect/menuselect --disable app_getcpeid menuselect.makeopts
+menuselect/menuselect --disable app_ices menuselect.makeopts
+menuselect/menuselect --disable app_url menuselect.makeopts
+menuselect/menuselect --disable app_jack menuselect.makeopts
+menuselect/menuselect --disable format_ogg_vorbis menuselect.makeopts
+menuselect/menuselect --disable res_srtp menuselect.makeopts
+menuselect/menuselect --disable res_fax_spandsp menuselect.makeopts
+menuselect/menuselect --disable format_ogg_speex menuselect.makeopts
+menuselect/menuselect --disable func_speex menuselect.makeopts
+menuselect/menuselect --disable codec_speex menuselect.makeopts
+menuselect/menuselect --disable res_stun_monitor menuselect.makeopts
+menuselect/menuselect --disable res_phoneprov menuselect.makeopts
+menuselect/menuselect --disable chan_sip menuselect.makeopts
+menuselect/menuselect --disable chan_iax2 menuselect.makeopts
+menuselect/menuselect --disable chan_skinny menuselect.makeopts
+
 
 until make -j ${JOBS} all
 do
@@ -88,14 +126,6 @@ done
   >&2 echo "Make of asterisk done"
 make install
 
-# copy default configs
-# cp /usr/src/asterisk/configs/basic-pbx/*.conf /etc/asterisk/
-#make samples
-
-# set runuser and rungroup
-#chown -R asterisk:asterisk /etc/asterisk \
-#                           /var/*/asterisk \
-#                           /usr/*/asterisk
 
 mkdir /etc/asterisk/custom
 
@@ -103,6 +133,16 @@ chmod -R 750 /etc/asterisk/custom
 chmod -R 750 /var/spool/asterisk
 
 cd /
+
+echo "Download en Asterisk sounds"
+curl -s $ASTERISK_AUDIO_PROMPTS | tar xvz -C /var/lib/asterisk/sounds/en
+rm -f asterisk-core-sounds-en-alaw-current.tar.gz
+
+echo "Download OMniLeads sounds"
+mkdir -p /var/lib/asterisk/sounds/oml
+curl -s $OMNILEADS_AUDIO_PROMPTS | tar xvz -C /var/lib/asterisk/sounds/oml
+rm -f asterisk-oml-sounds-current.tar.gz
+
 
 # remove *-dev packages
 devpackages=`dpkg -l|grep '\-dev'|awk '{print $2}'|xargs`
