@@ -24,7 +24,7 @@ if [ "$1" == "" ]; then
 
   sed -i "s/extern_ip_nat/$PUBLIC_IP/g" /etc/asterisk/oml_pjsip_transports.conf
 
-  if [[ "${HOMER_ENABLE}" == "true" ]]; then
+  if [[ "${HOMER_ENABLE}" == "True" ]]; then
     sed -i "s/homer_host:homer_port/$HOMERHOST:$HOMERPORT/g" /etc/asterisk/hep.conf
   fi
 
@@ -36,7 +36,7 @@ if [ "$1" == "" ]; then
   sed -i "s/^UserName.*/UserName            = ${PGUSER}/g" /etc/odbc.ini
   sed -i "s/^Password.*/Password            = ${PGPASSWORD}/g" /etc/odbc.ini
   sed -i "s/^Port.*/Port                    = ${PGPORT}/g" /etc/odbc.ini
-  if [ "$PGCLOUD" == "true" ]; then
+  if [ "$PGSSL" == "True" ]; then
     sed -i "s/#SSLmode/SSLmode/g" /etc/odbc.ini
   fi
 
