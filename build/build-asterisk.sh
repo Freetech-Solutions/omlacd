@@ -131,12 +131,14 @@ cd /
 
 echo "Download en Asterisk sounds"
 mkdir -p /var/lib/asterisk/sounds/en
-curl -s $ASTERISK_AUDIO_PROMPTS | tar xvz -C /var/lib/asterisk/sounds/en
+curl -s $ASTERISK_AUDIO_PROMPTS
+tar xvz asterisk-core-sounds-en-alaw-current.tar.gz -C /var/lib/asterisk/sounds/en
 rm -f asterisk-core-sounds-en-alaw-current.tar.gz
 
 echo "Download OMniLeads sounds"
 mkdir -p /var/lib/asterisk/sounds/oml
-curl -s $OMNILEADS_AUDIO_PROMPTS | tar xvz -C /var/lib/asterisk/sounds/oml
+curl -s $OMNILEADS_AUDIO_PROMPTS
+tar xvz asterisk-oml-sounds-current.tar.gz -C /var/lib/asterisk/sounds/oml
 rm -f asterisk-oml-sounds-current.tar.gz
 
 chmod -R 750 /var/lib/asterisk/sounds

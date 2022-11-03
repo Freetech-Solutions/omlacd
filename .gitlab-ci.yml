@@ -22,21 +22,22 @@ container-image:
   script:
     - >-
       docker buildx build
-      --file=build/docker/Dockerfile
+      --file=build/Dockerfile
       --tag=dev
       --target=dev
       .
     - >-
       docker buildx build
-      --file=build/docker/Dockerfile
+      --file=build/Dockerfile
       --tag=run
       --target=run
       .
     - |-
       if [ -n "${DOCKER_USER}" ] && [ -n "${DOCKER_PASSWORD}" ]; then
         echo "${DOCKER_PASSWORD}" | docker login --username "${DOCKER_USER}" --password-stdin
-        docker tag run freetechsolutions/omlacd:latest
+        docker tag run freetechsolutions/omlacd:latest freetechsolutions/omlacd:$CI_COMMIT_SHA
         docker push docker.io/freetechsolutions/omlacd:latest
+        docker push docker.io/freetechsolutions/omlacd:$CI_COMMIT_SHA
       fi
   rules:
     - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "oml-dev-2.0"
