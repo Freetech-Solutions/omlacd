@@ -35,7 +35,8 @@ container-image:
     - |-
       if [ -n "${DOCKER_USER}" ] && [ -n "${DOCKER_PASSWORD}" ]; then
         echo "${DOCKER_PASSWORD}" | docker login --username "${DOCKER_USER}" --password-stdin
-        docker tag run freetechsolutions/omlacd:latest freetechsolutions/omlacd:$CI_COMMIT_SHA
+        docker tag run freetechsolutions/omlacd:latest
+        docker tag run freetechsolutions/omlacd:$CI_COMMIT_SHA
         docker push docker.io/freetechsolutions/omlacd:latest
         docker push docker.io/freetechsolutions/omlacd:$CI_COMMIT_SHA
       fi
