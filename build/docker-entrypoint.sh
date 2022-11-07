@@ -20,7 +20,9 @@ if [ "$1" == "" ]; then
   sed -i "s/amiuser/$AMI_USER/g" /etc/asterisk/oml_manager.conf
   sed -i "s/amipassword/$AMI_PASSWORD/g" /etc/asterisk/oml_manager.conf
 
+  if [[ "${NETWORK_MODE}" == "bridge" ]]; then
   sed -i "s/50000/40999/g" /etc/asterisk/rtp.conf
+  fi
 
   sed -i "s/extern_ip_nat/$PUBLIC_IP/g" /etc/asterisk/oml_pjsip_transports.conf
 
@@ -41,8 +43,9 @@ if [ "$1" == "" ]; then
   fi
 
   chown -R 1000:1000 /var/*/asterisk \
-                     /usr/*/asterisk \
-                     /etc/asterisk
+                     /usr/*/asterisk
+
+  chown 1000:1000 /etc/asterisk
 
   echo "**[omlacd] Initializing asterisk"
 
