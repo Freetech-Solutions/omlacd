@@ -64,6 +64,7 @@ cd asterisk
 : ${JOBS:=$(( $(nproc) + $(nproc) / 2 ))}
 
 #DEBIAN_FRONTEND=noninteractive contrib/scripts/install_prereq install
+DEBIAN_FRONTEND=noninteractive contrib/scripts/get_mp3_source.sh
 
 ./configure --with-resample \
             --with-pjproject-bundled \
