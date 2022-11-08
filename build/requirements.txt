@@ -1,4 +1,5 @@
 redis==3.5.3
 -e git+https://github.com/SrMoreno/pyst2@master#egg=pyst2
-websocket-client==0.58.0
+websocket-client==1.4.2
 requests==2.27.1
+gTTS==2.2.4
