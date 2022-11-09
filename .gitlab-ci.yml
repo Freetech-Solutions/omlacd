@@ -33,10 +33,10 @@ container-image:
       --target=run
       .
     - |-
-      if [ -n "${DOCKER_USER}" ] && [ -n "${DOCKER_PASSWORD}" ]; then
-        echo "${DOCKER_PASSWORD}" | docker login --username "${DOCKER_USER}" --password-stdin
-        docker tag run omnileads/omlacd:latest
-        docker tag run omnileads/omlacd:$CI_COMMIT_SHORT_SHA
+      if [ -n "${DOCKER_USERNAME}" ] && [ -n "${DOCKER_SECRET}" ]; then
+        echo "${DOCKER_SECRET}" | docker login --username "${DOCKER_USERNAME}" --password-stdin
+        docker tag run omnileads/asterisk:latest
+        docker tag run omnileads/asterisk:$CI_COMMIT_SHORT_SHA
         docker push docker.io/omnileads/asterisk:latest
         docker push docker.io/omnileads/asterisk:$CI_COMMIT_SHORT_SHA
       fi
