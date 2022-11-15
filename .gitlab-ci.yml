@@ -1,16 +1,5 @@
 stages:
   - build
-  - deploy
-
-workflow:
-  rules:
-    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == 'master'
-      variables:
-        IMG_TAG: latest
-    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == 'develop'
-      variables:
-        IMG_TAG: develop
-    - when: always
 
 container-image:
   services:
@@ -22,13 +11,13 @@ container-image:
   script:
     - >-
       docker buildx build
-      --file=build/Dockerfile
+      --file=Dockerfile
       --tag=dev
       --target=dev
       .
     - >-
       docker buildx build
-      --file=build/Dockerfile
+      --file=Dockerfile
       --tag=run
       --target=run
       .
@@ -43,3 +32,5 @@ container-image:
   rules:
     - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "oml-dev-2.0"
     - if: $CI_PIPELINE_SOURCE == "web"
+  tags:
+      - build
