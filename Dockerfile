@@ -6,8 +6,8 @@ FROM python:3.10.4-slim-bullseye as dev
 ENV LANG en_US.utf8
 ENV NOTVISIBLE "in users profile"
 
-COPY build//build-asterisk.sh .asterisk_version_deb build//requirements.txt /
-RUN ASTERISK_VERSION=$(cat /.asterisk_version_deb) /build-asterisk.sh
+COPY build/build-asterisk.sh .asterisk_version build/requirements.txt /
+RUN ASTERISK_VERSION=$(cat .asterisk_version) /build-asterisk.sh
 RUN apt update \
     && apt install -y libgsm1 git curl python3-psycopg2 gnupg \
     && pip3 install -r /requirements.txt \
