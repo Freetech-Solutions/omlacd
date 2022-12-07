@@ -42,10 +42,9 @@ if [ "$1" == "" ]; then
     sed -i "s/#SSLmode/SSLmode/g" /etc/odbc.ini
   fi
 
-  # chown -R 1000:1000 /var/*/asterisk \
-  #                    /usr/*/asterisk
-  #
-  # chown 1000:1000 /etc/asterisk
+  chown -R 1000:1000 /var/*/asterisk \
+                     /usr/*/asterisk \
+                     /etc/asterisk
 
   echo "**[omlacd] Initializing asterisk"
 
