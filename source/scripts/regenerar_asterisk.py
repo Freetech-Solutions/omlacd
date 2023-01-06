@@ -43,9 +43,9 @@ CUSTOM_AUDIO_FILES_PATH = f'{ASTERISK_SOUND_FILES}oml/'
 MOH_AUDIO_FILES_PATH = f'{ASTERISK_SOUND_FILES}'
 
 logger = logging.getLogger("asyncio")
-fh = logging.FileHandler(
-    f'{ASTERISK_LOCATION}/var/log/asterisk/websockets.log')
-
+logFormatter = logging.Formatter(fmt='%(asctime)s :: %(levelname)-8s :: %(message)s')
+fh = logging.FileHandler(f'{ASTERISK_LOCATION}/var/log/asterisk/websockets.log')
+fh.setFormatter(logFormatter)
 logger.addHandler(fh)
 logger.setLevel(logging.INFO)
 websocket.enableTrace(False)
@@ -102,6 +102,23 @@ class WebsocketClient(object):
 
 
 class RegenerarConfiguracion(object):
+    RELOAD_RES_PJSIP = 'asterisk -rx \'module reload res_pjsip.so\''
+    RELOAD_APP_QUEUE = 'asterisk -rx \'module reload app_queue.so\''
+    DIALPLAN_RELOAD = 'asterisk -rx \'dialplan reload\''
+    RELOAD_RES_MOH = 'asterisk -rx \'module reload res_musiconhold.so\''
+    RELOAD_APP_AMD = 'asterisk -rx \'module reload app_amd.so\''
+    RELOAD_CHAN_SIP = 'asterisk -rx \'module reload chan_sip.so\''
+
+    COMANDOS = {
+        'oml_pjsip_agents.conf': RELOAD_RES_PJSIP,
+        'oml_pjsip_trunks.conf': RELOAD_RES_PJSIP,
+        'oml_queues.conf': RELOAD_APP_QUEUE,
+        'oml_extensions_outr.conf': DIALPLAN_RELOAD,
+        'oml_moh.conf': RELOAD_RES_MOH,
+        'oml_amd.conf': RELOAD_APP_AMD,
+        'oml_sip_trunks.conf': RELOAD_CHAN_SIP,
+        'oml_sip_registrations.conf': RELOAD_CHAN_SIP,
+    }
 
     def __init__(self, logger):
         super().__init__()
@@ -112,10 +129,18 @@ class RegenerarConfiguracion(object):
         # TODO: Refactorizar para dividir responsabilidades
         lista_data = self._json_string_a_lista(stream_data)
         audio_custom_modificado = False
+        self.logger.info(f'--- Procesando mensaje ---')
+        comandos = []
         for archivo in lista_data:
+            tipo_archivo = archivo['type']
+            self.logger.info(f'  -- Procesando archivo de tipo: {tipo_archivo}')
             if archivo['type'] == 'CONF_FILE':
                 if self._escribe_archivo_conf(archivo):
-                    self._comando_regeneracion_asterisk(archivo['archivo'])
+                    comando = self._get_comando_regeneracion_asterisk(archivo['archivo'])
+                    if comando and comando not in comandos:
+                        comandos.append(comando)
+                else:
+                    self.logger.error('ERROR')
             elif archivo['type'] == 'AUDIO_CUSTOM' and archivo['action'] == 'COPY':
                 self._escribe_audio_custom(archivo)
                 audio_custom_modificado = True
@@ -127,6 +152,7 @@ class RegenerarConfiguracion(object):
             elif archivo['type'] == 'ASTERISK_PLAY_LIST_DIR' and archivo['action'] == 'DELETE':
                 self._delete_playlist_files(archivo)
 
+        self._ejecutar_comandos(comandos)
         if audio_custom_modificado:
             self.ami_manager.connect()
             self.ami_manager.module_reload()
@@ -157,9 +183,9 @@ class RegenerarConfiguracion(object):
             f = open(f'{file_path}{nombre_archivo}', 'wb')
             f.write(contenido_bin)
             f.close()
-            self.logger.info(f'File: {nombre_archivo} copied')
+            self.logger.info(f'  File: {nombre_archivo} copied')
         except Exception as e:
-            self.logger.error(f'Error creating file: {nombre_archivo} {e}')
+            self.logger.error(f'  Error creating file: {nombre_archivo} {e}')
 
     def _escribe_asterisk_sounds(self, archivo_info):
         try:
@@ -201,21 +227,23 @@ class RegenerarConfiguracion(object):
         except Exception as e:
             self.logger.error(f'Error deleting playlist: {playlist} {e}')
 
-    def _comando_regeneracion_asterisk(self, nombre_archivo):
-        COMANDOS = {
-            'oml_pjsip_agents.conf': 'asterisk -rx \'module reload res_pjsip.so\'',
-            'oml_pjsip_trunks.conf': 'asterisk -rx \'module reload res_pjsip.so\'',
-            'oml_queues.conf': 'asterisk -rx \'module reload app_queue.so\'',
-            'oml_extensions_outr.conf': 'asterisk -rx \'dialplan reload\'',
-            'oml_moh.conf': 'asterisk -rx \'module reload res_musiconhold.so\'',
-            'oml_amd.conf': 'asterisk -rx \'module reload app_amd.so\'',
-            'oml_sip_trunks.conf': 'asterisk -rx \'module reload chan_sip.so\'',
-            'oml_sip_registrations.conf': 'asterisk -rx \'module reload chan_sip.so\''
-        }
-        string_command = COMANDOS.get(nombre_archivo, False)
+    def _get_comando_regeneracion_asterisk(self, nombre_archivo):
+        string_command = self.COMANDOS.get(nombre_archivo, False)
         if string_command:
-            # TODO: controlar el resultado de la ejecución para loggear errores
-            print(subprocess.call(shlex.split(string_command)))
+            info = f'  -- El archivo {nombre_archivo} requiere ejecucion de: {string_command}'
+            self.logger.info(info)
+            return string_command
+        else:
+            self.logger.error(f'Comando no registrado para archivo: {nombre_archivo}')
+
+    def _ejecutar_comandos(self, comandos):
+        for comando in comandos:
+            self._ejecutar_comando(comando)
+    
+    def _ejecutar_comando(self, comando):
+        # TODO: controlar el resultado de la ejecución para loggear errores
+        self.logger.info(f'  -- Ejecutando: {comando}')
+        self.logger.info(f'  -- Resultado: {subprocess.call(shlex.split(comando))}')
 
     def _json_string_a_lista(self, raw_string):
         res = {}
