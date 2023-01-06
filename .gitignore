@@ -18,3 +18,4 @@ deploy/first_boot_installer.sh
 deploy/oml_installer.sh
 deploy/.env
 build/rpm/.env
+*.pyc
