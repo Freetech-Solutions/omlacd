@@ -65,7 +65,7 @@ COPY build//docker-entrypoint.sh /docker-entrypoint.sh
 
 RUN useradd -M -u 1000 asterisk
 
-EXPOSE 5060/udp 5160/udp 40000-50000/udp
+EXPOSE 5060/udp
 
 ENTRYPOINT ["/docker-entrypoint.sh"]
 CMD [""]
