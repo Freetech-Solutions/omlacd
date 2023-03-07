@@ -24,10 +24,8 @@ container-image:
     - |-
       if [ -n "${DOCKER_USERNAME}" ] && [ -n "${DOCKER_SECRET}" ]; then
         echo "${DOCKER_SECRET}" | docker login --username "${DOCKER_USERNAME}" --password-stdin
-        docker tag run omnileads/asterisk:latest
-        docker tag run omnileads/asterisk:$CI_COMMIT_SHORT_SHA
-        docker push docker.io/omnileads/asterisk:latest
-        docker push docker.io/omnileads/asterisk:$CI_COMMIT_SHORT_SHA
+        docker tag run omnileads/asterisk:230204.01
+        docker push docker.io/omnileads/asterisk:230204.01
       fi
   rules:
     - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "oml-dev-2.0"
