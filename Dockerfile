@@ -63,7 +63,7 @@ COPY source/odbc/*.ini /etc/
 COPY source/scripts/* /opt/asterisk/virtualenv/scripts/
 COPY build//docker-entrypoint.sh /docker-entrypoint.sh
 
-RUN useradd -M -u 1000 asterisk
+RUN useradd -M -u 1000 omnileads
 
 EXPOSE 5060/udp
 
