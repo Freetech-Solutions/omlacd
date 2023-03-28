@@ -1,7 +1,7 @@
 #!/bin/bash
 
 set -ex
-COMMAND="/usr/sbin/asterisk -T -U asterisk -p -vvvvvvvf"
+COMMAND="/usr/sbin/asterisk -T -U omnileads -p -vvvvvvvf"
 
 PUBLIC_IP=$(curl http://ipinfo.io/ip)
 
@@ -16,12 +16,19 @@ if [ "$1" == "" ]; then
   ln -s /usr/share/zoneinfo/$TZ /etc/localtime
 
   echo "**[omlacd] Writting the AMI config"
-  sed -i "s/bindaddr=127.0.0.1/bindaddr=$ASTERISK_HOSTNAME/g" /etc/asterisk/oml_manager.conf
   sed -i "s/amiuser/$AMI_USER/g" /etc/asterisk/oml_manager.conf
   sed -i "s/amipassword/$AMI_PASSWORD/g" /etc/asterisk/oml_manager.conf
 
   if [[ "${NETWORK_MODE}" == "bridge" ]]; then
-  sed -i "s/50000/40999/g" /etc/asterisk/rtp.conf
+    sed -i "s/50000/40999/g" /etc/asterisk/rtp.conf
+  fi
+
+  if [ "${DEPLOY_HA}" = "True" ]; then
+    sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_manager.conf
+    sed -i "s/bind=0.0.0.0:5160/bind=$ASTERISK_HOSTNAME:5160/g" /etc/asterisk/oml_pjsip_transports.conf
+    sed -i "s/bind=0.0.0.0:5060/bind=$ASTERISK_HOSTNAME:5060/g" /etc/asterisk/oml_pjsip_transports.conf
+  else
+    sed -i "s/bindaddr=127.0.0.1/bindaddr=$ASTERISK_HOSTNAME/g" /etc/asterisk/oml_manager.conf    
   fi
 
   sed -i "s/extern_ip_nat/$PUBLIC_IP/g" /etc/asterisk/oml_pjsip_transports.conf
