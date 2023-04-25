@@ -27,6 +27,10 @@ if [ "$1" == "" ]; then
     sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_manager.conf
     sed -i "s/bind=0.0.0.0:5160/bind=$ASTERISK_HOSTNAME:5160/g" /etc/asterisk/oml_pjsip_transports.conf
     sed -i "s/bind=0.0.0.0:5060/bind=$ASTERISK_HOSTNAME:5060/g" /etc/asterisk/oml_pjsip_transports.conf
+  if [ -n "${PROD_AIO_IP}" ]; then
+    sed -i "s/bindaddr=127.0.0.1/bindaddr=$ASTERISK_HOSTNAME/g" /etc/asterisk/oml_manager.conf    
+    sed -i "s/bind=0.0.0.0:5160/bind=$ASTERISK_HOSTNAME:5160/g" /etc/asterisk/oml_pjsip_transports.conf
+    sed -i "s/bind=0.0.0.0:5060/bind=$PUBLIC_IP:5060/g" /etc/asterisk/oml_pjsip_transports.conf
   else
     sed -i "s/bindaddr=127.0.0.1/bindaddr=$ASTERISK_HOSTNAME/g" /etc/asterisk/oml_manager.conf    
   fi
@@ -35,6 +39,11 @@ if [ "$1" == "" ]; then
 
   if [[ "${HOMER_ENABLE}" == "True" ]]; then
     sed -i "s/homer_host:homer_port/$HOMERHOST:$HOMERPORT/g" /etc/asterisk/hep.conf
+  fi
+
+  if [[ "${FULL_LOGS}" == "True" ]]; then
+    sed -i "s/;full.log/full.log/g" /etc/asterisk/logger.conf
+    sed -i "s/messages.log/;messages.log/g" /etc/asterisk/logger.conf
   fi
 
   sed -i "s/^;queue_log_realtime_use_gmt=yes/queue_log_realtime_use_gmt=yes/g" /etc/asterisk/logger.conf
