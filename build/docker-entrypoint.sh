@@ -24,20 +24,17 @@ if [ "$1" == "" ]; then
   case ${ENV} in
   docker-compose-devenv)
     echo "devenv docker-compose"
-    sed -i "s/50000/40999/g" /etc/asterisk/rtp.conf
+    sed -i "s/50000/40299/g" /etc/asterisk/rtp.conf
     sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_manager.conf    
     ;;
   docker-compose-cloud)
     echo "cloud docker-compose"
-    sed -i "s/bindaddr=127.0.0.1/bindaddr=$ASTERISK_HOSTNAME/g" /etc/asterisk/oml_manager.conf    
-    sed -i "s/bind=0.0.0.0:5160/bind=$ASTERISK_HOSTNAME:5160/g" /etc/asterisk/oml_pjsip_transports.conf
-    sed -i "s/bind=0.0.0.0:5060/bind=$PUBLIC_IP:5060/g" /etc/asterisk/oml_pjsip_transports.conf
+    sed -i "s/50000/40299/g" /etc/asterisk/rtp.conf
+    sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_manager.conf    
     ;;
   docker-compose-lan)
     echo "lan docker-compose"
     sed -i "s/bindaddr=127.0.0.1/bindaddr=$ASTERISK_HOSTNAME/g" /etc/asterisk/oml_manager.conf    
-    sed -i "s/bind=0.0.0.0:5160/bind=$ASTERISK_HOSTNAME:5160/g" /etc/asterisk/oml_pjsip_transports.conf
-    sed -i "s/bind=0.0.0.0:5060/bind=$ASTERISK_HOSTNAME:5060/g" /etc/asterisk/oml_pjsip_transports.conf
     ;;
   systemd-cloud)
     sed -i "s/bindaddr=127.0.0.1/bindaddr=$ASTERISK_HOSTNAME/g" /etc/asterisk/oml_manager.conf    
