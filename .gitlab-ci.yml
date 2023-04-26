@@ -24,7 +24,7 @@ container-image:
     - |-
       if [ -n "${DOCKER_USERNAME}" ] && [ -n "${DOCKER_SECRET}" ]; then
         echo "${DOCKER_SECRET}" | docker login --username "${DOCKER_USERNAME}" --password-stdin
-        docker tag run omnileads/asterisk:230328.01
+        docker tag run omnileads/asterisk:230425.01
         docker push docker.io/omnileads/asterisk:230425.01
       fi
   rules:
