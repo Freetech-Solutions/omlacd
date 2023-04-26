@@ -27,7 +27,7 @@ if [ "$1" == "" ]; then
     sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_manager.conf
     sed -i "s/bind=0.0.0.0:5160/bind=$ASTERISK_HOSTNAME:5160/g" /etc/asterisk/oml_pjsip_transports.conf
     sed -i "s/bind=0.0.0.0:5060/bind=$ASTERISK_HOSTNAME:5060/g" /etc/asterisk/oml_pjsip_transports.conf
-  if [ -n "${PROD_AIO_IP}" ]; then
+  elif [ -n "${PROD_AIO_IP}" ]; then
     sed -i "s/bindaddr=127.0.0.1/bindaddr=$ASTERISK_HOSTNAME/g" /etc/asterisk/oml_manager.conf    
     sed -i "s/bind=0.0.0.0:5160/bind=$ASTERISK_HOSTNAME:5160/g" /etc/asterisk/oml_pjsip_transports.conf
     sed -i "s/bind=0.0.0.0:5060/bind=$PUBLIC_IP:5060/g" /etc/asterisk/oml_pjsip_transports.conf
