@@ -22,7 +22,7 @@ if [ "$1" == "" ]; then
   # Set AMI listen IPADDR 
   # Set SIP-Agent(5160) listen IPADDR & SIP-PSTN(5060) listen IPADDR
   case ${ENV} in
-  devenv)
+  docker-compose-devenv)
     echo "devenv docker-compose"
     sed -i "s/50000/40999/g" /etc/asterisk/rtp.conf
     sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_manager.conf    
