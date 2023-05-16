@@ -122,6 +122,10 @@ done
   >&2 echo "Make of asterisk done"
 make install
 
+ # Install codec g729
+echo "Adding codec g729"
+wget http://asterisk.hosting.lv/bin/codec_g729-ast180-gcc4-glibc-pentium.so
+mv codec_g729-ast180-gcc4-glibc-pentium.so /usr/lib/asterisk/modules/codec_g729.so
 
 mkdir /etc/asterisk/custom
 
