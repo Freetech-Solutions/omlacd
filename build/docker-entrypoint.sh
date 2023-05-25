@@ -72,10 +72,12 @@ if [ "$1" == "" ]; then
     ;;  
   systemd-ha)
     echo "systemd HA"
-    sed -i "s/bindaddr=127.0.0.1/bindaddr=$ASTERISK_HOSTNAME/g" /etc/asterisk/oml_manager.conf
-    sed -i "s/bindaddr=127.0.0.1/bindaddr=$ASTERISK_HOSTNAME/g" /etc/asterisk/oml_http.conf
+    sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_manager.conf
+    sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_http.conf
     sed -i "s/bind=0.0.0.0:5160/bind=$ASTERISK_HOSTNAME:5160/g" /etc/asterisk/oml_pjsip_transports.conf
-    sed -i "s/bind=0.0.0.0:5060/bind=$PUBLIC_IP:5060/g" /etc/asterisk/oml_pjsip_transports.conf
+    sed -i "s/bind=0.0.0.0:5060/bind=$ASTERISK_HOSTNAME:5060/g" /etc/asterisk/oml_pjsip_transports.conf
+    sed -i "s/;external_media_address=extern_ip_nat/external_media_address=$PUBLIC_IP/g" /etc/asterisk/oml_pjsip_transports.conf
+    sed -i "s/;external_signaling_address=extern_ip_nat/external_signaling_address=$PUBLIC_IP/g" /etc/asterisk/oml_pjsip_transports.conf
     ;;
   *)
     echo "El número ingresado no está en el rango válido"
@@ -101,7 +103,7 @@ if [ "$1" == "" ]; then
   sed -i "s/^UserName.*/UserName            = ${PGUSER}/g" /etc/odbc.ini
   sed -i "s/^Password.*/Password            = ${PGPASSWORD}/g" /etc/odbc.ini
   sed -i "s/^Port.*/Port                    = ${PGPORT}/g" /etc/odbc.ini
-  if [ "$PGSSL" == "True" ]; then
+  if [ "${PGSSL}" == "true" ]; then
     sed -i "s/#SSLmode/SSLmode/g" /etc/odbc.ini
   fi
 
