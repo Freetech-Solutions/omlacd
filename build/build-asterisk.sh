@@ -124,8 +124,9 @@ make install
 
  # Install codec g729
 echo "Adding codec g729"
-wget http://asterisk.hosting.lv/bin/codec_g729-ast180-gcc4-glibc-pentium.so
-mv codec_g729-ast180-gcc4-glibc-pentium.so /usr/lib/asterisk/modules/codec_g729.so
+wget http://asterisk.hosting.lv/bin/codec_g729-ast180-gcc4-glibc-x86_64-pentium4.so
+mv codec_g729* /usr/lib/asterisk/modules/codec_g729.so
+chmod +x /usr/lib/asterisk/modules/codec_g729.so
 
 mkdir /etc/asterisk/custom
 
