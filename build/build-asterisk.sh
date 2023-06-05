@@ -77,6 +77,7 @@ menuselect/menuselect --disable BUILD_NATIVE menuselect.makeopts
 menuselect/menuselect --enable BETTER_BACKTRACES menuselect.makeopts
 # codecs
 menuselect/menuselect --enable codec_gsm menuselect.makeopts
+menuselect/menuselect --enable codec_opus menuselect.makeopts
 
 menuselect/menuselect --disable-category MENUSELECT_CORE_SOUNDS menuselect.makeopts
 menuselect/menuselect --disable-category MENUSELECT_MOH menuselect.makeopts
