@@ -1,18 +1,15 @@
-# vim:set ft=dockerfile:
-
-
-FROM python:3.10.4-slim-bullseye as dev
+FROM python:3.10.12-slim-bullseye as dev
 
 ENV LANG en_US.utf8
 ENV NOTVISIBLE "in users profile"
+
+RUN pip install --upgrade pip
 
 COPY build/build-asterisk.sh .asterisk_version build/requirements.txt /
 RUN ASTERISK_VERSION=$(cat .asterisk_version) /build-asterisk.sh
 RUN apt update \
     && apt install -y libgsm1 git curl python3-psycopg2 gnupg \
-    && pip3 install -r /requirements.txt \
-    && echo "deb http://packages.irontec.com/debian stretch main" >> /etc/apt/sources.list \
-    && wget http://packages.irontec.com/public.key -q -O - | apt-key add - \
+    && pip install -r /requirements.txt \
     && apt-get update -y \
     && apt install sngrep -y \
     && apt-get remove --purge git -y \
@@ -29,7 +26,7 @@ RUN apt update \
     && rm -rf /usr/lib/python3/dist-packages/psycopg2/ \
     && rm -rf /lib/x86_64-linux-gnu/libkeyutils.so.1*
 
-FROM python:3.10.4-slim-bullseye as run
+FROM python:3.10.12-slim-bullseye as run
 
 RUN mkdir /src \
     && apt-get update -qq \
