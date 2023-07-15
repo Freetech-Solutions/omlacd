@@ -1,14 +1,13 @@
 # Release Notes
-[230703.01] - 2023-07/03
+2023-07-15
 
 ## Added
 
-* oml-298 - New Asterisk ports scenary "all" to open all ports on 0.0.0.0
+* oml-302 Add Homer SIP Capture integration
 
 ## Changed
 
-* oml-297 - Migrate from asterisk AGI to FastAGI python component
-* oml-297 - Migrate callrec-converter script from bash (aws cli based) to python (boto3 pip based).
+No changes in this release.
 
 ## Fixed
 
