@@ -76,7 +76,7 @@ if [ "$1" == "" ]; then
   if [[ "${HOMER_ENABLE}" == "True" ]]; then
     sed -i "s/no/yes/g" /etc/asterisk/hep.conf
     sed -i "s/homer_host:homer_port/$HOMERHOST:$HOMERPORT/g" /etc/asterisk/hep.conf
-    sed -i "s/1234/$TENANT_ID/g" /etc/asterisk/hep.conf
+    sed -i "s/tenant/$TENANT_ID/g" /etc/asterisk/hep.conf
   fi
 
   if [[ "${FULL_LOGS}" == "True" ]]; then
