@@ -74,7 +74,9 @@ if [ "$1" == "" ]; then
   sed -i "s/extern_ip_nat/$PUBLIC_IP/g" /etc/asterisk/oml_pjsip_transports.conf
 
   if [[ "${HOMER_ENABLE}" == "True" ]]; then
+    sed -i "s/no/yes/g" /etc/asterisk/hep.conf
     sed -i "s/homer_host:homer_port/$HOMERHOST:$HOMERPORT/g" /etc/asterisk/hep.conf
+    sed -i "s/tenant/$TENANT_ID/g" /etc/asterisk/hep.conf
   fi
 
   if [[ "${FULL_LOGS}" == "True" ]]; then
