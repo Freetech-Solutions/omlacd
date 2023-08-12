@@ -8,7 +8,7 @@ PUBLIC_IP=$(curl http://ipinfo.io/ip)
 if [ "$1" == "" ]; then
 
   echo "**[omlacd] Initializing regenerar_asterisk script"
-  python3 /opt/asterisk/virtualenv/scripts/regenerar_asterisk.py &
+  python3 /opt/asterisk/scripts/regenerar_asterisk.py &
   sleep 4
 
   echo "**[omlacd] Setting localtime"
@@ -31,7 +31,7 @@ if [ "$1" == "" ]; then
       sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_http.conf
       ;;
     cloud)
-      echo "cloud"
+      echo "******* cloud scenary *******"
       sed -i "s/bindaddr=127.0.0.1/bindaddr=$ASTERISK_HOSTNAME/g" /etc/asterisk/oml_manager.conf
       sed -i "s/bind=0.0.0.0:5160/bind=$ASTERISK_HOSTNAME:5160/g" /etc/asterisk/oml_pjsip_transports.conf
       if [[ "${ARQ}" == "cluster" ]]; then
@@ -39,16 +39,16 @@ if [ "$1" == "" ]; then
       fi
       ;;
     lan)
-      echo "lan"
+      echo "******** lan scenary *******"
       sed -i "s/bindaddr=127.0.0.1/bindaddr=$ASTERISK_HOSTNAME/g" /etc/asterisk/oml_manager.conf
       sed -i "s/bind=0.0.0.0:5160/bind=$ASTERISK_HOSTNAME:5160/g" /etc/asterisk/oml_pjsip_transports.conf
       sed -i "s/bind=0.0.0.0:5060/bind=$ASTERISK_HOSTNAME:5060/g" /etc/asterisk/oml_pjsip_transports.conf
       if [[ "${ARQ}" == "cluster" ]]; then
         sed -i "s/bindaddr=127.0.0.1/bindaddr=$ASTERISK_HOSTNAME/g" /etc/asterisk/oml_http.conf
       fi
-      ;;
+      ;;    
     nat)
-      echo "nat"
+      echo "********* nat scenary *******"
       sed -i "s/bindaddr=127.0.0.1/bindaddr=$ASTERISK_HOSTNAME/g" /etc/asterisk/oml_manager.conf      
       sed -i "s/bind=0.0.0.0:5160/bind=$ASTERISK_HOSTNAME:5160/g" /etc/asterisk/oml_pjsip_transports.conf
       sed -i "s/bind=0.0.0.0:5060/bind=$ASTERISK_HOSTNAME:5060/g" /etc/asterisk/oml_pjsip_transports.conf
@@ -59,17 +59,23 @@ if [ "$1" == "" ]; then
       fi
       ;;
     all)
-      echo "open 0.0.0.0"      
+      echo "******* open 0.0.0.0 scenary *******"
       sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_manager.conf
       sed -i "s/bind=0.0.0.0:5160/bind=0.0.0.0:5160/g" /etc/asterisk/oml_pjsip_transports.conf
       sed -i "s/bind=0.0.0.0:5060/bind=0.0.0.0:5060/g" /etc/asterisk/oml_pjsip_transports.conf
       sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_http.conf  
-      ;;  
+      ;;
+    ha)
+      echo "******** HA scenary *******"
+      sed -i "s/bindaddr=127.0.0.1/bindaddr=$ASTERISK_VIP/g" /etc/asterisk/oml_manager.conf
+      sed -i "s/bind=0.0.0.0:5160/bind=$ASTERISK_HOSTNAME:5160/g" /etc/asterisk/oml_pjsip_transports.conf
+      sed -i "s/bind=0.0.0.0:5060/bind=$ASTERISK_VIP:5060/g" /etc/asterisk/oml_pjsip_transports.conf
+      sed -i "s/bindaddr=127.0.0.1/bindaddr=$ASTERISK_HOSTNAME/g" /etc/asterisk/oml_http.conf
+      ;;      
     *)
       echo "You must to pass ENV var: devenv", cloud, lan or nat
       ;;
   esac        
-  
 
   sed -i "s/extern_ip_nat/$PUBLIC_IP/g" /etc/asterisk/oml_pjsip_transports.conf
 
@@ -84,7 +90,9 @@ if [ "$1" == "" ]; then
     sed -i "s/messages.log/;messages.log/g" /etc/asterisk/logger.conf
   fi
 
-  sed -i "s/^;queue_log_realtime_use_gmt=yes/queue_log_realtime_use_gmt=yes/g" /etc/asterisk/logger.conf
+  if [[ "${UTC_LOGS}" == "True" ]]; then
+    sed -i "s/^;queue_log_realtime_use_gmt=yes/queue_log_realtime_use_gmt=yes/g" /etc/asterisk/logger.conf
+  fi
 
   echo "**[omlacd] Writing the odbc.ini file with database variables"
   sed -i "s/Servername.*/Servername         = ${PGHOST}/g" /etc/odbc.ini
@@ -98,13 +106,14 @@ if [ "$1" == "" ]; then
 
   chown -R 1000:1000 /var/*/asterisk \
                      /usr/*/asterisk \
-                     /etc/asterisk
+                     /etc/asterisk/*.conf \
+                     /opt/asterisk/scripts
 
   echo "**[omlacd] Initializing asterisk"
 
 else
   echo "**[omlacd] Initializing regenerar_asterisk script"
-  python3 /opt/asterisk/virtualenv/scripts/regenerar_asterisk.py &
+  python3 /opt/asterisk/scripts/regenerar_asterisk.py &
   echo "**[omlacd] Initializing asterisk"
 fi
 
