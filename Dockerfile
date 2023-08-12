@@ -50,15 +50,12 @@ COPY --from=dev /var/run/asterisk/ /var/run/asterisk/
 COPY --from=dev /usr/local/lib/python3.10/ /usr/local/lib/python3.10/
 COPY --from=dev /usr/lib/x86_64-linux-gnu/ /usr/lib/x86_64-linux-gnu/
 
-RUN cp -a /usr/local/lib/python3.10/site-packages/pyst2 /src/ && \
-  mkdir -p /opt/asterisk/virtualenv/bin/ && \
-  ln -s /usr/local/bin/python3 /opt/asterisk/virtualenv/bin/
+RUN cp -a /usr/local/lib/python3.10/site-packages/pyst2 /src/ 
 
 COPY source/astconf/* /etc/asterisk/
-COPY source/agis/* /var/lib/asterisk/agi-bin/
 COPY source/odbc/*.ini /etc/
-COPY source/scripts/* /opt/asterisk/virtualenv/scripts/
-COPY build//docker-entrypoint.sh /docker-entrypoint.sh
+COPY source/scripts/* /opt/asterisk/scripts/
+COPY build/docker-entrypoint.sh /docker-entrypoint.sh
 
 RUN useradd -M -u 1000 omnileads
 
