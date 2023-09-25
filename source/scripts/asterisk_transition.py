@@ -1,3 +1,5 @@
+#!/usr/local/bin/python3.10
+
 # -*- coding: utf-8 -*-
 
 # Copyright (C) 2018 Freetech Solutions
