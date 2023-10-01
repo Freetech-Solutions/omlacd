@@ -4,6 +4,7 @@ PROGNAME=$(basename $0)
 ASTERISK_VERSION=$(cat .asterisk_version)
 ASTERISK_AUDIO_PROMPTS=https://downloads.asterisk.org/pub/telephony/sounds/asterisk-core-sounds-en-alaw-current.tar.gz
 OMNILEADS_AUDIO_PROMPTS=https://fts-public-packages.s3-sa-east-1.amazonaws.com/asterisk/asterisk-oml-sounds-current.tar.gz
+OMNILEADS_MOH=https://cobrate.sfo3.digitaloceanspaces.com/asterisk-oml-moh-current.tar.gz
 
 if test -z ${ASTERISK_VERSION}; then
   echo "${PROGNAME}: ASTERISK_VERSION required" >&2
@@ -11,8 +12,6 @@ if test -z ${ASTERISK_VERSION}; then
 fi
 
 set -ex
-
-#useradd --system asterisk
 
 apt-get update -qq
 DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends --no-install-suggests \
@@ -129,11 +128,6 @@ wget http://asterisk.hosting.lv/bin/codec_g729-ast180-gcc4-glibc-x86_64-pentium4
 mv codec_g729* /usr/lib/asterisk/modules/codec_g729.so
 chmod +x /usr/lib/asterisk/modules/codec_g729.so
 
-mkdir /etc/asterisk/custom
-
-chmod -R 750 /etc/asterisk/custom
-chmod -R 750 /var/spool/asterisk
-
 cd /
 
 echo "Download en Asterisk sounds"
@@ -148,7 +142,13 @@ wget $OMNILEADS_AUDIO_PROMPTS
 tar xvfz asterisk-oml-sounds-current.tar.gz -C /var/lib/asterisk/sounds/oml
 rm -f asterisk-oml-sounds-current.tar.gz
 
+echo "Download OMniLeads MOH"
+wget $OMNILEADS_MOH
+tar xvfz asterisk-oml-moh-current.tar.gz -C /var/lib/asterisk/moh
+rm -f asterisk-oml-sounds-current.tar.gz
+
 chmod -R 750 /var/lib/asterisk/sounds
+chmod -R 750 /var/lib/asterisk/moh
 
 # remove *-dev packages
 devpackages=`dpkg -l|grep '\-dev'|awk '{print $2}'|xargs`
