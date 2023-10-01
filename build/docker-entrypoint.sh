@@ -3,9 +3,14 @@
 set -ex
 COMMAND="/usr/sbin/asterisk -T -U omnileads -p -vvvvvvvf"
 
-PUBLIC_IP=$(curl http://ipinfo.io/ip)
 
 if [ "$1" == "" ]; then
+
+  if [[ "${ENV}" == "devenv" ]]; then
+    PUBLIC_IP=localhost
+  else
+    PUBLIC_IP=$(curl http://ipinfo.io/ip)
+  fi    
 
   echo "**[omlacd] Initializing regenerar_asterisk script"
   python3 /opt/asterisk/scripts/regenerar_asterisk.py &
@@ -13,7 +18,7 @@ if [ "$1" == "" ]; then
 
   echo "**[omlacd] Setting localtime"
   rm -rf /etc/localtime
-  ln -s /usr/share/zoneinfo/$TZ /etc/localtime
+  ln -s "/usr/share/zoneinfo/${TZ}" /etc/localtime
 
   echo "**[omlacd] Writting the AMI config"
   sed -i "s/amiuser/$AMI_USER/g" /etc/asterisk/oml_manager.conf
@@ -61,7 +66,11 @@ if [ "$1" == "" ]; then
     all)
       echo "******* open 0.0.0.0 scenary *******"
       sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_manager.conf
-      sed -i "s/bind=0.0.0.0:5160/bind=0.0.0.0:5160/g" /etc/asterisk/oml_pjsip_transports.conf
+      if [[ "${ARQ}" == "cluster" ]]; then
+        sed -i "s/bind=0.0.0.0:5160/bind=0.0.0.0:5160/g" /etc/asterisk/oml_pjsip_transports.conf
+      else
+        sed -i "s/bind=0.0.0.0:5160/bind=$ASTERISK_HOSTNAME:5160/g" /etc/asterisk/oml_pjsip_transports.conf
+      fi    
       sed -i "s/bind=0.0.0.0:5060/bind=0.0.0.0:5060/g" /etc/asterisk/oml_pjsip_transports.conf
       sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_http.conf  
       ;;
@@ -73,7 +82,7 @@ if [ "$1" == "" ]; then
       sed -i "s/bindaddr=127.0.0.1/bindaddr=$ASTERISK_HOSTNAME/g" /etc/asterisk/oml_http.conf
       ;;      
     *)
-      echo "You must to pass ENV var: devenv", cloud, lan or nat
+      echo "You must to pass ENV var: devenv, cloud, lan or nat"
       ;;
   esac        
 
@@ -104,10 +113,10 @@ if [ "$1" == "" ]; then
     sed -i "s/#SSLmode/SSLmode/g" /etc/odbc.ini
   fi
 
-  chown -R 1000:1000 /var/*/asterisk \
-                     /usr/*/asterisk \
-                     /etc/asterisk/*.conf \
-                     /opt/asterisk/scripts
+  # chown -R 1000:1000 /var/*/asterisk \
+  #                    /usr/*/asterisk \
+  #                    /etc/asterisk/*.conf \
+  #                    /opt/asterisk/scripts
 
   echo "**[omlacd] Initializing asterisk"
 
