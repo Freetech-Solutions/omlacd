@@ -1,21 +1,22 @@
 # Release Notes
-2023-08-11
+2023-10-01
 
 ## Added
 
-* oml-244 back & restore procedure with python scripts
-* oml-307 new ENV scenary (ENV=ha) in order to attach SIP 5060 & AMI 5038 to cluster VIP
+* No added in this release.
 
 ## Changed
 
-* oml-305 the call log registration logic from ODBC queue_log has been extrapolated to FastAGI
-* oml-305 move all python scripts to new location /opt/asterisk/scripts
-* oml-305 upgrade to asterisk 18.19.0
+* oml-345 The Dockerfile and docker-entrypoint.sh files have been modified to optimize the container startup process
+* oml-345 logger.conf was modified to only keep logs on stdout
+* oml-304 The streaming of manager events related to app_queue.so has been enabled
 
 ## Fixed
 
-* oml-308  New environment variable (UTC_LOGS) to indicate whether to keep logs (queue_log) using UTC
+* oml-328 ENV=all now enable the manager user on 0.0.0.0
+* oml-310 Now the default music on hold is working correctly
+* oml-2487 Inbound and manual call transfer to campaign failure reports
 
 ## Removed
 
-No removals in this release.
+* master.csv & /var/log/asterisk/full file logs
