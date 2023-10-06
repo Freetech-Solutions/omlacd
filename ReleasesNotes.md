@@ -16,6 +16,7 @@
 * oml-328 ENV=all now enable the manager user on 0.0.0.0
 * oml-310 Now the default music on hold is working correctly
 * oml-2487 Inbound and manual call transfer to campaign failure reports
+* oml-2509 Inbound CTOUT BUSY/CONGESTION failure reports
 
 ## Removed
 
