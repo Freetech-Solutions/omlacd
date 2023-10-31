@@ -53,7 +53,6 @@ COPY --from=dev /usr/lib/x86_64-linux-gnu/ /usr/lib/x86_64-linux-gnu/
 RUN cp -a /usr/local/lib/python3.10/site-packages/pyst2 /src/ 
 
 COPY source/astconf/* /etc/asterisk/
-COPY source/odbc/*.ini /etc/
 COPY source/scripts/* /opt/asterisk/scripts/
 COPY build/docker-entrypoint.sh /docker-entrypoint.sh
 
