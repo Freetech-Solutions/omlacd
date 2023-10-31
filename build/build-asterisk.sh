@@ -43,11 +43,6 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends --no-i
     uuid \
     uuid-dev \
     xmlstarlet \
-    unixodbc \
-    odbc-postgresql \
-    unixodbc-dev \
-    odbcinst \
-    odbcinst1debian2 \
     libjansson-dev \
     wget
 
