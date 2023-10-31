@@ -1,5 +1,1 @@
-<<<<<<< HEAD
 240226.01
-=======
-231019.01
->>>>>>> f6fe8b1 (Oml 2457 dev loggeo de actividad agente desde oml 2.0)
