@@ -4,7 +4,7 @@ PROGNAME=$(basename $0)
 ASTERISK_VERSION=$(cat .asterisk_version)
 ASTERISK_AUDIO_PROMPTS=https://downloads.asterisk.org/pub/telephony/sounds/asterisk-core-sounds-en-alaw-current.tar.gz
 OMNILEADS_AUDIO_PROMPTS=https://fts-public-packages.s3-sa-east-1.amazonaws.com/asterisk/asterisk-oml-sounds-current.tar.gz
-OMNILEADS_MOH=https://cobrate.sfo3.digitaloceanspaces.com/asterisk-oml-moh-current.tar.gz
+OMNILEADS_MOH=https://fts-public-packages.s3-sa-east-1.amazonaws.com/asterisk/asterisk-oml-moh-current.tar.gz
 
 if test -z ${ASTERISK_VERSION}; then
   echo "${PROGNAME}: ASTERISK_VERSION required" >&2
