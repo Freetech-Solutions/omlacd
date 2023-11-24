@@ -12,25 +12,23 @@ container-image-dev:
     - >-
       docker buildx build
       --file=Dockerfile
-      --tag=dev
-      --target=dev
-      .
-    - >-
-      docker buildx build
-      --file=Dockerfile
       --tag=run
       --target=run
       .
     - |-
-      if [ -n "${DOCKER_USERNAME}" ] && [ -n "${DOCKER_SECRET}" ]; then
+      if [ "${CI_COMMIT_BRANCH}" == "main" ]; then
         echo "${DOCKER_SECRET}" | docker login --username "${DOCKER_USERNAME}" --password-stdin
         IMAGE_VERSION=$(cat version.txt)
         docker tag run omnileads/asterisk:$IMAGE_VERSION
         docker push docker.io/omnileads/asterisk:$IMAGE_VERSION
+      else
+        echo "${DOCKER_PASSWORD}" | docker login --username "${DOCKER_USER}" --password-stdin
+        IMAGE_VERSION=$(cat version.txt)
+        docker tag run freetechsolutions/asterisk:$IMAGE_VERSION
+        docker push docker.io/freetechsolutions/asterisk:$IMAGE_VERSION
       fi  
   rules:
-    - if: '$CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "oml-dev-2.0"'
-    - if: '$CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main"'
+    - if: '$CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "master-2.0"'
+    - if: '$CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "develop-2.0"'
     - if: '$CI_COMMIT_REF_NAME =~ /build/'
     - if: '$CI_PIPELINE_SOURCE == "web"'
-
