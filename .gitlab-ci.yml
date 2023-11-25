@@ -16,7 +16,7 @@ container-image-dev:
       --target=run
       .
     - |-
-      if [ "${CI_COMMIT_BRANCH}" == "main" ]; then
+      if [ "${CI_COMMIT_BRANCH}" == "master-2.0" ]; then
         echo "${DOCKER_SECRET}" | docker login --username "${DOCKER_USERNAME}" --password-stdin
         IMAGE_VERSION=$(cat version.txt)
         docker tag run omnileads/asterisk:$IMAGE_VERSION
