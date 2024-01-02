@@ -93,13 +93,21 @@ if [ "$1" == "" ]; then
     sed -i "s/tenant/$TENANT_ID/g" /etc/asterisk/hep.conf
   fi
 
-  echo "**[omlacd] Initializing asterisk"
+  # Set Scale parameters
+  if [[ $SCALE == "True" ]]; then
+    sed -i "s/;initial_size=5/initial_size=5/g" /etc/asterisk/stasis.conf
+    sed -i "s/;idle_timeout_sec=20/idle_timeout_sec=${THREADPOOL_IDLE_TIMEOUT}/g" /etc/asterisk/stasis.conf
+    sed -i "s/;max_size=50/max_size=${THREADPOOL_MAX_SIZE}/g" /etc/asterisk/stasis.conf
+    sed -i "s/timer_b=64000/timer_b=32000/g" /etc/asterisk/oml_pjsip.conf
+    sed -i "s/threadpool_idle_timeout=60/threadpool_idle_timeout=${THREADPOOL_IDLE_TIMEOUT}/g" /etc/asterisk/oml_pjsip.conf
+    sed -i "s/threadpool_max_size=50/threadpool_max_size=${THREADPOOL_MAX_SIZE}/g" /etc/asterisk/oml_pjsip.conf
+  fi
 
 else
   echo "**[omlacd] Initializing regenerar_asterisk script"
   python3 /opt/asterisk/scripts/regenerar_asterisk.py &
-  echo "**[omlacd] Initializing asterisk"
 fi
 
 # Init asterisk server
+echo "**[omlacd] Initializing asterisk"
 exec ${COMMAND}
