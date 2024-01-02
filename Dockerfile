@@ -56,8 +56,7 @@ COPY source/astconf/* /etc/asterisk/
 COPY source/scripts/* /opt/asterisk/scripts/
 COPY build/docker-entrypoint.sh /docker-entrypoint.sh
 
-RUN mkdir /etc/asterisk/custom
-RUN chmod 750 /etc/asterisk/custom /var/spool/asterisk
+RUN chmod 750 /var/spool/asterisk
 RUN useradd -M -u 1000 omnileads
 RUN chown -R omnileads.omnileads /var/lib/asterisk /etc/asterisk /opt/asterisk /usr/lib/asterisk /docker-entrypoint.sh /var/spool/asterisk
 

@@ -1,18 +1,14 @@
 # Release Notes
-2023-11-25
+2024-01-02
 
 ## Added
 
-* oml-414 [BUILD] In the build stage, it's possible to discern between registry containers based on the branch type.
+* oml-250 [ASTERISK]: It is now possible to customize certain parameters to achieve scalability of concurrent calls.
 
 ## Changed
 
-* oml-414 [DEPLOY] When the environment variable env=all is set, port 5160 (Users) is opened on 0.0.0.0, allowing the use of an external RTPEngine.
-* oml-414 New asterisk version 18.20.0
+* oml-438 [ASTERISK]: Customization of dialplan, AGI, and the Asterisk component environment is now possible using Docker multistage build.
 
 ## Fixed
 
-
 ## Removed
-
-
