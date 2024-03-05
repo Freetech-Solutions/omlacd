@@ -23,10 +23,9 @@ from datetime import date
 import boto3
 from botocore.exceptions import NoCredentialsError
 
-ano = date.today().strftime("%Y")
-mes = date.today().strftime("%m")
-dia = date.today().strftime("%d")
-directorio_final = f"/opt/callrec/{ano}-{mes}-{dia}"
+# ano = date.today().strftime("%Y")
+# mes = date.today().strftime("%m")
+# dia = date.today().strftime("%d")
 
 callrec_device = os.getenv("CALLREC_DEVICE")
 s3_bucket_name = os.getenv("S3_BUCKET_NAME")
@@ -61,8 +60,9 @@ def upload_to_s3(source_path, destination_path):
         exit(1)
 
 def move_file_to_s3(source_file):
-    destination_path = f"{ano}-{mes}-{dia}/{source_file}"
-    source_path = f"/var/spool/asterisk/monitor/{ano}-{mes}-{dia}/{source_file}"
+
+    destination_path = f"{date_bucket}/{source_file}"
+    source_path = f"/var/spool/asterisk/monitor/{date_dialplan}/{source_file}"
     upload_to_s3(source_path, destination_path)
     os.remove(source_path)
 
@@ -70,8 +70,17 @@ if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: python script.py source_file")
         sys.exit(1)
-
     source_file = sys.argv[1]
-    print(f"Moviendo archivo '{source_file}' a S3...")
+    date_dialplan = sys.argv[2]
+    date_bucket = sys.argv[2]
+    
+    #date_script = f"{ano}-{mes}-{dia}"
+    #print(f"Fechas en cambio de dia: '{date_script}' VS {date_dialplan}")
+    
+    # if date_script == date_dialplan:
+    #     date_bucket = date_dialplan
+    # else:
+    #     date_bucket = date_script
+
     move_file_to_s3(source_file)
-    print(f"Archivo '{source_file}' movido exitosamente a S3.")
+    print(f"Archivo '{source_file}' movido exitosamente a S3 '{date_bucket}'.")
