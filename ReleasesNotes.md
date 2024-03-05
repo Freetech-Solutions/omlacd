@@ -1,14 +1,12 @@
 # Release Notes
-2024-01-02
+2024-03-05
 
 ## Added
 
-* oml-250 [ASTERISK]: It is now possible to customize certain parameters to achieve scalability of concurrent calls.
-
 ## Changed
 
-* oml-438 [ASTERISK]: Customization of dialplan, AGI, and the Asterisk component environment is now possible using Docker multistage build.
-
 ## Fixed
+
+* oml-475 Calls that start on one day and end on the next cannot be played back or downloaded.
 
 ## Removed
