@@ -128,4 +128,4 @@ fi
 
 # Init asterisk server
 echo "**[omlacd] Initializing asterisk"
-exec ${COMMAND}
+su omnileads -c "exec ${COMMAND}"
