@@ -15,7 +15,7 @@ if [ "$1" == "" ]; then
   fi    
 
   echo "**[omlacd] Initializing regenerar_asterisk script"
-  python3 /opt/asterisk/scripts/regenerar_asterisk.py &
+  su omnileads -c "python3 /opt/asterisk/scripts/regenerar_asterisk.py &"
   sleep 4
 
   # Set TZ
@@ -105,9 +105,9 @@ if [ "$1" == "" ]; then
 
 else
   echo "**[omlacd] Initializing regenerar_asterisk script"
-  python3 /opt/asterisk/scripts/regenerar_asterisk.py &
+  su omnileads -c "python3 /opt/asterisk/scripts/regenerar_asterisk.py &"
 fi
 
 # Init asterisk server
 echo "**[omlacd] Initializing asterisk"
-exec ${COMMAND}
+su omnileads -c "exec ${COMMAND}"

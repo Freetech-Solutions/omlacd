@@ -58,7 +58,7 @@ COPY build/docker-entrypoint.sh /docker-entrypoint.sh
 
 RUN chmod 750 /var/spool/asterisk
 RUN useradd -M -u 1000 omnileads
-RUN chown -R omnileads.omnileads /var/lib/asterisk /etc/asterisk /opt/asterisk /usr/lib/asterisk /docker-entrypoint.sh /var/spool/asterisk
+RUN chown -R omnileads.omnileads /var/lib/asterisk /etc/asterisk /opt/asterisk /usr/lib/asterisk /docker-entrypoint.sh /var/spool/asterisk /var/log/asterisk
 
 EXPOSE 5060/udp
 
