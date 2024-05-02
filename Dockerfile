@@ -1,8 +1,10 @@
 FROM python:3.12-slim-bullseye as dev
 
+# Configuración de entorno
 ENV LANG en_US.utf8
 ENV NOTVISIBLE "in users profile"
 
+# Actualización de pip y copia de scripts necesarios
 RUN pip install --upgrade pip
 
 COPY build/build-asterisk.sh .asterisk_version build/requirements.txt /
@@ -28,8 +30,8 @@ FROM python:3.12-slim-bullseye as run
 RUN apt update -qq \
     && apt install -y libbinutils libedit2 libncursesw5 wget awscli \
     && apt autoremove -y \
-    && apt clean -y \
-    && apt purge -y \
+    && apt clean \
+    && apt purge \
     && rm -rf /var/lib/apt/lists/*
 
 # Copia de los componentes de Asterisk y picoTTS desde la etapa de desarrollo
@@ -40,7 +42,6 @@ COPY --from=dev /etc/asterisk /etc/asterisk/
 COPY --from=dev /var/lib/asterisk /var/lib/asterisk
 COPY --from=dev /var/log/asterisk /var/log/asterisk
 COPY --from=dev /var/spool/asterisk /var/spool/asterisk
-COPY --from=dev /root/bin/* /usr/sbin/
 COPY --from=dev /usr/lib/asterisk /usr/lib/asterisk/
 COPY --from=dev /var/run/asterisk/ /var/run/asterisk/
 # picoTTS
