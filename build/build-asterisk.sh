@@ -52,13 +52,6 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends --no-i
 
 apt-get purge -y --auto-remove
 
-git clone https://github.com/naggety/picotts.git /usr/src/pico \
-    && cd /usr/src/pico \
-    && ./autogen.sh \
-    && ./configure \
-    && make \
-    && make install
-
 mkdir -p /usr/src/
 cd /usr/src/
 
