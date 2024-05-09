@@ -1,7 +1,7 @@
 #!/opt/asterisk/virtualenv/bin/python3
 # -*- coding: utf-8 -*-
 
-# Copyright (C) 2018 Freetech Solutions
+# Copyright (C) 2024 Freetech Solutions
 
 # This file is part of OMniLeads
 

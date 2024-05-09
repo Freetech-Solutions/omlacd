@@ -1,8 +1,8 @@
-#!/usr/local/bin/python3.10
+#!/usr/bin/env python3.12
 
 # -*- coding: utf-8 -*-
 
-# Copyright (C) 2018 Freetech Solutions
+# Copyright (C) 2024 Freetech Solutions
 
 # This file is part of OMniLeads
 
