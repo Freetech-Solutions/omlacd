@@ -3,7 +3,7 @@ PROGNAME=$(basename $0)
 
 ASTERISK_VERSION=$(cat .asterisk_version)
 ASTERISK_AUDIO_PROMPTS=https://downloads.asterisk.org/pub/telephony/sounds/asterisk-core-sounds-en-alaw-current.tar.gz
-OMNILEADS_AUDIO_PROMPTS=https://fts-public-packages.s3-sa-east-1.amazonaws.com/asterisk/asterisk-oml-sounds-current.tar.gz
+OMNILEADS_AUDIO_PROMPTS=https://omnileads.sfo3.digitaloceanspaces.com/asterisk-oml-sounds-current.tar.gz
 OMNILEADS_MOH=https://fts-public-packages.s3-sa-east-1.amazonaws.com/asterisk/asterisk-oml-moh-current.tar.gz
 
 if test -z ${ASTERISK_VERSION}; then
@@ -18,6 +18,10 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends --no-i
     autoconf \
     binutils-dev \
     build-essential \
+    automake \
+    autoconf \
+    libpopt-dev \
+    git \
     ca-certificates \
     curl \
     file \
@@ -119,7 +123,7 @@ make install
 
  # Install codec g729
 echo "Adding codec g729"
-wget http://asterisk.hosting.lv/bin/codec_g729-ast180-gcc4-glibc-x86_64-pentium4.so
+wget http://asterisk.hosting.lv/bin/codec_g729-ast200-gcc4-glibc-x86_64-pentium4.so
 mv codec_g729* /usr/lib/asterisk/modules/codec_g729.so
 chmod +x /usr/lib/asterisk/modules/codec_g729.so
 
@@ -142,8 +146,22 @@ wget $OMNILEADS_MOH
 tar xvfz asterisk-oml-moh-current.tar.gz -C /var/lib/asterisk/moh
 rm -f asterisk-oml-sounds-current.tar.gz
 
+# Descargar y compilar picoTTS
+RUN git clone https://github.com/naggety/picotts.git /usr/src/pico \
+    && cd /usr/src/pico \
+    && ./autogen.sh \
+    && ./configure \
+    && make \
+    && make install
+
 chmod -R 750 /var/lib/asterisk/sounds
 chmod -R 750 /var/lib/asterisk/moh
+
+# remove packages
+RUN apt-get remove --purge -y git \
+    && apt autoremove -y \
+    && apt clean \
+    && rm -rf /var/lib/apt/lists/* /usr/src/asterisk /usr/include/asterisk /usr/lib/python3/dist-packages/psycopg2/ /lib/x86_64-linux-gnu/libkeyutils.so.1*
 
 # remove *-dev packages
 devpackages=`dpkg -l|grep '\-dev'|awk '{print $2}'|xargs`
