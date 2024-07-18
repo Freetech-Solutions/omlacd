@@ -14,10 +14,6 @@ if [ "$1" == "" ]; then
     fi
   fi    
 
-  echo "**[omlacd] Initializing regenerar_asterisk script"
-  su omnileads -c "python3 /opt/asterisk/scripts/regenerar_asterisk.py &"
-  sleep 4
-
   # Set TZ
   echo "**[omlacd] Setting localtime"
   rm -rf /etc/localtime
@@ -28,6 +24,11 @@ if [ "$1" == "" ]; then
   sed -i "s/amiuser/$AMI_USER/g" /etc/asterisk/oml_manager.conf
   sed -i "s/amipassword/$AMI_PASSWORD/g" /etc/asterisk/oml_manager.conf
   
+  # Set ARI user & password
+  echo "**[omlacd] Writting the ARI config"
+  sed -i "s/ariuser/$AMI_USER/g" /etc/asterisk/oml_ari.conf
+  sed -i "s/aripassword/$AMI_PASSWORD/g" /etc/asterisk/oml_ari.conf
+
   # tune some socket interface in order to BIND properly ip and ports
   case ${ENV} in
     devenv)
@@ -123,7 +124,6 @@ if [ "$1" == "" ]; then
 
 else
   echo "**[omlacd] Initializing regenerar_asterisk script"
-  su omnileads -c "python3 /opt/asterisk/scripts/regenerar_asterisk.py &"
 fi
 
 # Init asterisk server
