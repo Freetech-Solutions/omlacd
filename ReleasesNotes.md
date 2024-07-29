@@ -1,22 +1,13 @@
 # Release Notes
-2024-05-03
+2024-07-29
 
 ## Added
 
-* Post Call Survey with voice reconigzed agi script and dialplan module
-* Text to Speech Google cloud agi script and dialplan module
-* Text to Speech PicoTTS agi script and dialplan module
-* Speech to text with Google cloud agi script
-* Add HYBRID scenary (Rtpengine WAN & Asterisk LAN)
-
 ## Changed
 
-* Upgrade Asterisk 20.7.0
-* Upgrade Python 3.12
-* Upgrade pyst2 lib
-* Call recordings are now sent to a new processing component (conversion to mp3 and uploading to bucket)
+* Upgrade Asterisk 20.9.1.
+* The asterisk_reloader script, which generates the business logic configuration, now runs in a separate container.
 
 ## Fixed
-
 
 ## Removed
