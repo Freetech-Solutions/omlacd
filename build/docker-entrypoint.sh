@@ -96,7 +96,7 @@ if [ "$1" == "" ]; then
       sed -i "s/bindaddr=127.0.0.1/bindaddr=$ASTERISK_VIP/g" /etc/asterisk/oml_manager.conf
       sed -i "s/bind=0.0.0.0:5160/bind=$ASTERISK_HOSTNAME:5160/g" /etc/asterisk/oml_pjsip_transports.conf
       sed -i "s/bind=0.0.0.0:5060/bind=$ASTERISK_VIP:5060/g" /etc/asterisk/oml_pjsip_transports.conf
-      sed -i "s/bindaddr=127.0.0.1/bindaddr=$ASTERISK_HOSTNAME/g" /etc/asterisk/oml_http.conf
+      sed -i "s/bindaddr=127.0.0.1/bindaddr=$ASTERISK_VIP/g" /etc/asterisk/oml_http.conf
       ;;      
     *)
       echo "You must to pass ENV var: devenv, cloud, lan or nat"
@@ -128,4 +128,5 @@ fi
 
 # Init asterisk server
 echo "**[omlacd] Initializing asterisk"
+chown -R omnileads:omnileads /etc/asterisk/retrieve_conf /var/lib/asterisk/sounds/oml /var/spool/asterisk/monitor
 exec ${COMMAND}
