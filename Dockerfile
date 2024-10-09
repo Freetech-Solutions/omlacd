@@ -58,12 +58,13 @@ COPY --from=dev /usr/local/lib/python3.12/ /usr/local/lib/python3.12/
 COPY --from=dev /usr/lib/x86_64-linux-gnu/ /usr/lib/x86_64-linux-gnu/
 
 COPY source/astconf/* /etc/asterisk/
+COPY source/astconf/retrieve_conf/ /etc/asterisk/retrieve_conf/
 COPY source/scripts/* /opt/asterisk/scripts/
 COPY source/agi-bin/* /var/lib/asterisk/agi-bin/
 COPY build/docker-entrypoint.sh /docker-entrypoint.sh
 
 RUN chmod 750 -R /var/spool/asterisk
-RUN useradd -M -u 1000 omnileads
+RUN useradd -M omnileads
 RUN chown -R omnileads.omnileads /var/lib/asterisk /etc/asterisk /opt/asterisk /usr/lib/asterisk /docker-entrypoint.sh /var/spool/asterisk /var/log/asterisk
 
 EXPOSE 5060/udp
