@@ -1,4 +1,4 @@
-FROM python:3.12-slim-bullseye as dev
+FROM python:3.12-slim-bullseye AS dev
 
 ENV LANG en_US.utf8
 ENV NOTVISIBLE "in users profile"
@@ -23,7 +23,7 @@ RUN apt update \
     && rm -rf /usr/include/asterisk \
     && rm -rf /lib/x86_64-linux-gnu/libkeyutils.so.1*
 
-FROM python:3.12-slim-bullseye as run
+FROM python:3.12-slim-bullseye AS run
 
 RUN apt update -qq \
     && apt install -y libbinutils libedit2 libncursesw5 wget awscli \
