@@ -128,5 +128,5 @@ fi
 
 # Init asterisk server
 echo "**[omlacd] Initializing asterisk"
-chown -R omnileads:omnileads /etc/asterisk/retrieve_conf /var/lib/asterisk/sounds/oml /var/spool/asterisk/monitor
+chown -R omnileads:omnileads /etc/asterisk/retrieve_conf /var/lib/asterisk/sounds /var/spool/asterisk/monitor
 exec ${COMMAND}
