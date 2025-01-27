@@ -37,6 +37,21 @@ if [ "$1" == "" ]; then
       sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_manager.conf
       sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_http.conf
       ;;
+    docker)
+      echo "production env with docker-compose"     
+      sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_manager.conf
+      sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_http.conf
+      if [[ "${SIP_NAT_MODE}" == "public_ip" ]]; then
+        sed -i "s/;external_media_address=extern_ip_nat/external_media_address=$PUBLIC_IP_DOCKER_ENGINE/g" /etc/asterisk/oml_pjsip_transports.conf
+        sed -i "s/;external_signaling_address=extern_ip_nat/external_signaling_address=$PUBLIC_IP_DOCKER_ENGINE/g" /etc/asterisk/oml_pjsip_transports.conf    
+      elif  [[ "${SIP_NAT_MODE}" == "lan_ip" ]]; then
+        sed -i "s/;external_media_address=extern_ip_nat/external_media_address=$PRIVATE_IP_DOCKER_ENGINE/g" /etc/asterisk/oml_pjsip_transports.conf
+        sed -i "s/;external_signaling_address=extern_ip_nat/external_signaling_address=$PRIVATE_IP_DOCKER_ENGINE/g" /etc/asterisk/oml_pjsip_transports.conf    
+      else
+        echo "Error No NAT mode selected"
+        echo "Posible NAT audio problems"
+      fi  
+      ;;  
     cloud)
       echo "******* cloud scenary *******"
       sed -i "s/bindaddr=127.0.0.1/bindaddr=$ASTERISK_HOSTNAME/g" /etc/asterisk/oml_manager.conf
