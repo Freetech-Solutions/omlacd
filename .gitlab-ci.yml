@@ -28,7 +28,7 @@ container-image-dev:
         docker push docker.io/freetechsolutions/asterisk:$IMAGE_VERSION
       fi  
   rules:
-    - if: '$CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "master-2.0"'
-    - if: '$CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "develop-2.0"'
     - if: '$CI_COMMIT_REF_NAME =~ /build/'
     - if: '$CI_PIPELINE_SOURCE == "web"'
+    - if: '$CI_PIPELINE_BUILD == "true"'
+    - if: '$CI_PIPELINE_BUILD_ACD == "true"'
