@@ -1,4 +1,4 @@
-FROM omnileads/asterisk_base_img:250222.01 as run
+FROM omnileads/asterisk_base_img:250422.01 as run
 
 ENV LANG en_US.utf8
 ENV NOTVISIBLE "in users profile"
@@ -7,7 +7,7 @@ COPY build/requirements.txt /
 
 RUN echo "deb http://ftp.de.debian.org/debian bullseye main non-free" >> /etc/apt/sources.list
 RUN apt update && apt install -y --no-install-recommends \
-    sngrep curl \
+    sngrep curl libgsm1 \
     && pip install --no-cache-dir --upgrade pip && pip install --no-cache-dir -r /requirements.txt \
     && apt autoremove -y && apt clean -y && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
