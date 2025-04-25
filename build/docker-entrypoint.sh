@@ -99,11 +99,38 @@ if [ "$1" == "" ]; then
       sed -i "s/10.22.22.199:5060/$DIALER_ACD_HOSTNAME:5060/g" /etc/asterisk/oml_pjsip_transports.conf
       ;;
     all)
-      echo "******* open 0.0.0.0 scenary *******"
+      echo "******* open 0.0.0.0 + nat scenary *******"
       sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_manager.conf
       sed -i "s/bind=0.0.0.0:5160/bind=0.0.0.0:5160/g" /etc/asterisk/oml_pjsip_transports.conf
       sed -i "s/bind=0.0.0.0:5060/bind=0.0.0.0:5060/g" /etc/asterisk/oml_pjsip_transports.conf
       sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_http.conf  
+      sed -i "s/10.22.22.199:5060/$DIALER_ACD_HOSTNAME:5060/g" /etc/asterisk/oml_pjsip_transports.conf
+      ;;
+    all_ait)
+      echo "******* open 0.0.0.0 scenary *******"
+      sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_manager.conf
+      sed -i "s/bind=0.0.0.0:5160/bind=0.0.0.0:5160/g" /etc/asterisk/oml_pjsip_transports.conf
+      sed -i "s/bind=0.0.0.0:5060/bind=0.0.0.0:5060/g" /etc/asterisk/oml_pjsip_transports.conf
+      sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_http.conf
+      sed -i "s/10.22.22.199:5060/$DIALER_ACD_HOSTNAME:5060/g" /etc/asterisk/oml_pjsip_transports.conf
+      ;;
+    all_ait_nat)
+      echo "******* open 0.0.0.0 scenary *******"
+      sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_manager.conf
+      sed -i "s/bind=0.0.0.0:5160/bind=0.0.0.0:5160/g" /etc/asterisk/oml_pjsip_transports.conf
+      sed -i "s/bind=0.0.0.0:5060/bind=0.0.0.0:5060/g" /etc/asterisk/oml_pjsip_transports.conf
+      sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_http.conf
+      sed -i "s/;external_media_address=extern_ip_nat/external_media_address=$PUBLIC_IP/g" /etc/asterisk/oml_pjsip_transports.conf
+      sed -i "s/;external_signaling_address=extern_ip_nat/external_signaling_address=$PUBLIC_IP/g" /etc/asterisk/oml_pjsip_transports.conf
+      sed -i "s/10.22.22.199:5060/$DIALER_ACD_HOSTNAME:5060/g" /etc/asterisk/oml_pjsip_transports.conf
+      ;;
+    all_ait_nat_mediaonly)
+      echo "******* open 0.0.0.0 scenary *******"
+      sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_manager.conf
+      sed -i "s/bind=0.0.0.0:5160/bind=0.0.0.0:5160/g" /etc/asterisk/oml_pjsip_transports.conf
+      sed -i "s/bind=0.0.0.0:5060/bind=0.0.0.0:5060/g" /etc/asterisk/oml_pjsip_transports.conf
+      sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_http.conf
+      sed -i "s/;external_media_address=extern_ip_nat/external_media_address=$PUBLIC_IP/g" /etc/asterisk/oml_pjsip_transports.conf
       sed -i "s/10.22.22.199:5060/$DIALER_ACD_HOSTNAME:5060/g" /etc/asterisk/oml_pjsip_transports.conf
       ;;
     ha)
