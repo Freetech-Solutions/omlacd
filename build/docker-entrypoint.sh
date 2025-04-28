@@ -1,23 +1,50 @@
 #!/bin/bash
 
-set -ex
+set -euo pipefail
 COMMAND="/usr/sbin/asterisk -T -U omnileads -p -vvvvvvvf"
+
+# Validate required environment variables
+for var in ENV TZ AMI_USER AMI_PASSWORD; do
+  if [ -z "${!var:-}" ]; then
+    echo "ERROR: environment variable '$var' must be set" >&2
+    exit 1
+  fi
+done
 
 
 if [ "$1" == "" ]; then
 
-  if [[ "${ENV}" == "devenv" ]]; then
+RTP_PORT_MIN=${RTP_PORT_MIN:-40000}
+RTP_PORT_MAX=${RTP_PORT_MAX:-50000}
+
+# Scale tuning defaults
+STASIS_INITIAL_SIZE=${STASIS_INITIAL_SIZE:-10}
+STASIS_IDLE_TIMEOUT_SEC=${STASIS_IDLE_TIMEOUT_SEC:-120}
+STASIS_MAX_SIZE=${STASIS_MAX_SIZE:-60}
+TIMER_B=${TIMER_B:-6400}
+TIMER_T1=${TIMER_T1:-100}
+THREADPOOL_IDLE_TIMEOUT=${THREADPOOL_IDLE_TIMEOUT:-60}
+THREADPOOL_MAX_SIZE=${THREADPOOL_MAX_SIZE:-50}
+THREADPOOL_INITIAL_SIZE=${THREADPOOL_INITIAL_SIZE:-8}
+THREADPOOL_AUTO_INCREMENT=${THREADPOOL_AUTO_INCREMENT:-5}
+
+  if [[ "${ENV}" == "dev" ]]; then
     PUBLIC_IP=localhost
   else
     if [[ -z "${PUBLIC_IP}" ]]; then
-      PUBLIC_IP=$(curl http://ipinfo.io/ip)
+      if PUBLIC_IP=$(curl --retry 3 --connect-timeout 5 --max-time 10 -fsSL http://ipinfo.io/ip); then
+        :
+      else
+        echo "WARN: could not fetch public IP, defaulting to 127.0.0.1" >&2
+        PUBLIC_IP=127.0.0.1
+      fi
     fi
   fi    
 
   # Set TZ
   echo "**[omlacd] Setting localtime"
-  rm -rf /etc/localtime
-  ln -s "/usr/share/zoneinfo/${TZ}" /etc/localtime
+  ln -sf "/usr/share/zoneinfo/${TZ}" /etc/localtime
+  echo "${TZ}" > /etc/timezone
 
   # Set AMI user & password
   echo "**[omlacd] Writting the AMI config"
@@ -31,20 +58,24 @@ if [ "$1" == "" ]; then
 
   # tune some socket interface in order to BIND properly ip and ports
   case ${ENV} in
-    devenv)
+    dev)
       echo "devenv docker-compose"
       sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_manager.conf
       sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_http.conf
       ;;
-    docker)
+    prod)
       echo "production env with docker-compose"     
       sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_manager.conf
       sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_http.conf
-      if [[ -n "${SIP_NAT_IPADDR}" ]]; then
-        sed -i "s/;external_media_address=extern_ip_nat/external_media_address=$SIP_NAT_IPADDR/g" /etc/asterisk/oml_pjsip_transports.conf
-        sed -i "s/;external_signaling_address=extern_ip_nat/external_signaling_address=$SIP_NAT_IPADDR/g" /etc/asterisk/oml_pjsip_transports.conf          
-      fi  
-      ;;  
+      sed -i "s/bind=0.0.0.0:5160/bind=$ASTERISK_HOSTNAME:5160/g" /etc/asterisk/oml_pjsip_transports.conf
+      if [[ "${NAT}" == "true" ]]; then
+        sed -i "s/bind=0.0.0.0:5060/bind=$ASTERISK_HOSTNAME:5060/g" /etc/asterisk/oml_pjsip_transports.conf
+        sed -i "s/;external_media_address=extern_ip_nat/external_media_address=$PUBLIC_IP/g" /etc/asterisk/oml_pjsip_transports.conf
+        sed -i "s/;external_signaling_address=extern_ip_nat/external_signaling_address=$PUBLIC_IP/g" /etc/asterisk/oml_pjsip_transports.conf
+      elif [[ "${PUBLIC_IP}" != "$ASTERISK_HOSTNAME" && "${NAT}" != "true" ]]; then
+        sed -i "s/bind=0.0.0.0:5060/bind=$PUBLIC_IP:5060/g" /etc/asterisk/oml_pjsip_transports.conf
+      fi
+      ;;
     cloud)
       echo "******* cloud scenary *******"
       sed -i "s/bindaddr=127.0.0.1/bindaddr=$ASTERISK_HOSTNAME/g" /etc/asterisk/oml_manager.conf
@@ -64,7 +95,6 @@ if [ "$1" == "" ]; then
       if [[ "${ARQ}" == "cluster" ]]; then
         sed -i "s/bindaddr=127.0.0.1/bindaddr=$ASTERISK_HOSTNAME/g" /etc/asterisk/oml_http.conf
       fi
-      sed -i "s/10.22.22.199:5060/$DIALER_ACD_HOSTNAME:5060/g" /etc/asterisk/oml_pjsip_transports.conf
       ;;  
     lan)
       echo "******** lan scenary *******"
@@ -74,7 +104,6 @@ if [ "$1" == "" ]; then
       if [[ "${ARQ}" == "cluster" ]]; then
         sed -i "s/bindaddr=127.0.0.1/bindaddr=$ASTERISK_HOSTNAME/g" /etc/asterisk/oml_http.conf
       fi
-      sed -i "s/10.22.22.199:5060/$DIALER_ACD_HOSTNAME:5060/g" /etc/asterisk/oml_pjsip_wizard.conf
       ;;    
     nat)
       echo "********* nat scenary *******"
@@ -86,7 +115,6 @@ if [ "$1" == "" ]; then
       if [[ "${ARQ}" == "cluster" ]]; then
         sed -i "s/bindaddr=127.0.0.1/bindaddr=$ASTERISK_HOSTNAME/g" /etc/asterisk/oml_http.conf
       fi
-      sed -i "s/10.22.22.199:5060/$DIALER_ACD_HOSTNAME:5060/g" /etc/asterisk/oml_pjsip_transports.conf
       ;;
     hybrid)
       echo "********* hybrid scenary *******"
@@ -96,7 +124,6 @@ if [ "$1" == "" ]; then
       if [[ "${ARQ}" == "cluster" ]]; then
         sed -i "s/bindaddr=127.0.0.1/bindaddr=$ASTERISK_HOSTNAME/g" /etc/asterisk/oml_http.conf
       fi
-      sed -i "s/10.22.22.199:5060/$DIALER_ACD_HOSTNAME:5060/g" /etc/asterisk/oml_pjsip_transports.conf
       ;;
     all)
       echo "******* open 0.0.0.0 + nat scenary *******"
@@ -104,7 +131,6 @@ if [ "$1" == "" ]; then
       sed -i "s/bind=0.0.0.0:5160/bind=0.0.0.0:5160/g" /etc/asterisk/oml_pjsip_transports.conf
       sed -i "s/bind=0.0.0.0:5060/bind=0.0.0.0:5060/g" /etc/asterisk/oml_pjsip_transports.conf
       sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_http.conf  
-      sed -i "s/10.22.22.199:5060/$DIALER_ACD_HOSTNAME:5060/g" /etc/asterisk/oml_pjsip_transports.conf
       ;;
     all_ait)
       echo "******* open 0.0.0.0 scenary *******"
@@ -112,7 +138,6 @@ if [ "$1" == "" ]; then
       sed -i "s/bind=0.0.0.0:5160/bind=0.0.0.0:5160/g" /etc/asterisk/oml_pjsip_transports.conf
       sed -i "s/bind=0.0.0.0:5060/bind=0.0.0.0:5060/g" /etc/asterisk/oml_pjsip_transports.conf
       sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_http.conf
-      sed -i "s/10.22.22.199:5060/$DIALER_ACD_HOSTNAME:5060/g" /etc/asterisk/oml_pjsip_transports.conf
       ;;
     all_ait_nat)
       echo "******* open 0.0.0.0 scenary *******"
@@ -122,7 +147,6 @@ if [ "$1" == "" ]; then
       sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_http.conf
       sed -i "s/;external_media_address=extern_ip_nat/external_media_address=$PUBLIC_IP/g" /etc/asterisk/oml_pjsip_transports.conf
       sed -i "s/;external_signaling_address=extern_ip_nat/external_signaling_address=$PUBLIC_IP/g" /etc/asterisk/oml_pjsip_transports.conf
-      sed -i "s/10.22.22.199:5060/$DIALER_ACD_HOSTNAME:5060/g" /etc/asterisk/oml_pjsip_transports.conf
       ;;
     all_ait_nat_mediaonly)
       echo "******* open 0.0.0.0 scenary *******"
@@ -131,7 +155,6 @@ if [ "$1" == "" ]; then
       sed -i "s/bind=0.0.0.0:5060/bind=0.0.0.0:5060/g" /etc/asterisk/oml_pjsip_transports.conf
       sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_http.conf
       sed -i "s/;external_media_address=extern_ip_nat/external_media_address=$PUBLIC_IP/g" /etc/asterisk/oml_pjsip_transports.conf
-      sed -i "s/10.22.22.199:5060/$DIALER_ACD_HOSTNAME:5060/g" /etc/asterisk/oml_pjsip_transports.conf
       ;;
     ha)
       echo "******** HA scenary *******"
@@ -139,7 +162,6 @@ if [ "$1" == "" ]; then
       sed -i "s/bind=0.0.0.0:5160/bind=$ASTERISK_HOSTNAME:5160/g" /etc/asterisk/oml_pjsip_transports.conf
       sed -i "s/bind=0.0.0.0:5060/bind=$ASTERISK_VIP:5060/g" /etc/asterisk/oml_pjsip_transports.conf
       sed -i "s/bindaddr=127.0.0.1/bindaddr=$ASTERISK_VIP/g" /etc/asterisk/oml_http.conf
-      sed -i "s/10.22.22.199:5060/$DIALER_ACD_HOSTNAME:5060/g" /etc/asterisk/oml_pjsip_transports.conf
       ;;      
     *)
       echo "You must to pass ENV var: devenv, cloud, lan or nat"
@@ -156,19 +178,29 @@ if [ "$1" == "" ]; then
   fi
 
   # Set Scale parameters
-  if [[ $SCALE == "True" ]]; then
-    sed -i "s/;initial_size=5/initial_size=5/g" /etc/asterisk/stasis.conf
-    sed -i "s/;idle_timeout_sec=20/idle_timeout_sec=${THREADPOOL_IDLE_TIMEOUT}/g" /etc/asterisk/stasis.conf
-    sed -i "s/;max_size=50/max_size=${THREADPOOL_MAX_SIZE}/g" /etc/asterisk/stasis.conf
-    sed -i "s/timer_b=64000/timer_b=32000/g" /etc/asterisk/oml_pjsip.conf
+  if [[ "${SCALE:-}" == "True" ]]; then
+    sed -i "s/;initial_size=5/initial_size=${STASIS_INITIAL_SIZE}/g" /etc/asterisk/stasis.conf
+    sed -i "s/;idle_timeout_sec=20/idle_timeout_sec=${STASIS_IDLE_TIMEOUT_SEC}/g" /etc/asterisk/stasis.conf
+    sed -i "s/;max_size=50/max_size=${STASIS_MAX_SIZE}/g" /etc/asterisk/stasis.conf
+    sed -i "s/timer_b=64000/timer_b=${TIMER_B}/g" /etc/asterisk/oml_pjsip.conf
+    sed -i "s/timer_t1=1000/timer_t1=${TIMER_T1}/g" /etc/asterisk/oml_pjsip.conf
     sed -i "s/threadpool_idle_timeout=60/threadpool_idle_timeout=${THREADPOOL_IDLE_TIMEOUT}/g" /etc/asterisk/oml_pjsip.conf
     sed -i "s/threadpool_max_size=50/threadpool_max_size=${THREADPOOL_MAX_SIZE}/g" /etc/asterisk/oml_pjsip.conf
+    sed -i "s/threadpool_initial_size=0/threadpool_initial_size=${THREADPOOL_INITIAL_SIZE}/g" /etc/asterisk/oml_pjsip.conf
+    sed -i "s/threadpool_auto_increment=5/threadpool_auto_increment=${THREADPOOL_AUTO_INCREMENT}/g" /etc/asterisk/oml_pjsip.conf
   fi
 
-# Replace docker dialer_acd:5060 host, if DIALER_HOSTNAME is set
+# Dialer Settings
 if [[ -n "${DIALER_HOST}" ]]; then
     sed -i "s/dialer-asterisk/${DIALER_HOST}/g" /etc/asterisk/oml_pjsip_wizard.conf
 fi
+if [[ "${DIALER_HOST}" != "127.0.0.1" ]]; then
+  sed -i "s/127.0.0.1:5260/${ASTERISK_HOSTNAME}:5260/g" /etc/asterisk/oml_pjsip_transports.conf
+fi
+
+# Set RTP ports range
+sed -i -e "s/40000/${RTP_PORT_MIN}/g" /etc/asterisk/rtp.conf
+sed -i -e "s/50000/${RTP_PORT_MAX}/g" /etc/asterisk/rtp.conf
 
 else
   echo "**[omlacd] Initializing regenerar_asterisk script"

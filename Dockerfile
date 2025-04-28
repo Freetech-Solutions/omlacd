@@ -1,7 +1,7 @@
-FROM omnileads/asterisk_base_img:250422.01 as run
+FROM omnileads/asterisk_base_img:250523.01 AS run
 
-ENV LANG en_US.utf8
-ENV NOTVISIBLE "in users profile"
+ENV LANG=en_US.utf8
+ENV NOTVISIBLE="in users profile"
 
 COPY build/requirements.txt /
 

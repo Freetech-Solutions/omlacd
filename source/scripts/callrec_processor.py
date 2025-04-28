@@ -21,50 +21,69 @@
 
 import os
 import sys
-import pika
 import json
 import logging
-from datetime import date
+from gearman import GearmanClient
 
-# Configura el logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# ───── Configuración general ─────
+TASK_CALLREC_COMPRESSOR = b'tel-callrec-compressor'
+TASK_CALLREC_TRANSCRIBER = b'tel-callrec-transcriber'
+logger = logging.getLogger("callrec_client")
 
-# Configuración de RabbitMQ
-rabbitmq_host = os.getenv("RABBITMQ_HOST")
-rabbitmq_queue = 'callrec_processor'
-callrec_split = os.getenv("CALLREC_SPLIT_CHANNELS")
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(name)s - [%(filename)s:%(lineno)d] - %(message)s'
+)
 
-def connect_to_rabbitmq():
-    connection = pika.BlockingConnection(pika.ConnectionParameters(host=rabbitmq_host))
-    channel = connection.channel()
-    channel.queue_declare(queue=rabbitmq_queue, durable=True)
-    return connection, channel
+# Leer variable para decidir si se hace split y transcripción
+callrec_split = os.getenv("CALLREC_SPLIT_CHANNELS", "False")
 
-def send_to_rabbitmq(message):
-    connection, channel = connect_to_rabbitmq()
-    channel.basic_publish(
-        exchange='',
-        routing_key=rabbitmq_queue,
-        body=json.dumps(message),
-        properties=pika.BasicProperties(
-            delivery_mode=2,  # make message persistent
-        ))
-    logging.info("Mensaje enviado a RabbitMQ.")
-    connection.close()
+gearman_host = os.getenv('GEARMAN_HOST',  'localhost')
+gearman_port = os.getenv('GEARMAN_PORT',  '4730')
+gearman_server = f"{gearman_host}:{gearman_port}"
 
-def write_message_rabbitmq(source_file, date_dialplan, callrec_split):
-    message = {
-        'fileName': source_file,
-        'dateFileName': date_dialplan,
-        'splitChannels': callrec_split
-    }
-    send_to_rabbitmq(message)
 
+# ───── Función para enviar tarea a una cola Gearman ─────
+def send_task(task_name: bytes, job_data: dict):
+    try:
+        gm_client = GearmanClient([gearman_server])
+        logger.info(f"Enviando tarea '{task_name.decode()}' a {gearman_server}: {job_data}")
+        job_request = gm_client.submit_job(
+            task_name,
+            json.dumps(job_data).encode('utf-8'),
+            wait_until_complete=True
+        )
+
+        if job_request.complete:
+            result = job_request.result.decode('utf-8')
+            logger.info(f"Job '{task_name.decode()}' completado: '{result}'")
+        else:
+            logger.error(f"Job '{task_name.decode()}' falló. Estado: {job_request.state}"
+                         f"{' (timeout)' if job_request.timed_out else ''}")
+    except Exception as e:
+        logger.exception(f"Error al enviar tarea '{task_name.decode()}': {e}")
+
+
+# ───── Main CLI entrypoint ─────
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        logging.info("Usage: python script.py source_file date_dialplan")
+        logger.error("Uso: python client.py <source_file> <date_dialplan>")
         sys.exit(1)
+
     source_file = sys.argv[1]
+    # Strip .wav extension for sending to Gearman tasks
+    if source_file.lower().endswith('.wav'):
+        source_file = source_file[:-4]
     date_dialplan = sys.argv[2]
-    
-    write_message_rabbitmq(source_file, date_dialplan, callrec_split)
+
+    job_data = {
+        'fileName':        source_file,
+        'dateFileName':    date_dialplan,
+    }
+
+    # 1) Envío a tel_callrec siempre
+    send_task(TASK_CALLREC_COMPRESSOR, job_data)
+
+    # 2) Si splitChannels=True, también enviamos a tel_callrec_transcriber
+    if callrec_split:
+        send_task(TASK_CALLREC_TRANSCRIBER, job_data)

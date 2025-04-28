@@ -18,12 +18,12 @@ container-image-dev:
     - |-
       if [ "${CI_COMMIT_BRANCH}" == "master-2.0" ]; then
         echo "${DOCKER_SECRET}" | docker login --username "${DOCKER_USERNAME}" --password-stdin
-        IMAGE_VERSION=$(cat version.txt)
+        IMAGE_VERSION="$(date +%Y%m%d)-${CI_COMMIT_SHORT_SHA}"
         docker tag run omnileads/asterisk:$IMAGE_VERSION
         docker push docker.io/omnileads/asterisk:$IMAGE_VERSION
       else
         echo "${DOCKER_PASSWORD}" | docker login --username "${DOCKER_USER}" --password-stdin
-        IMAGE_VERSION=$(cat version.txt)
+        IMAGE_VERSION="$(date +%Y%m%d)-${CI_COMMIT_SHORT_SHA}"
         docker tag run freetechsolutions/asterisk:$IMAGE_VERSION
         docker push docker.io/freetechsolutions/asterisk:$IMAGE_VERSION
       fi  
