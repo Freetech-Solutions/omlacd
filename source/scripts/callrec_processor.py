@@ -36,7 +36,10 @@ logging.basicConfig(
 )
 
 # Leer variable para decidir si se hace split y transcripción
-callrec_split = os.getenv("CALLREC_SPLIT_CHANNELS", "False")
+callrec_split_osenv = os.getenv("CALLREC_SPLIT_CHANNELS", "false").lower()
+if callrec_split_osenv not in ("true", "false"):
+    raise ValueError("CALLREC_SPLIT_CHANNELS debe ser 'true' o 'false'")
+callrec_split = callrec_split_osenv == "true"
 
 gearman_host = os.getenv('GEARMAN_HOST',  'localhost')
 gearman_port = os.getenv('GEARMAN_PORT',  '4730')
