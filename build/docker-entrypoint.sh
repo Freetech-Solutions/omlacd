@@ -1,7 +1,7 @@
 #!/bin/bash
 
 set -euo pipefail
-COMMAND="/usr/sbin/asterisk -T -U omnileads -p -vvvvvvvf"
+COMMAND="/usr/sbin/asterisk -T -U omnileads -p -f"
 
 # Validate required environment variables
 for var in ENV TZ AMI_USER AMI_PASSWORD; do
