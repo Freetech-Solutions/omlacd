@@ -1,3 +1,3 @@
 pyst2==0.5.1
-pika==1.3.2
 pytz==2024.1
+gearman3
