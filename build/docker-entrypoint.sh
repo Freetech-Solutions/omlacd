@@ -27,6 +27,7 @@ THREADPOOL_IDLE_TIMEOUT=${THREADPOOL_IDLE_TIMEOUT:-60}
 THREADPOOL_MAX_SIZE=${THREADPOOL_MAX_SIZE:-50}
 THREADPOOL_INITIAL_SIZE=${THREADPOOL_INITIAL_SIZE:-8}
 THREADPOOL_AUTO_INCREMENT=${THREADPOOL_AUTO_INCREMENT:-5}
+VOIP_NAT_IP=${VOIP_NAT_IP:-""}
 
   if [[ "${ENV}" == "dev" ]]; then
     PUBLIC_IP=localhost
@@ -63,12 +64,24 @@ THREADPOOL_AUTO_INCREMENT=${THREADPOOL_AUTO_INCREMENT:-5}
       sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_manager.conf
       sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_http.conf
       ;;
+    custom)
+      echo "production custom VoIP environment"
+      sed -i "s/bindaddr=127.0.0.1/bindaddr=${API_LISTEN_IP}/g" /etc/asterisk/oml_manager.conf
+      sed -i "s/bindaddr=127.0.0.1/bindaddr=${API_LISTEN_IP}/g" /etc/asterisk/oml_http.conf
+      sed -i "s/bind=0.0.0.0:5160/bind=${PJSIP_IP_AGENT}:5160/g" /etc/asterisk/oml_pjsip_transports.conf
+      sed -i "s/bind=0.0.0.0:5060/bind=${PJSIP_IP_TRUNK}:5060/g" /etc/asterisk/oml_pjsip_transports.conf
+      sed -i "s/bind=127.0.0.1:5260/bind=${PJSIP_IP_DIALER}:5260/g" /etc/asterisk/oml_pjsip_transports.conf
+      if [[ -n "${VOIP_NAT_IP}" ]]; then
+        sed -i "s/;external_media_address=extern_ip_nat/external_media_address=${VOIP_NAT_IP}/g" /etc/asterisk/oml_pjsip_transports.conf
+        sed -i "s/;external_signaling_address=extern_ip_nat/external_signaling_address=${VOIP_NAT_IP}/g" /etc/asterisk/oml_pjsip_transports.conf
+      fi  
+      ;;      
     prod)
       echo "production env with docker-compose"     
       sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_manager.conf
       sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_http.conf
       sed -i "s/bind=0.0.0.0:5160/bind=$ASTERISK_HOSTNAME:5160/g" /etc/asterisk/oml_pjsip_transports.conf
-      if [[ "${NAT}" == "true" ]]; then
+      if [[ -n "${VOIP_NAT_IP}" ]]; then
         sed -i "s/bind=0.0.0.0:5060/bind=$ASTERISK_HOSTNAME:5060/g" /etc/asterisk/oml_pjsip_transports.conf
         sed -i "s/;external_media_address=extern_ip_nat/external_media_address=$PUBLIC_IP/g" /etc/asterisk/oml_pjsip_transports.conf
         sed -i "s/;external_signaling_address=extern_ip_nat/external_signaling_address=$PUBLIC_IP/g" /etc/asterisk/oml_pjsip_transports.conf
