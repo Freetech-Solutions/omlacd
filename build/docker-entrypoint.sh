@@ -14,6 +14,8 @@ done
 
 if [ "$1" == "" ]; then
 
+LOG_LEVEL=${LOG_LEVEL:-0}
+
 RTP_PORT_MIN=${RTP_PORT_MIN:-40000}
 RTP_PORT_MAX=${RTP_PORT_MAX:-50000}
 
@@ -215,6 +217,7 @@ fi
 sed -i -e "s/40000/${RTP_PORT_MIN}/g" /etc/asterisk/rtp.conf
 sed -i -e "s/50000/${RTP_PORT_MAX}/g" /etc/asterisk/rtp.conf
 
+
 else
   echo "**[omlacd] Initializing regenerar_asterisk script"
 fi
@@ -222,4 +225,12 @@ fi
 # Init asterisk server
 echo "**[omlacd] Initializing asterisk"
 chown -R omnileads:omnileads /etc/asterisk/retrieve_conf /var/lib/asterisk/sounds /var/spool/asterisk/monitor
-exec ${COMMAND}
+
+# Set log-level
+if [[ "${LOG_LEVEL}" == "3" ]]; then
+  sed -i -e "s/security/security,dtmf/g" /etc/asterisk/logger.conf
+  exec ${COMMAND} -vvv
+else
+  exec ${COMMAND}
+fi
+
