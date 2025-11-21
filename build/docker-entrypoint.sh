@@ -2,11 +2,25 @@
 
 set -euo pipefail
 
-COMMAND="/usr/sbin/asterisk -T -U omnileads -p -f"
+#####################################
+# Configuración base
+#####################################
 
-##############################
+DEFAULT_ASTERISK_CMD=(/usr/sbin/asterisk -T -U omnileads -p -f)
+
+# Helper: evaluación booleana (true/1/yes, case-insensitive)
+is_true() {
+  local val="${1:-}"
+  val="${val,,}"          # minúsculas
+  case "$val" in
+    true|1|yes|y) return 0 ;;
+    *)            return 1 ;;
+  esac
+}
+
+#####################################
 # Validación de variables base
-##############################
+#####################################
 
 for var in ENV TZ AMI_USER AMI_PASSWORD; do
   if [ -z "${!var:-}" ]; then
@@ -15,9 +29,9 @@ for var in ENV TZ AMI_USER AMI_PASSWORD; do
   fi
 done
 
-##############################
+#####################################
 # Defaults globales seguros
-##############################
+#####################################
 
 LOG_LEVEL=${LOG_LEVEL:-0}
 
@@ -42,7 +56,7 @@ HOMER_HOST=${HOMER_HOST:-"homer_host"}
 HOMER_PORT=${HOMER_PORT:-"9060"}
 TENANT_ID=${TENANT_ID:-"tenant"}
 
-NAT=${VOIP_NAT:-""}
+VOIP_NAT_FLAG=${VOIP_NAT:-""}
 ARQ=${ARQ:-""}
 DIALER_HOST=${DIALER_HOST:-""}
 
@@ -50,41 +64,44 @@ ASTERISK_HOSTNAME=${ASTERISK_HOSTNAME:-"localhost"}
 ASTERISK_VIP=${ASTERISK_VIP:-"$ASTERISK_HOSTNAME"}
 
 #####################################
-# Rama principal (sin argumentos $1)
+# Funciones de configuración
 #####################################
 
-# Si no se pasa ningún argumento: modo normal (configurar + arrancar Asterisk)
-if [ "${1:-}" = "" ]; then
-
-  ##############################
-  # Set PUBLIC_IP
-  ##############################
-
+set_public_ip() {
+  # Dev: típicamente no queremos depender de un servicio externo
   if [[ "${ENV}" == "dev" ]]; then
-    PUBLIC_IP="localhost"
-  else
-    if [[ -z "${PUBLIC_IP}" ]]; then
-      if PUBLIC_IP=$(curl --retry 3 --connect-timeout 5 --max-time 10 -fsSL http://ipinfo.io/ip); then
-        :
-      else
-        echo "WARN: could not fetch public IP, defaulting to 127.0.0.1" >&2
-        PUBLIC_IP="127.0.0.1"
-      fi
-    fi
+    PUBLIC_IP="127.0.0.1"
+    return
   fi
 
-  ##############################
-  # Zona horaria
-  ##############################
+  # Para otros entornos, si ya viene seteada la respetamos
+  if [[ -n "${PUBLIC_IP}" ]]; then
+    return
+  fi
 
+  if PUBLIC_IP="$(curl --retry 3 --connect-timeout 5 --max-time 10 -fsSL http://ipinfo.io/ip)"; then
+    :
+  else
+    echo "WARN: could not fetch public IP, defaulting to 127.0.0.1" >&2
+    PUBLIC_IP="127.0.0.1"
+  fi
+}
+
+configure_timezone() {
   echo "**[omlacd] Setting localtime"
-  ln -sf "/usr/share/zoneinfo/${TZ}" /etc/localtime
+
+  local tz_file="/usr/share/zoneinfo/${TZ}"
+
+  if [[ ! -f "${tz_file}" ]]; then
+    echo "ERROR: Timezone file '${tz_file}' does not exist. Check TZ env var." >&2
+    exit 1
+  fi
+
+  ln -sf "${tz_file}" /etc/localtime
   echo "${TZ}" > /etc/timezone
+}
 
-  ##############################
-  # AMI / ARI
-  ##############################
-
+configure_ami_ari() {
   echo "**[omlacd] Writing the AMI config"
   sed -i "s/amiuser/${AMI_USER}/g" /etc/asterisk/oml_manager.conf
   sed -i "s/amipassword/${AMI_PASSWORD}/g" /etc/asterisk/oml_manager.conf
@@ -92,12 +109,10 @@ if [ "${1:-}" = "" ]; then
   echo "**[omlacd] Writing the ARI config"
   sed -i "s/ariuser/${AMI_USER}/g" /etc/asterisk/oml_ari.conf
   sed -i "s/aripassword/${AMI_PASSWORD}/g" /etc/asterisk/oml_ari.conf
+}
 
-  ##############################
-  # Ajuste de bind addresses
-  ##############################
-
-  case ${ENV} in
+configure_env_bindings() {
+  case "${ENV}" in
     dev)
       echo "devenv docker-compose"
       sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_manager.conf
@@ -123,12 +138,19 @@ if [ "${1:-}" = "" ]; then
       sed -i "s/bindaddr=127.0.0.1/bindaddr=${ASTERISK_HOSTNAME}/g" /etc/asterisk/oml_http.conf
       sed -i "s/bind=0.0.0.0:5160/bind=${ASTERISK_HOSTNAME}:5160/g" /etc/asterisk/oml_pjsip_transports.conf
 
-      if [[ -n "${PUBLIC_IP}" ]]; then
+      # Lógica corregida para NAT vs no NAT
+      if is_true "${VOIP_NAT_FLAG}"; then
+        # NAT: bind en hostname, external_* apuntando a PUBLIC_IP
         sed -i "s/bind=0.0.0.0:5060/bind=${ASTERISK_HOSTNAME}:5060/g" /etc/asterisk/oml_pjsip_transports.conf
         sed -i "s/;external_media_address=extern_ip_nat/external_media_address=${PUBLIC_IP}/g" /etc/asterisk/oml_pjsip_transports.conf
         sed -i "s/;external_signaling_address=extern_ip_nat/external_signaling_address=${PUBLIC_IP}/g" /etc/asterisk/oml_pjsip_transports.conf
-      elif [[ "${PUBLIC_IP}" != "${ASTERISK_HOSTNAME}" && "${NAT}" != "true" ]]; then
-        sed -i "s/bind=0.0.0.0:5060/bind=${PUBLIC_IP}:5060/g" /etc/asterisk/oml_pjsip_transports.conf
+      else
+        # Sin NAT: bind directo a PUBLIC_IP si es distinta del hostname
+        if [[ "${PUBLIC_IP}" != "${ASTERISK_HOSTNAME}" ]]; then
+          sed -i "s/bind=0.0.0.0:5060/bind=${PUBLIC_IP}:5060/g" /etc/asterisk/oml_pjsip_transports.conf
+        else
+          sed -i "s/bind=0.0.0.0:5060/bind=${ASTERISK_HOSTNAME}:5060/g" /etc/asterisk/oml_pjsip_transports.conf
+        fi
       fi
       ;;
 
@@ -233,77 +255,124 @@ if [ "${1:-}" = "" ]; then
       exit 1
       ;;
   esac
+}
 
-  # Reemplazo genérico extern_ip_nat -> PUBLIC_IP
-  sed -i "s/extern_ip_nat/${PUBLIC_IP}/g" /etc/asterisk/oml_pjsip_transports.conf
-
-  ##############################
-  # HOMER heplify
-  ##############################
-
-  if [[ "${HOMER_ENABLE}" == "True" ]]; then
-    sed -i "s/no/yes/g" /etc/asterisk/hep.conf
-    sed -i "s/homer_host:homer_port/${HOMER_HOST}:${HOMER_PORT}/g" /etc/asterisk/hep.conf
-    sed -i "s/tenant/${TENANT_ID}/g" /etc/asterisk/hep.conf
+configure_homer() {
+  if ! is_true "${HOMER_ENABLE}"; then
+    return
   fi
 
-  ##############################
-  # Scale parameters
-  ##############################
+  echo "**[omlacd] Enabling HOMER HEP capture"
 
-  if [[ "${SCALE:-}" == "True" ]]; then
-    sed -i "s/;initial_size=5/initial_size=${STASIS_INITIAL_SIZE}/g" /etc/asterisk/stasis.conf
-    sed -i "s/;idle_timeout_sec=20/idle_timeout_sec=${STASIS_IDLE_TIMEOUT_SEC}/g" /etc/asterisk/stasis.conf
-    sed -i "s/;max_size=50/max_size=${STASIS_MAX_SIZE}/g" /etc/asterisk/stasis.conf
-    sed -i "s/timer_b=64000/timer_b=${TIMER_B}/g" /etc/asterisk/oml_pjsip.conf
-    sed -i "s/timer_t1=1000/timer_t1=${TIMER_T1}/g" /etc/asterisk/oml_pjsip.conf
-    sed -i "s/threadpool_idle_timeout=60/threadpool_idle_timeout=${THREADPOOL_IDLE_TIMEOUT}/g" /etc/asterisk/oml_pjsip.conf
-    sed -i "s/threadpool_max_size=50/threadpool_max_size=${THREADPOOL_MAX_SIZE}/g" /etc/asterisk/oml_pjsip.conf
-    sed -i "s/threadpool_initial_size=0/threadpool_initial_size=${THREADPOOL_INITIAL_SIZE}/g" /etc/asterisk/oml_pjsip.conf
-    sed -i "s/threadpool_auto_increment=5/threadpool_auto_increment=${THREADPOOL_AUTO_INCREMENT}/g" /etc/asterisk/oml_pjsip.conf
+  sed -i -E 's/^(enabled\s*=\s*)no/\1yes/' /etc/asterisk/hep.conf
+  sed -i -E "s#^(capture_address\s*=\s*).*#\1${HOMER_HOST}:${HOMER_PORT}#" /etc/asterisk/hep.conf
+  sed -i -E "s#^(capture_name\s*=\s*).*#\1${TENANT_ID}#" /etc/asterisk/hep.conf
+}
+
+
+configure_scale() {
+  if ! is_true "${SCALE:-}"; then
+    return
   fi
 
-  ##############################
-  # Dialer Settings
-  ##############################
+  echo "**[omlacd] Applying scale parameters"
 
+  sed -i "s/;initial_size=5/initial_size=${STASIS_INITIAL_SIZE}/g" /etc/asterisk/stasis.conf
+  sed -i "s/;idle_timeout_sec=20/idle_timeout_sec=${STASIS_IDLE_TIMEOUT_SEC}/g" /etc/asterisk/stasis.conf
+  sed -i "s/;max_size=50/max_size=${STASIS_MAX_SIZE}/g" /etc/asterisk/stasis.conf
+
+  sed -i "s/timer_b=64000/timer_b=${TIMER_B}/g" /etc/asterisk/oml_pjsip.conf
+  sed -i "s/timer_t1=1000/timer_t1=${TIMER_T1}/g" /etc/asterisk/oml_pjsip.conf
+  sed -i "s/threadpool_idle_timeout=60/threadpool_idle_timeout=${THREADPOOL_IDLE_TIMEOUT}/g" /etc/asterisk/oml_pjsip.conf
+  sed -i "s/threadpool_max_size=50/threadpool_max_size=${THREADPOOL_MAX_SIZE}/g" /etc/asterisk/oml_pjsip.conf
+  sed -i "s/threadpool_initial_size=0/threadpool_initial_size=${THREADPOOL_INITIAL_SIZE}/g" /etc/asterisk/oml_pjsip.conf
+  sed -i "s/threadpool_auto_increment=5/threadpool_auto_increment=${THREADPOOL_AUTO_INCREMENT}/g" /etc/asterisk/oml_pjsip.conf
+}
+
+configure_dialer() {
   if [[ -n "${DIALER_HOST}" ]]; then
     sed -i "s/dialer-asterisk/${DIALER_HOST}/g" /etc/asterisk/oml_pjsip_wizard.conf
   fi
-  if [[ "${DIALER_HOST:-}" != "127.0.0.1" && -n "${DIALER_HOST}" ]]; then
+
+  if [[ -n "${DIALER_HOST}" && "${DIALER_HOST}" != "127.0.0.1" ]]; then
     sed -i "s/127.0.0.1:5260/${ASTERISK_HOSTNAME}:5260/g" /etc/asterisk/oml_pjsip_transports.conf
   fi
+}
 
-  ##############################
-  # RTP ports range
-  ##############################
+configure_rtp_ports() {
+  echo "**[omlacd] Configuring RTP ports range ${RTP_PORT_MIN}-${RTP_PORT_MAX}"
 
-  # Asumiendo formato típico:
-  # rtpstart=40000
-  # rtpend=50000
   sed -i -E "s/^(rtpstart=).*/\1${RTP_PORT_MIN}/" /etc/asterisk/rtp.conf
   sed -i -E "s/^(rtpend=).*/\1${RTP_PORT_MAX}/" /etc/asterisk/rtp.conf
+}
 
-else
-  #####################################
-  # Rama con argumentos ($1 no vacío)
-  #####################################
-  echo "**[omlacd] Nothing to do with args: $*"
-  # Se mantiene el comportamiento original: no se usan los argumentos
-  # adicionalmente y se continúa arrancando Asterisk más abajo.
-fi
+fix_permissions() {
+  echo "**[omlacd] Fixing permissions"
+  local paths=(
+    /etc/asterisk/retrieve_conf
+    /var/lib/asterisk/sounds
+    /var/spool/asterisk/monitor
+  )
 
-##############################
-# Inicio de Asterisk
-##############################
+  for p in "${paths[@]}"; do
+    if [[ -e "${p}" ]]; then
+      chown -R omnileads:omnileads "${p}"
+    fi
+  done
+}
 
-echo "**[omlacd] Initializing asterisk"
-chown -R omnileads:omnileads /etc/asterisk/retrieve_conf /var/lib/asterisk/sounds /var/spool/asterisk/monitor
+start_asterisk() {
+  echo "**[omlacd] Initializing asterisk"
 
-# Set log-level
-if [[ "${LOG_LEVEL}" == "3" ]]; then
-  sed -i -e "s/security/security,dtmf/g" /etc/asterisk/logger.conf
-  exec ${COMMAND} -vvv
-else
-  exec ${COMMAND}
-fi
+  fix_permissions
+
+  # Set log-level
+  if [[ "${LOG_LEVEL}" == "3" ]]; then
+    sed -i -e "s/security/security,dtmf/g" /etc/asterisk/logger.conf
+    exec "${DEFAULT_ASTERISK_CMD[@]}" -vvv "$@"
+  else
+    exec "${DEFAULT_ASTERISK_CMD[@]}" "$@"
+  fi
+}
+
+#####################################
+# Lógica principal / manejo de args
+#####################################
+
+main() {
+  # Determinar si estamos arrancando Asterisk o un comando arbitrario
+  local first_arg="${1:-}"
+
+  local run_asterisk="false"
+
+  if [[ -z "${first_arg}" ]]; then
+    # Sin argumentos -> comportamiento clásico: configurar + asterisk
+    run_asterisk="true"
+  elif [[ "${first_arg}" == "asterisk" ]]; then
+    # docker run imagen asterisk ...
+    run_asterisk="true"
+    shift
+  elif [[ "${first_arg}" == -* ]]; then
+    # docker run imagen -vvv (flags para asterisk)
+    run_asterisk="true"
+  fi
+
+  if [[ "${run_asterisk}" == "true" ]]; then
+    # Configuración completa antes de levantar Asterisk
+    set_public_ip
+    configure_timezone
+    configure_ami_ari
+    configure_env_bindings
+    configure_homer
+    configure_scale
+    configure_dialer
+    configure_rtp_ports
+
+    start_asterisk "$@"
+  else
+    echo "**[omlacd] Running custom command: $*"
+    exec "$@"
+  fi
+}
+
+main "$@"
