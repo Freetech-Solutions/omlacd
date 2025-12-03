@@ -1,4 +1,4 @@
-FROM omnileads/asterisk_base_img:250523.01 AS run
+FROM omnileads/asterisk_base_img:20251113-11cd8b11 AS run
 
 ENV LANG=en_US.utf8
 ENV NOTVISIBLE="in users profile"
