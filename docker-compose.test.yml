@@ -1,0 +1,67 @@
+version: '3.8'
+
+services:
+  acd-tests:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: acd-test:latest
+    container_name: acd-tests
+    volumes:
+      - ./source/tests_unit:/opt/asterisk/source/tests_unit:ro
+      - ./source/ari-app:/opt/asterisk/ari-app:ro
+      - ./.flake8:/opt/asterisk/.flake8:ro
+      - ./pytest.ini:/opt/asterisk/pytest.ini:ro
+    environment:
+      - PYTHONPATH=/opt/asterisk/ari-app
+    command: >
+      bash -c "
+        pip install -q -r /requirements.txt &&
+        echo '=== Ejecutando Linter ===' &&
+        flake8 ari-app/ --config=.flake8 --statistics --count &&
+        echo '' &&
+        echo '=== Ejecutando Tests ===' &&
+        pytest source/tests_unit/ -v --cov=ari-app --cov-report=term-missing
+      "
+    profiles:
+      - test
+
+  acd-linter:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: acd-test:latest
+    container_name: acd-linter
+    volumes:
+      - ./source/ari-app:/opt/asterisk/ari-app:ro
+      - ./.flake8:/opt/asterisk/.flake8:ro
+    environment:
+      - PYTHONPATH=/opt/asterisk/ari-app
+    command: >
+      bash -c "
+        pip install -q -r /requirements.txt &&
+        flake8 ari-app/ --config=.flake8 --statistics --count
+      "
+    profiles:
+      - lint
+
+  acd-pytest:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: acd-test:latest
+    container_name: acd-pytest
+    volumes:
+      - ./source/tests_unit:/opt/asterisk/source/tests_unit:ro
+      - ./source/ari-app:/opt/asterisk/ari-app:ro
+      - ./pytest.ini:/opt/asterisk/pytest.ini:ro
+    environment:
+      - PYTHONPATH=/opt/asterisk/ari-app
+    command: >
+      bash -c "
+        pip install -q -r /requirements.txt &&
+        pytest source/tests_unit/ -v --cov=ari-app --cov-report=term-missing --cov-report=html
+      "
+    profiles:
+      - pytest
+

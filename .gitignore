@@ -1,4 +1,8 @@
-source/agis/__pycache__/
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
 source/astconf/oml_pjsip_agents.conf
 source/astconf/oml_pjsip_trunks.conf
 source/astconf/oml_queues.conf

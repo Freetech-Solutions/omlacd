@@ -22,7 +22,7 @@ is_true() {
 # Validación de variables base
 #####################################
 
-for var in ENV TZ AMI_USER AMI_PASSWORD; do
+for var in TZ AMI_USER AMI_PASSWORD; do
   if [ -z "${!var:-}" ]; then
     echo "ERROR: environment variable '$var' must be set" >&2
     exit 1
@@ -35,8 +35,15 @@ done
 
 LOG_LEVEL=${LOG_LEVEL:-0}
 
+# RTP asterisk server ports range
 RTP_PORT_MIN=${RTP_PORT_MIN:-40000}
 RTP_PORT_MAX=${RTP_PORT_MAX:-50000}
+
+# WebRTC/VoIP outbound proxy
+VOIP_PROXY_HOST=${VOIP_PROXY_HOSTNAME:-"kamailio-pstn"}
+VOIP_PROXY_PORT=${VOIP_PROXY_PORT:-5060}
+WEBRTC_PROXY_HOST=${WEBRTC_PROXY_HOSTNAME:-"kamailio-webrtc"}
+WEBRTC_PROXY_PORT=${WEBRTC_PROXY_PORT:-10060}
 
 # Scale tuning defaults
 STASIS_INITIAL_SIZE=${STASIS_INITIAL_SIZE:-10}
@@ -48,44 +55,16 @@ THREADPOOL_IDLE_TIMEOUT=${THREADPOOL_IDLE_TIMEOUT:-60}
 THREADPOOL_MAX_SIZE=${THREADPOOL_MAX_SIZE:-50}
 THREADPOOL_INITIAL_SIZE=${THREADPOOL_INITIAL_SIZE:-8}
 THREADPOOL_AUTO_INCREMENT=${THREADPOOL_AUTO_INCREMENT:-5}
-PUBLIC_IP=${PUBLIC_IP:-""}
 
-# Otros flags opcionales
+# Optional flags
 HOMER_ENABLE=${HOMER_ENABLE:-""}
 HOMER_HOST=${HOMER_HOST:-"homer_host"}
 HOMER_PORT=${HOMER_PORT:-"9060"}
 TENANT_ID=${TENANT_ID:-"tenant"}
 
-VOIP_NAT_FLAG=${VOIP_NAT:-""}
-ARQ=${ARQ:-""}
-DIALER_HOST=${DIALER_HOST:-""}
-
-ASTERISK_HOSTNAME=${ASTERISK_HOSTNAME:-"localhost"}
-ASTERISK_VIP=${ASTERISK_VIP:-"$ASTERISK_HOSTNAME"}
-
 #####################################
 # Funciones de configuración
 #####################################
-
-set_public_ip() {
-  # Dev: típicamente no queremos depender de un servicio externo
-  if [[ "${ENV}" == "dev" ]]; then
-    PUBLIC_IP="127.0.0.1"
-    return
-  fi
-
-  # Para otros entornos, si ya viene seteada la respetamos
-  if [[ -n "${PUBLIC_IP}" ]]; then
-    return
-  fi
-
-  if PUBLIC_IP="$(curl --retry 3 --connect-timeout 5 --max-time 10 -fsSL http://ipinfo.io/ip)"; then
-    :
-  else
-    echo "WARN: could not fetch public IP, defaulting to 127.0.0.1" >&2
-    PUBLIC_IP="127.0.0.1"
-  fi
-}
 
 configure_timezone() {
   echo "**[omlacd] Setting localtime"
@@ -102,159 +81,10 @@ configure_timezone() {
 }
 
 configure_ami_ari() {
-  echo "**[omlacd] Writing the AMI config"
-  sed -i "s/amiuser/${AMI_USER}/g" /etc/asterisk/oml_manager.conf
-  sed -i "s/amipassword/${AMI_PASSWORD}/g" /etc/asterisk/oml_manager.conf
-
+  
   echo "**[omlacd] Writing the ARI config"
   sed -i "s/ariuser/${AMI_USER}/g" /etc/asterisk/oml_ari.conf
   sed -i "s/aripassword/${AMI_PASSWORD}/g" /etc/asterisk/oml_ari.conf
-}
-
-configure_env_bindings() {
-  case "${ENV}" in
-    dev)
-      echo "devenv docker-compose"
-      sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_manager.conf
-      sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_http.conf
-      ;;
-
-    custom)
-      echo "production custom VoIP environment"
-      sed -i "s/bindaddr=127.0.0.1/bindaddr=${API_LISTEN_IP:?API_LISTEN_IP must be set for ENV=custom}/g" /etc/asterisk/oml_manager.conf
-      sed -i "s/bindaddr=127.0.0.1/bindaddr=${API_LISTEN_IP:?API_LISTEN_IP must be set for ENV=custom}/g" /etc/asterisk/oml_http.conf
-      sed -i "s/bind=0.0.0.0:5160/bind=${PJSIP_IP_AGENT:?PJSIP_IP_AGENT must be set for ENV=custom}:5160/g" /etc/asterisk/oml_pjsip_transports.conf
-      sed -i "s/bind=0.0.0.0:5060/bind=${PJSIP_IP_TRUNK:?PJSIP_IP_TRUNK must be set for ENV=custom}:5060/g" /etc/asterisk/oml_pjsip_transports.conf
-      sed -i "s/bind=127.0.0.1:5260/bind=${PJSIP_IP_DIALER:?PJSIP_IP_DIALER must be set for ENV=custom}:5260/g" /etc/asterisk/oml_pjsip_transports.conf
-      if [[ -n "${PUBLIC_IP}" ]]; then
-        sed -i "s/;external_media_address=extern_ip_nat/external_media_address=${PUBLIC_IP}/g" /etc/asterisk/oml_pjsip_transports.conf
-        sed -i "s/;external_signaling_address=extern_ip_nat/external_signaling_address=${PUBLIC_IP}/g" /etc/asterisk/oml_pjsip_transports.conf
-      fi
-      ;;
-
-    prod)
-      echo "production env with docker-compose"
-      sed -i "s/bindaddr=127.0.0.1/bindaddr=${ASTERISK_HOSTNAME}/g" /etc/asterisk/oml_manager.conf
-      sed -i "s/bindaddr=127.0.0.1/bindaddr=${ASTERISK_HOSTNAME}/g" /etc/asterisk/oml_http.conf
-      sed -i "s/bind=0.0.0.0:5160/bind=${ASTERISK_HOSTNAME}:5160/g" /etc/asterisk/oml_pjsip_transports.conf
-
-      # Lógica corregida para NAT vs no NAT
-      if is_true "${VOIP_NAT_FLAG}"; then
-        # NAT: bind en hostname, external_* apuntando a PUBLIC_IP
-        sed -i "s/bind=0.0.0.0:5060/bind=${ASTERISK_HOSTNAME}:5060/g" /etc/asterisk/oml_pjsip_transports.conf
-        sed -i "s/;external_media_address=extern_ip_nat/external_media_address=${PUBLIC_IP}/g" /etc/asterisk/oml_pjsip_transports.conf
-        sed -i "s/;external_signaling_address=extern_ip_nat/external_signaling_address=${PUBLIC_IP}/g" /etc/asterisk/oml_pjsip_transports.conf
-      else
-        # Sin NAT: bind directo a PUBLIC_IP si es distinta del hostname
-        if [[ "${PUBLIC_IP}" != "${ASTERISK_HOSTNAME}" ]]; then
-          sed -i "s/bind=0.0.0.0:5060/bind=${PUBLIC_IP}:5060/g" /etc/asterisk/oml_pjsip_transports.conf
-        else
-          sed -i "s/bind=0.0.0.0:5060/bind=${ASTERISK_HOSTNAME}:5060/g" /etc/asterisk/oml_pjsip_transports.conf
-        fi
-      fi
-      ;;
-
-    cloud)
-      echo "******* cloud scenary *******"
-      sed -i "s/bindaddr=127.0.0.1/bindaddr=${ASTERISK_HOSTNAME}/g" /etc/asterisk/oml_manager.conf
-      sed -i "s/bind=0.0.0.0:5160/bind=${ASTERISK_HOSTNAME}:5160/g" /etc/asterisk/oml_pjsip_transports.conf
-      sed -i "s/bind=0.0.0.0:5060/bind=${PUBLIC_IP}:5060/g" /etc/asterisk/oml_pjsip_transports.conf
-      if [[ "${ARQ}" == "cluster" ]]; then
-        sed -i "s/bindaddr=127.0.0.1/bindaddr=${ASTERISK_HOSTNAME}/g" /etc/asterisk/oml_http.conf
-      fi
-      sed -i "s/10.22.22.199:5060/${PUBLIC_IP}:5060/g" /etc/asterisk/oml_pjsip_wizard.conf
-      ;;
-
-    cloud_external_dialer)
-      echo "******* cloud scenary with external dialer *******"
-      sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_manager.conf
-      sed -i "s/bind=0.0.0.0:5160/bind=${ASTERISK_HOSTNAME}:5160/g" /etc/asterisk/oml_pjsip_transports.conf
-      sed -i "s/bind=0.0.0.0:5060/bind=${PUBLIC_IP}:5060/g" /etc/asterisk/oml_pjsip_transports.conf
-      if [[ "${ARQ}" == "cluster" ]]; then
-        sed -i "s/bindaddr=127.0.0.1/bindaddr=${ASTERISK_HOSTNAME}/g" /etc/asterisk/oml_http.conf
-      fi
-      ;;
-
-    lan)
-      echo "******** lan scenary *******"
-      sed -i "s/bindaddr=127.0.0.1/bindaddr=${ASTERISK_HOSTNAME}/g" /etc/asterisk/oml_manager.conf
-      sed -i "s/bind=0.0.0.0:5160/bind=${ASTERISK_HOSTNAME}:5160/g" /etc/asterisk/oml_pjsip_transports.conf
-      sed -i "s/bind=0.0.0.0:5060/bind=${ASTERISK_HOSTNAME}:5060/g" /etc/asterisk/oml_pjsip_transports.conf
-      if [[ "${ARQ}" == "cluster" ]]; then
-        sed -i "s/bindaddr=127.0.0.1/bindaddr=${ASTERISK_HOSTNAME}/g" /etc/asterisk/oml_http.conf
-      fi
-      ;;
-
-    nat)
-      echo "********* nat scenary *******"
-      sed -i "s/bindaddr=127.0.0.1/bindaddr=${ASTERISK_HOSTNAME}/g" /etc/asterisk/oml_manager.conf
-      sed -i "s/bind=0.0.0.0:5160/bind=${ASTERISK_HOSTNAME}:5160/g" /etc/asterisk/oml_pjsip_transports.conf
-      sed -i "s/bind=0.0.0.0:5060/bind=${ASTERISK_HOSTNAME}:5060/g" /etc/asterisk/oml_pjsip_transports.conf
-      sed -i "s/;external_media_address=extern_ip_nat/external_media_address=${PUBLIC_IP}/g" /etc/asterisk/oml_pjsip_transports.conf
-      sed -i "s/;external_signaling_address=extern_ip_nat/external_signaling_address=${PUBLIC_IP}/g" /etc/asterisk/oml_pjsip_transports.conf
-      if [[ "${ARQ}" == "cluster" ]]; then
-        sed -i "s/bindaddr=127.0.0.1/bindaddr=${ASTERISK_HOSTNAME}/g" /etc/asterisk/oml_http.conf
-      fi
-      ;;
-
-    hybrid)
-      echo "********* hybrid scenary *******"
-      sed -i "s/bindaddr=127.0.0.1/bindaddr=${ASTERISK_HOSTNAME}/g" /etc/asterisk/oml_manager.conf
-      sed -i "s/bind=0.0.0.0:5160/bind=${ASTERISK_HOSTNAME}:5160/g" /etc/asterisk/oml_pjsip_transports.conf
-      sed -i "s/bind=0.0.0.0:5060/bind=${ASTERISK_HOSTNAME}:5060/g" /etc/asterisk/oml_pjsip_transports.conf
-      if [[ "${ARQ}" == "cluster" ]]; then
-        sed -i "s/bindaddr=127.0.0.1/bindaddr=${ASTERISK_HOSTNAME}/g" /etc/asterisk/oml_http.conf
-      fi
-      ;;
-
-    all)
-      echo "******* open 0.0.0.0 + nat scenary *******"
-      sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_manager.conf
-      sed -i "s/bind=0.0.0.0:5160/bind=0.0.0.0:5160/g" /etc/asterisk/oml_pjsip_transports.conf
-      sed -i "s/bind=0.0.0.0:5060/bind=0.0.0.0:5060/g" /etc/asterisk/oml_pjsip_transports.conf
-      sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_http.conf
-      ;;
-
-    all_ait)
-      echo "******* open 0.0.0.0 scenary *******"
-      sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_manager.conf
-      sed -i "s/bind=0.0.0.0:5160/bind=0.0.0.0:5160/g" /etc/asterisk/oml_pjsip_transports.conf
-      sed -i "s/bind=0.0.0.0:5060/bind=0.0.0.0:5060/g" /etc/asterisk/oml_pjsip_transports.conf
-      sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_http.conf
-      ;;
-
-    all_ait_nat)
-      echo "******* open 0.0.0.0 scenary *******"
-      sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_manager.conf
-      sed -i "s/bind=0.0.0.0:5160/bind=0.0.0.0:5160/g" /etc/asterisk/oml_pjsip_transports.conf
-      sed -i "s/bind=0.0.0.0:5060/bind=0.0.0.0:5060/g" /etc/asterisk/oml_pjsip_transports.conf
-      sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_http.conf
-      sed -i "s/;external_media_address=extern_ip_nat/external_media_address=${PUBLIC_IP}/g" /etc/asterisk/oml_pjsip_transports.conf
-      sed -i "s/;external_signaling_address=extern_ip_nat/external_signaling_address=${PUBLIC_IP}/g" /etc/asterisk/oml_pjsip_transports.conf
-      ;;
-
-    all_ait_nat_mediaonly)
-      echo "******* open 0.0.0.0 scenary *******"
-      sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_manager.conf
-      sed -i "s/bind=0.0.0.0:5160/bind=0.0.0.0:5160/g" /etc/asterisk/oml_pjsip_transports.conf
-      sed -i "s/bind=0.0.0.0:5060/bind=0.0.0.0:5060/g" /etc/asterisk/oml_pjsip_transports.conf
-      sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_http.conf
-      sed -i "s/;external_media_address=extern_ip_nat/external_media_address=${PUBLIC_IP}/g" /etc/asterisk/oml_pjsip_transports.conf
-      ;;
-
-    ha)
-      echo "******** HA scenary *******"
-      sed -i "s/bindaddr=127.0.0.1/bindaddr=${ASTERISK_VIP}/g" /etc/asterisk/oml_manager.conf
-      sed -i "s/bind=0.0.0.0:5160/bind=${ASTERISK_HOSTNAME}:5160/g" /etc/asterisk/oml_pjsip_transports.conf
-      sed -i "s/bind=0.0.0.0:5060/bind=${ASTERISK_VIP}:5060/g" /etc/asterisk/oml_pjsip_transports.conf
-      sed -i "s/bindaddr=127.0.0.1/bindaddr=${ASTERISK_VIP}/g" /etc/asterisk/oml_http.conf
-      ;;
-
-    *)
-      echo "ERROR: Invalid ENV='${ENV}'. Valid values: dev, custom, prod, cloud, cloud_external_dialer, lan, nat, hybrid, all, all_ait, all_ait_nat, all_ait_nat_mediaonly, ha" >&2
-      exit 1
-      ;;
-  esac
 }
 
 configure_homer() {
@@ -268,7 +98,6 @@ configure_homer() {
   sed -i -E "s#^(capture_address\s*=\s*).*#\1${HOMER_HOST}:${HOMER_PORT}#" /etc/asterisk/hep.conf
   sed -i -E "s#^(capture_name\s*=\s*).*#\1${TENANT_ID}#" /etc/asterisk/hep.conf
 }
-
 
 configure_scale() {
   if ! is_true "${SCALE:-}"; then
@@ -289,16 +118,6 @@ configure_scale() {
   sed -i "s/threadpool_auto_increment=5/threadpool_auto_increment=${THREADPOOL_AUTO_INCREMENT}/g" /etc/asterisk/oml_pjsip.conf
 }
 
-configure_dialer() {
-  if [[ -n "${DIALER_HOST}" ]]; then
-    sed -i "s/dialer-asterisk/${DIALER_HOST}/g" /etc/asterisk/oml_pjsip_wizard.conf
-  fi
-
-  if [[ -n "${DIALER_HOST}" && "${DIALER_HOST}" != "127.0.0.1" ]]; then
-    sed -i "s/127.0.0.1:5260/${ASTERISK_HOSTNAME}:5260/g" /etc/asterisk/oml_pjsip_transports.conf
-  fi
-}
-
 configure_rtp_ports() {
   echo "**[omlacd] Configuring RTP ports range ${RTP_PORT_MIN}-${RTP_PORT_MAX}"
 
@@ -306,12 +125,23 @@ configure_rtp_ports() {
   sed -i -E "s/^(rtpend=).*/\1${RTP_PORT_MAX}/" /etc/asterisk/rtp.conf
 }
 
+configure_outbound_proxy() {
+  echo "**[omlacd] Configuring outbound proxy"
+  echo "outbound_proxy=sip:${VOIP_PROXY_HOST}:${VOIP_PROXY_PORT};lr" >> /etc/asterisk/oml_pjsip_wizard.conf
+  echo "identify/match=${VOIP_PROXY_HOST}" >> /etc/asterisk/oml_pjsip_wizard.conf
+}
+
+configure_webrtc_proxy() {
+  echo "**[omlacd] Configuring webrtc proxy"
+  sed -i "s/kamailio-webrtc:10060/${WEBRTC_PROXY_HOST}:${WEBRTC_PROXY_PORT}/g" /etc/asterisk/oml_pjsip_wizard.conf
+}
+
 fix_permissions() {
   echo "**[omlacd] Fixing permissions"
   local paths=(
     /etc/asterisk/retrieve_conf
     /var/lib/asterisk/sounds
-    /var/spool/asterisk/monitor
+    /var/spool/asterisk/recording
   )
 
   for p in "${paths[@]}"; do
@@ -359,14 +189,13 @@ main() {
 
   if [[ "${run_asterisk}" == "true" ]]; then
     # Configuración completa antes de levantar Asterisk
-    set_public_ip
     configure_timezone
     configure_ami_ari
-    configure_env_bindings
     configure_homer
     configure_scale
-    configure_dialer
     configure_rtp_ports
+    configure_outbound_proxy
+    configure_webrtc_proxy
 
     start_asterisk "$@"
   else
