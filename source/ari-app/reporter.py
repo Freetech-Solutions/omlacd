@@ -347,7 +347,8 @@ class ACDReporter:
         talk_time=None,
         leg_unique_id=None,
         node_id=None,
-        numero_extra=None
+        numero_extra=None,
+        destination_type=None,
     ):
 
         dest = dest_extension or numero_extra
@@ -363,7 +364,8 @@ class ACDReporter:
             'campana_id_origen': self._clean_id(campana_id_origen),
             'agente_origen_id': self._clean_id(agente_origen_id),
             'initiated_by': initiated_by,     # varchar(16)
-            'transfer_type': transfer_type,   # varchar(16)
+            'transfer_type': transfer_type,   # varchar(16) — mecánica (ej. BLIND, ATTENDED)
+            'destination_type': destination_type,  # varchar — destino (ej. AGENT, EXTERNAL, CAMPAIGN)
             'numero_extra': dest,             # varchar(64)
             'target_agent_id': self._clean_id(target_agent_id),
             'target_campaign_id': self._clean_id(target_campaign_id),

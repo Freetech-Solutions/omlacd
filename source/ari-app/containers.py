@@ -207,15 +207,6 @@ class ACDContainer(containers.DeclarativeContainer):
         recording_base_path=config.RECORDING_BASE_PATH,
     )
 
-    # Transfer Manager
-    transfer_manager = providers.Singleton(
-        TransferManager,
-        state_store=state_store,
-        ari_client=ari_client,
-        reporter=reporter,
-        agent_status_service=agent_status_service,
-    )
-
     # Handlers
     manual_handler = providers.Factory(
         ManualCallHandler,
@@ -229,7 +220,15 @@ class ACDContainer(containers.DeclarativeContainer):
         route_validator=route_validator,
     )
 
-    inbound_handler = providers.Factory(
+    def _make_get_campaign_config(redis_client):
+        return lambda id_camp: get_campaign_config_with_defaults(redis_client, id_camp)
+
+    sip_refer_get_campaign_config = providers.Factory(
+        _make_get_campaign_config,
+        redis_client=redis_client_base,
+    )
+
+    inbound_handler = providers.Singleton(
         InboundCallHandler,
         ari_client=ari_client,
         state_store=state_store,
@@ -240,6 +239,18 @@ class ACDContainer(containers.DeclarativeContainer):
         queue_event_manager=queue_event_manager,
         distribution_service=distribution_service,
         agent_status_service=agent_status_service,
+    )
+
+    transfer_manager = providers.Singleton(
+        TransferManager,
+        state_store=state_store,
+        ari_client=ari_client,
+        reporter=reporter,
+        agent_status_service=agent_status_service,
+        distribution_service=distribution_service,
+        get_campaign_config=sip_refer_get_campaign_config,
+        queue_event_manager=queue_event_manager,
+        inbound_handler=inbound_handler,
     )
 
     progressive_handler = providers.Factory(
@@ -266,15 +277,8 @@ class ACDContainer(containers.DeclarativeContainer):
     )
 
     # SIP REFER listener (transferencia desde voicebot por REFER)
-    def _make_get_campaign_config(redis_client):
-        return lambda id_camp: get_campaign_config_with_defaults(redis_client, id_camp)
-
     verloop_refer_handler = providers.Singleton(VerloopReferHandler)
     sip_refer_handlers = providers.List(verloop_refer_handler)
-    sip_refer_get_campaign_config = providers.Factory(
-        _make_get_campaign_config,
-        redis_client=redis_client_base,
-    )
 
     # Router
     handlers_dict = providers.Dict({

@@ -542,6 +542,8 @@ class InboundCallHandler(BaseHandler):
                 if not fresh_ctx.uniqueid_agent:
                     fresh_ctx.uniqueid_agent = channel_id
 
+                fresh_ctx.transfer_in_progress = False
+
                 if not fresh_ctx.agent_answered_ts:
                     fresh_ctx.agent_answered_ts = datetime.now().isoformat()
                 if getattr(fresh_ctx, "is_voicebot", False):

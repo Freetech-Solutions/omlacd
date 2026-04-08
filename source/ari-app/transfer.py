@@ -2,7 +2,7 @@ import logging
 import time
 import threading
 from datetime import datetime
-from typing import Optional, Dict
+from typing import Any, Callable, Dict, Optional
 
 from ari_manager import ARI
 from state import CallRegistry, CallContext, ConsultationData
@@ -77,11 +77,25 @@ class TransferManager:
     - Verificación post-operación para detectar cambios de estado concurrentes
     """
 
-    def __init__(self, state_store: CallRegistry, ari_client: ARI, reporter, agent_status_service: Optional[AgentStatusService] = None):
+    def __init__(
+        self,
+        state_store: CallRegistry,
+        ari_client: ARI,
+        reporter,
+        agent_status_service: Optional[AgentStatusService] = None,
+        distribution_service: Any = None,
+        get_campaign_config: Optional[Callable[[str], Dict[str, Any]]] = None,
+        queue_event_manager: Any = None,
+        inbound_handler: Any = None,
+    ):
         self.state_store = state_store
         self.ari = ari_client
         self.reporter = reporter
         self.agent_status_service = agent_status_service
+        self.distribution_service = distribution_service
+        self.get_campaign_config = get_campaign_config
+        self.queue_event_manager = queue_event_manager
+        self.inbound_handler = inbound_handler
         # Logger estandarizado por módulo
         self.logger = logging.getLogger(__name__)
         self.asterisk_app = settings.ARI_APP
@@ -298,7 +312,8 @@ class TransferManager:
         id_customer: Optional[int] = None,
         id_camp: Optional[int] = None,
         call_type: Optional[int] = None,
-        agent_id: Optional[int] = None
+        agent_id: Optional[int] = None,
+        destination_type: str = "",
     ):
         """
         Wrapper para reportar transferencias.
@@ -306,7 +321,8 @@ class TransferManager:
         Args:
             ctx: Contexto de llamada (opcional, se usa si se proporciona)
             initiator: Iniciador de la transferencia
-            transfer_type: Tipo de transferencia
+            transfer_type: Mecánica de transferencia (ej. BLIND, ATTENDED) para Gearman/BD
+            destination_type: Tipo de destino (ej. AGENT, EXTERNAL, CAMPAIGN)
             endpoint: Endpoint destino
             result: Resultado de la transferencia
             duration_ms: Duración en milisegundos
@@ -342,6 +358,7 @@ class TransferManager:
             agente_origen_id=_agent_id or 0,
             initiated_by=initiator,
             transfer_type=transfer_type,
+            destination_type=destination_type or None,
             numero_extra=endpoint,
             target_agent_id=target_agent_id,
             target_campaign_id=target_camp_id,
@@ -525,7 +542,6 @@ class TransferManager:
             unique_id=call_id,
             endpoint=endpoint,
             agente_id=agente_id,
-            transfer_type="AGENT",
             target_agent_id=target_agent_id
         )
 
@@ -539,6 +555,9 @@ class TransferManager:
     ) -> bool:
         """
         Realiza una transferencia ciega a un endpoint.
+
+        Nota: El parámetro ``transfer_type`` se conserva por compatibilidad de firma; el
+        evento TRANSFER usa siempre mecánica BLIND y deduce ``destination_type`` (AGENT vs EXTERNAL).
         
         Thread-safety:
             Este método utiliza locks distribuidos de Redis para garantizar atomicidad.
@@ -692,13 +711,15 @@ class TransferManager:
                     return False
 
             # Reportar Éxito
+            destination_type = "AGENT" if target_agent_id else "EXTERNAL"
             self._log_transfer_result(
-                initiator=initiator, 
-                transfer_type=transfer_type, 
-                endpoint=endpoint, 
-                result="OK", 
+                initiator=initiator,
+                transfer_type="BLIND",
+                destination_type=destination_type,
+                endpoint=endpoint,
+                result="OK",
                 duration_ms=int((time.monotonic()-inicio_ts)*1000),
-                leg_unique_id=leg_id, 
+                leg_unique_id=leg_id,
                 target_agent_id=target_agent_id,
                 call_id=call_id,
                 id_customer=id_customer,
@@ -735,11 +756,13 @@ class TransferManager:
                     call_type = None
                     agent_id = None
             
+            destination_type = "AGENT" if target_agent_id else "EXTERNAL"
             self._log_transfer_result(
-                initiator=initiator, 
-                transfer_type=transfer_type, 
-                endpoint=endpoint, 
-                result="FAILED", 
+                initiator=initiator,
+                transfer_type="BLIND",
+                destination_type=destination_type,
+                endpoint=endpoint,
+                result="FAILED",
                 duration_ms=int((time.monotonic()-inicio_ts)*1000),
                 sip_reason=str(e),
                 call_id=call_id,
@@ -749,6 +772,116 @@ class TransferManager:
                 agent_id=agent_id
             )
             return False
+
+    def _start_redistribution_after_blind_to_campaign(self, call_id: str, target_camp_id: str) -> None:
+        """
+        Tras blind_to_campaign: cancela timer/eventos de la distribución previa e inicia
+        el loop de cola hacia la campaña destino (misma mecánica que InboundCallHandler.on_start).
+        """
+        if not self.distribution_service:
+            self.logger.error(
+                "TransferManager: distribution_service no inyectado; no se puede redistribuir "
+                "tras blind_to_campaign (call_id=%s, campaña=%s)",
+                call_id,
+                target_camp_id,
+            )
+            return
+        if not self.get_campaign_config:
+            self.logger.error(
+                "TransferManager: get_campaign_config no inyectado; no se puede redistribuir "
+                "tras blind_to_campaign (call_id=%s)",
+                call_id,
+            )
+            return
+
+        self.distribution_service.stop_distribution(
+            call_id, cancel_timer=True, hangup_agent_channel=False
+        )
+
+        campaign_cfg = self.get_campaign_config(target_camp_id)
+        strategy = str(campaign_cfg.get("strategy") or "fewestcalls")
+        ring_timeout = int(
+            campaign_cfg.get("ring_timeout")
+            or getattr(settings, "DEFAULT_ORIGINATE_TIMEOUT", 45)
+        )
+        max_wait_time = float(campaign_cfg.get("max_wait_time") or 3600)
+
+        with self.state_store.lock(call_id):
+            ctx = self.state_store.get(call_id)
+            if not ctx:
+                self.logger.warning(
+                    "_start_redistribution_after_blind_to_campaign: sin contexto para call_id=%s",
+                    call_id,
+                )
+                return
+            ctx.queue_timeout_seconds = int(max_wait_time)
+            self.state_store.register_unsafe(call_id, ctx)
+            bridge_id = ctx.bridge_id
+            pstn_channel_id = ctx.pstn_channel
+            uniqueid = ctx.uniqueid_pstn or call_id
+            id_customer = ctx.id_customer
+            tel_customer = ctx.phone_number
+            call_type_val = ctx.call_type
+            callid_meta = ctx.call_id
+
+        if self.queue_event_manager:
+            try:
+                self.queue_event_manager.on_enter_queue(
+                    callid=call_id,
+                    uniqueid=uniqueid,
+                    campana_id=str(target_camp_id),
+                )
+            except Exception:
+                self.logger.exception(
+                    "Error notificando on_enter_queue tras blind_to_campaign (call_id=%s)",
+                    call_id,
+                )
+
+        distribution_metadata = {
+            "id_customer": id_customer,
+            "id_camp": int(target_camp_id),
+            "tel_customer": tel_customer,
+            "callid": callid_meta,
+            "call_type": call_type_val
+            if call_type_val is not None
+            else CallType.INBOUND_ID,
+        }
+
+        on_queue_timeout_callback = None
+        if self.inbound_handler and hasattr(
+            self.inbound_handler, "_mark_pstn_hangup_by_app"
+        ):
+            mark_fn = self.inbound_handler._mark_pstn_hangup_by_app
+            on_queue_timeout_callback = lambda cid, ch: mark_fn(ch)
+
+        if campaign_cfg.get("voicebot") and campaign_cfg.get("external_ag_host"):
+            self.distribution_service.start_voicebot_distribution(
+                call_id=call_id,
+                campaign_id=str(target_camp_id),
+                bridge_id=bridge_id,
+                strategy=campaign_cfg.get("voicebot_strategy", "random"),
+                ring_timeout=ring_timeout,
+                queue_timeout_sec=max_wait_time,
+                pstn_channel_id=pstn_channel_id,
+                uniqueid=uniqueid,
+                distribution_metadata=distribution_metadata,
+                external_host=campaign_cfg["external_ag_host"],
+                max_qcalls=campaign_cfg.get("maxqcall", 10),
+                on_queue_timeout_callback=on_queue_timeout_callback,
+            )
+        else:
+            self.distribution_service.start_distribution(
+                call_id=call_id,
+                campaign_id=str(target_camp_id),
+                bridge_id=bridge_id,
+                strategy=strategy,
+                ring_timeout=ring_timeout,
+                queue_timeout_sec=max_wait_time,
+                pstn_channel_id=pstn_channel_id,
+                uniqueid=uniqueid,
+                distribution_metadata=distribution_metadata,
+                on_queue_timeout_callback=on_queue_timeout_callback,
+            )
 
     # -------------------------------------------------------------------------
     # 2) Blind Transfer -> Campaña (Re-encolar)
@@ -835,7 +968,8 @@ class TransferManager:
         self._log_transfer_result(
             ctx=None,
             initiator="AGENTE",
-            transfer_type="QUEUE",
+            transfer_type="BLIND",
+            destination_type="CAMPAIGN",
             endpoint=f"CAMPAIGN:{target_camp_id}",
             result="OK",
             target_camp_id=int(target_camp_id),
@@ -846,11 +980,20 @@ class TransferManager:
             agent_id=source_agent_id
         )
 
-        # TODO: Aquí debes disparar el evento de redistribución.
-        # En la arquitectura nueva, esto podría ser publicar en Redis o llamar al Router.
-        # self.router.redistribute(ctx) 
-        self.logger.info(f"🔄 Cliente re-encolado en campaña {target_camp_id}. Esperando distribución...")
-        
+        target_camp_str = str(target_camp_id)
+        try:
+            self._start_redistribution_after_blind_to_campaign(call_id, target_camp_str)
+        except Exception:
+            self.logger.exception(
+                "blind_to_campaign: error iniciando redistribución para call_id=%s campaña=%s",
+                call_id,
+                target_camp_str,
+            )
+
+        self.logger.info(
+            f"🔄 Cliente re-encolado en campaña {target_camp_id}. Distribución iniciada hacia esa cola."
+        )
+
         return True
 
     # -------------------------------------------------------------------------
@@ -1194,7 +1337,8 @@ class TransferManager:
             self._log_transfer_result(
                 ctx=None,
                 initiator="AGENTE",
-                transfer_type="AGENT",
+                transfer_type="ATTENDED",
+                destination_type="AGENT",
                 endpoint=endpoint,
                 result="OK",
                 duration_ms=0,  # La duración puede calcularse si se guarda timestamp de inicio
