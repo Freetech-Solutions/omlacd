@@ -220,7 +220,8 @@ class ACDReporter:
                         channel_leg_dialstatus=None, channel_leg_start_ts=None,
                         channel_leg_answer_ts=None, channel_leg_end_ts=None,
                         channel_leg_hangup_cause=None, channel_leg_hangup_cause_txt=None,
-                        custom_data=None, archivo_grabacion=None):
+                        custom_data=None, archivo_grabacion=None,
+                        transfer_count=None):
 
         cid = callid or call_data.get('callid') or call_data.get('unique_id')
         uid = uniqueid or call_data.get('uniqueid') or cid
@@ -238,6 +239,11 @@ class ACDReporter:
             f"agente_id={agent_id}, campana_id={camp_id}"
         )
         contact_id = call_data.get('id_customer') or call_data.get('contacto_id') or call_data.get('customer_id')
+
+        if transfer_count is not None:
+            resolved_transfer_count = max(0, int(transfer_count))
+        else:
+            resolved_transfer_count = max(0, int(call_data.get('transfer_count', 0)))
 
         # Determinar si fue atendida por voicebot
         atendida_por_voicebot = call_data.get('is_voicebot', False)
@@ -286,6 +292,7 @@ class ACDReporter:
             "numero_origen": call_data.get('numero_origen') or call_data.get('trunk_callerid') or call_data.get('phone_number'),
             "contacto_id": self._clean_id(contact_id),
             "es_transferencia": bool(is_transfer),
+            "transfer_count": resolved_transfer_count,
             "atendida_por_voicebot": bool(atendida_por_voicebot),
             "atencion_hibrida": atencion_hibrida,
             "quien_corto": int(quien_corto),

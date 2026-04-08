@@ -827,6 +827,7 @@ class TransferManager:
             ctx.agent_channel = None
             # transfer_in_progress permanece en True hasta que el flujo de re-encolado
             # complete y la llamada vuelva a asignarse
+            ctx.transfer_count += 1
 
             self.state_store.register_unsafe(unique_id, ctx)
 
@@ -1185,6 +1186,7 @@ class TransferManager:
                 ctx.consultation = None # Limpiar objeto consulta
                 ctx.transfer_in_progress = False
                 ctx.is_transferred = True
+                ctx.transfer_count += 1
                 self.state_store.register_unsafe(unique_id, ctx)
 
             # 4. Registrar resultado de la transferencia
@@ -1658,6 +1660,7 @@ class TransferManager:
                     # Verificar que el estado no haya cambiado (otro thread podría haber cancelado)
                     if ctx.transfer_in_progress and ctx.agent_channel == channel_id:
                         ctx.transfer_in_progress = False
+                        ctx.transfer_count += 1
                         self.state_store.register_unsafe(call_id, ctx)
                     else:
                         # El estado cambió, posiblemente cancelado por otro thread

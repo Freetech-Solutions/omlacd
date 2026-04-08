@@ -542,6 +542,12 @@ def insert_llamada_resumen(message):
         direction = 'INBOUND' if (t_campana == CallType.INBOUND_ID) else 'OUTBOUND'
         start_time = fecha_inicio or datetime.now().astimezone().isoformat()
         es_transferencia = clean_bool(message.get("es_transferencia"))
+        _payload_transfer_count = message.get("transfer_count")
+        if _payload_transfer_count is not None:
+            _parsed_tc = clean_int(_payload_transfer_count)
+            summary_transfer_count = max(0, _parsed_tc if _parsed_tc is not None else 0)
+        else:
+            summary_transfer_count = 1 if es_transferencia else 0
         custom_data = message.get("custom_data")
         if not isinstance(custom_data, dict):
             custom_data = {}
@@ -571,7 +577,7 @@ def insert_llamada_resumen(message):
             "customer_id": clean_int(message.get("contacto_id")),
             "outcome": clean_bool(message.get("es_venta")),
             "is_transferred": es_transferencia,
-            "transfer_count": 1 if es_transferencia else 0,
+            "transfer_count": summary_transfer_count,
             "channel_data": Json(custom_data),
             "created_at": now_iso,
             "updated_at": now_iso,

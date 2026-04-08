@@ -1121,6 +1121,7 @@ class InboundCallHandler(BaseHandler):
                                     "call_type": context.call_type or CallType.INBOUND_ID,
                                     "is_voicebot": getattr(context, "is_voicebot", False),
                                     "is_voicebot_transfer": getattr(context, "is_voicebot_transfer", False),
+                                    "transfer_count": getattr(context, "transfer_count", 0),
                                     "ts_start_iso": context.bridge_created_ts,
                                     "ts_answer_iso": context.pstn_answered_ts or context.agent_answered_ts,
                                 }
@@ -1170,6 +1171,7 @@ class InboundCallHandler(BaseHandler):
                                     "call_type": context.call_type or CallType.INBOUND_ID,
                                     "is_voicebot": getattr(context, "is_voicebot", False),
                                     "is_voicebot_transfer": getattr(context, "is_voicebot_transfer", False),
+                                    "transfer_count": getattr(context, "transfer_count", 0),
                                     "ts_start_iso": context.bridge_created_ts,
                                     "ts_answer_iso": context.pstn_answered_ts or context.agent_answered_ts,
                                 }
@@ -1231,6 +1233,7 @@ class InboundCallHandler(BaseHandler):
                                 "call_type": context.call_type or CallType.INBOUND_ID,
                                 "is_voicebot": getattr(context, "is_voicebot", False),
                                 "is_voicebot_transfer": getattr(context, "is_voicebot_transfer", False),
+                                "transfer_count": getattr(context, "transfer_count", 0),
                                 "ts_start_iso": context.bridge_created_ts,
                                 "ts_answer_iso": context.pstn_answered_ts or context.agent_answered_ts,
                                 "agente_id": getattr(context, "agent_id", None),

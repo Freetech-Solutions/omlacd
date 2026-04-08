@@ -828,6 +828,7 @@ class ManualCallHandler(BaseHandler):
             'call_type': call_type,
             'is_voicebot': getattr(context, 'is_voicebot', None),
             'is_voicebot_transfer': getattr(context, 'is_voicebot_transfer', None),
+            'transfer_count': getattr(context, 'transfer_count', 0),
             'ts_start_iso': context.bridge_created_ts,
             'ts_answer_iso': context.pstn_answered_ts or context.agent_answered_ts,
         }

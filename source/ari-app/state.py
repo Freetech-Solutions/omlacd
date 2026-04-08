@@ -55,6 +55,7 @@ class CallContext(BaseModel):
     is_voicebot: bool = False
     is_voicebot_transfer: bool = False
     is_transferred: bool = False
+    transfer_count: int = 0
     transfer_in_progress: bool = False
     pstn_channel_bridged: bool = False
     consultation: Optional[ConsultationData] = None
