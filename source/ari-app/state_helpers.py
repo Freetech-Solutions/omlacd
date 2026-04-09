@@ -1,11 +1,56 @@
 import logging
 from contextlib import contextmanager
+from datetime import datetime
 from typing import Iterator, Optional, Tuple
 
 from state import CallRegistry, CallContext
 
 
 logger = logging.getLogger(__name__)
+
+
+def finalize_current_agent_segment(ctx: CallContext) -> float:
+    """
+    Cierra el segmento de conversación del agente actual (agent_id + agent_answered_ts),
+    lo añade a ctx.agent_segments y reinicia agent_answered_ts al instante actual.
+
+    Debe invocarse bajo el lock distribuido del call_id si el contexto se persiste en Redis.
+    """
+    if not getattr(ctx, "agent_id", None) or not getattr(ctx, "agent_answered_ts", None):
+        return 0.0
+
+    try:
+        now = datetime.now().astimezone()
+
+        # Parsear el inicio
+        start_str = ctx.agent_answered_ts.replace("Z", "+00:00")
+        start_dt = datetime.fromisoformat(start_str)
+
+        # Hacer el datetime 'aware' si es 'naive'
+        if start_dt.tzinfo is None:
+            start_dt = start_dt.replace(tzinfo=now.tzinfo)
+
+        duration = max(0.0, (now - start_dt).total_seconds())
+
+        segment = {
+            "agent_id": ctx.agent_id,
+            "start_ts": ctx.agent_answered_ts,
+            "end_ts": now.isoformat(),
+            "talk_duration": round(duration, 3),
+        }
+
+        if getattr(ctx, "agent_segments", None) is None:
+            ctx.agent_segments = []
+
+        ctx.agent_segments.append(segment)
+
+        # Resetear el timestamp para el siguiente agente usando formato aware
+        ctx.agent_answered_ts = now.isoformat()
+
+        return duration
+    except Exception as e:
+        logger.error("finalize_current_agent_segment: fallo parseando timestamps: %s", e)
+        return 0.0
 
 
 @contextmanager

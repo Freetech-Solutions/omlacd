@@ -11,6 +11,9 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar('T')
 
+# Default de agent_answered_ts_override: leer context.agent_answered_ts
+_USE_CONTEXT_AGENT_TS = object()
+
 
 def parse_ari_args(args_list: List[str]) -> Dict[str, str]:
     """
@@ -390,10 +393,21 @@ def determine_who_hung_up(channel_id: str, context: Any) -> int:
     return 0  # Sistema/Otro
 
 
+def _ensure_offset_aware(dt: Optional[datetime]) -> Optional[datetime]:
+    """Alinea naive/aware con state_helpers: naive se interpreta en TZ local del servidor."""
+    if dt is None:
+        return None
+    if dt.tzinfo is not None:
+        return dt
+    local_tz = datetime.now().astimezone().tzinfo
+    return dt.replace(tzinfo=local_tz)
+
+
 def compute_bot_agent_durations(
     context: Any,
     end_iso: Optional[str],
     duracion_llamada: float,
+    agent_answered_ts_override: Any = _USE_CONTEXT_AGENT_TS,
 ) -> Tuple[float, float]:
     """
     Calcula bot_duration (duración del leg AGENT Voicebot) y agent_duration
@@ -403,6 +417,9 @@ def compute_bot_agent_durations(
              voicebot_leg_end_ts, agent_answered_ts (p. ej. CallContext).
     end_iso: timestamp ISO de fin del segmento (o None).
     duracion_llamada: duración total ya calculada en segundos.
+    agent_answered_ts_override: distinto del default = usar este string o None
+        (p. ej. timestamp capturado antes de finalize_current_agent_segment);
+        None explícito evita leer context.agent_answered_ts tras un reset.
 
     Returns:
         (bot_duration, agent_duration) en segundos.
@@ -417,11 +434,18 @@ def compute_bot_agent_durations(
 
     is_voicebot = getattr(context, "is_voicebot", False)
     is_voicebot_transfer = getattr(context, "is_voicebot_transfer", False)
-    voicebot_start = _parse_iso(getattr(context, "voicebot_leg_start_ts", None))
-    voicebot_end = _parse_iso(getattr(context, "voicebot_leg_end_ts", None))
-    agent_answered_ts = getattr(context, "agent_answered_ts", None)
-    agent_answered_dt = _parse_iso(agent_answered_ts)
-    end_dt = _parse_iso(end_iso)
+    voicebot_start = _ensure_offset_aware(
+        _parse_iso(getattr(context, "voicebot_leg_start_ts", None))
+    )
+    voicebot_end = _ensure_offset_aware(
+        _parse_iso(getattr(context, "voicebot_leg_end_ts", None))
+    )
+    if agent_answered_ts_override is _USE_CONTEXT_AGENT_TS:
+        agent_ts = getattr(context, "agent_answered_ts", None)
+    else:
+        agent_ts = agent_answered_ts_override
+    agent_answered_dt = _ensure_offset_aware(_parse_iso(agent_ts))
+    end_dt = _ensure_offset_aware(_parse_iso(end_iso))
 
     if is_voicebot_transfer:
         bot_sec = 0.0

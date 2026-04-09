@@ -5,6 +5,7 @@ se calcule desde el timestamp del agente humano, no del voicebot.
 """
 import unittest
 from unittest.mock import MagicMock, patch
+from datetime import datetime, timezone, timedelta
 import sys
 import os
 
@@ -20,6 +21,7 @@ ari_app_dir = os.path.join(source_dir, "ari-app")
 if ari_app_dir not in sys.path:
     sys.path.insert(0, ari_app_dir)
 
+import utils as utils_mod
 from utils import compute_bot_agent_durations
 
 
@@ -105,6 +107,66 @@ class TestComputeBotAgentDurations(unittest.TestCase):
         self.assertEqual(bot_duration, 0.0)
         self.assertGreaterEqual(agent_duration, 9.0)
         self.assertLessEqual(agent_duration, 11.0)
+
+    def test_mixed_naive_end_iso_and_aware_agent_ts_no_typeerror(self):
+        """end_iso naive (como datetime.now().isoformat()) y agent con offset: no TypeError."""
+        art = timezone(timedelta(hours=-3))
+        fixed_local = datetime(2026, 2, 3, 17, 0, 0, tzinfo=art)
+        context = MagicMock()
+        context.is_voicebot = False
+        context.is_voicebot_transfer = False
+        context.agent_answered_ts = "2026-02-03T17:00:03.000000-03:00"
+        end_iso = "2026-02-03T17:00:13.000000"
+
+        real_datetime = datetime
+        with patch.object(utils_mod, "datetime") as mock_dt:
+            mock_dt.now.return_value = fixed_local
+            mock_dt.fromisoformat = real_datetime.fromisoformat
+            bot_duration, agent_duration = compute_bot_agent_durations(
+                context, end_iso, 43.0
+            )
+
+        self.assertEqual(bot_duration, 0.0)
+        self.assertGreaterEqual(agent_duration, 9.0)
+        self.assertLessEqual(agent_duration, 11.0)
+
+    def test_agent_answered_ts_override_ignores_post_finalize_context(self):
+        """Tras finalize, context.agent_answered_ts es ~fin; override debe ser el inicio real del tramo."""
+        context = MagicMock()
+        context.is_voicebot = False
+        context.is_voicebot_transfer = False
+        context.agent_answered_ts = "2026-02-03T17:00:13.000000-03:00"
+        saved_pre_finalize = "2026-02-03T17:00:03.000000-03:00"
+        end_iso = "2026-02-03T17:00:13.500000-03:00"
+
+        _, agent_duration = compute_bot_agent_durations(
+            context,
+            end_iso,
+            999.0,
+            agent_answered_ts_override=saved_pre_finalize,
+        )
+
+        self.assertGreaterEqual(agent_duration, 10.4)
+        self.assertLessEqual(agent_duration, 10.6)
+
+        _, wrong_if_context_only = compute_bot_agent_durations(
+            context, end_iso, 999.0
+        )
+        self.assertLess(wrong_if_context_only, 1.0, "sin override, el TS reseteado daría ~0.5s")
+
+    def test_explicit_none_override_skips_context_agent_ts(self):
+        """Override None explícito debe usar fallback duracion_llamada, no context.agent_answered_ts."""
+        context = MagicMock()
+        context.is_voicebot = False
+        context.is_voicebot_transfer = False
+        context.agent_answered_ts = "2026-02-03T17:00:13.000000-03:00"
+        _, agent_duration = compute_bot_agent_durations(
+            context,
+            "2026-02-03T17:00:14.000000-03:00",
+            42.5,
+            agent_answered_ts_override=None,
+        )
+        self.assertEqual(agent_duration, 42.5)
 
 
 if __name__ == "__main__":

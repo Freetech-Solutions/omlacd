@@ -9,7 +9,7 @@ from state import CallRegistry, CallContext, ConsultationData
 from config import settings
 from services.agent_status_service import AgentStatusService
 from constants import CallType
-from state_helpers import is_channel_in_context
+from state_helpers import finalize_current_agent_segment, is_channel_in_context
 from utils import build_oml_sip_headers
 
 class TransferManager:
@@ -314,6 +314,7 @@ class TransferManager:
         call_type: Optional[int] = None,
         agent_id: Optional[int] = None,
         destination_type: str = "",
+        talk_time: Optional[float] = None,
     ):
         """
         Wrapper para reportar transferencias.
@@ -323,7 +324,8 @@ class TransferManager:
             initiator: Iniciador de la transferencia
             transfer_type: Mecánica de transferencia (ej. BLIND, ATTENDED) para Gearman/BD
             destination_type: Tipo de destino (ej. AGENT, EXTERNAL, CAMPAIGN)
-            endpoint: Endpoint destino
+            endpoint: Se persiste como numero_extra; usar solo para destinos EXTERNAL (SIP/externo).
+                Con target_agent_id o target_camp_id, dejar vacío y resolver por FK.
             result: Resultado de la transferencia
             duration_ms: Duración en milisegundos
             leg_unique_id: ID único de la pierna
@@ -366,6 +368,7 @@ class TransferManager:
             resultado=result,
             duration_ms=duration_ms,
             sip_reason=sip_reason,
+            talk_time=talk_time,
             node_id=self.node_id
         )
 
@@ -716,7 +719,7 @@ class TransferManager:
                 initiator=initiator,
                 transfer_type="BLIND",
                 destination_type=destination_type,
-                endpoint=endpoint,
+                endpoint=endpoint if destination_type == "EXTERNAL" else "",
                 result="OK",
                 duration_ms=int((time.monotonic()-inicio_ts)*1000),
                 leg_unique_id=leg_id,
@@ -761,7 +764,7 @@ class TransferManager:
                 initiator=initiator,
                 transfer_type="BLIND",
                 destination_type=destination_type,
-                endpoint=endpoint,
+                endpoint=endpoint if destination_type == "EXTERNAL" else "",
                 result="FAILED",
                 duration_ms=int((time.monotonic()-inicio_ts)*1000),
                 sip_reason=str(e),
@@ -953,6 +956,8 @@ class TransferManager:
                 )
                 return False
 
+            finalize_current_agent_segment(ctx)
+
             # Actualizar estado para la nueva campaña de forma atómica
             ctx.id_camp = int(target_camp_id)
             ctx.agent_id = None
@@ -970,7 +975,7 @@ class TransferManager:
             initiator="AGENTE",
             transfer_type="BLIND",
             destination_type="CAMPAIGN",
-            endpoint=f"CAMPAIGN:{target_camp_id}",
+            endpoint="",
             result="OK",
             target_camp_id=int(target_camp_id),
             call_id=call_id,
@@ -1322,6 +1327,8 @@ class TransferManager:
                 endpoint = ctx.consultation.target_endpoint or ""
                 leg_unique_id = ctx.consultation.consult_leg_ch
                 
+                duration = finalize_current_agent_segment(ctx)
+
                 # Actualizar estado después de obtener todos los valores necesarios
                 # El nuevo agente es el B
                 ctx.agent_channel = leg_unique_id
@@ -1334,12 +1341,13 @@ class TransferManager:
 
             # 4. Registrar resultado de la transferencia
             # Todos los valores ya fueron obtenidos dentro del lock antes de liberarlo
+            destination_type = "AGENT" if target_agent_id else "EXTERNAL"
             self._log_transfer_result(
                 ctx=None,
                 initiator="AGENTE",
                 transfer_type="ATTENDED",
-                destination_type="AGENT",
-                endpoint=endpoint,
+                destination_type=destination_type,
+                endpoint=endpoint if destination_type == "EXTERNAL" else "",
                 result="OK",
                 duration_ms=0,  # La duración puede calcularse si se guarda timestamp de inicio
                 leg_unique_id=leg_unique_id,
@@ -1348,7 +1356,8 @@ class TransferManager:
                 id_customer=id_customer,
                 id_camp=id_camp,
                 call_type=call_type,
-                agent_id=agent_id
+                agent_id=agent_id,
+                talk_time=round(duration, 3),
             )
 
             return True
@@ -1772,7 +1781,11 @@ class TransferManager:
             # otros threads lean un estado donde agent_channel ya cambió pero la operación
             # ARI aún no se completó.
             old_agent = ctx.agent_channel
+            old_agent_id = ctx.agent_id
+            finalize_current_agent_segment(ctx)
             ctx.agent_channel = channel_id  # El nuevo canal toma el lugar del agente
+            if ctx.target_agent_id is not None:
+                ctx.agent_id = ctx.target_agent_id
             # NO marcar transfer_in_progress = False todavía - se marcará después de operación ARI exitosa
             ctx.is_transferred = True
             
@@ -1817,13 +1830,14 @@ class TransferManager:
             self.logger.error(f"Error agregando canal {channel_id} al bridge {bridge_id}: {e}")
             # Si falla esto, la transferencia falló. Rollback del estado
             # Como mantenemos transfer_in_progress = True, el rollback es más simple:
-            # solo necesitamos restaurar agent_channel
+            # solo necesitamos restaurar agent_channel y agent_id
             with self.state_store.lock(call_id):
                 ctx = self.state_store.get(call_id)
                 if ctx:
                     # Verificar que el estado no haya cambiado antes de hacer rollback
                     if ctx.transfer_in_progress and ctx.agent_channel == channel_id:
                         ctx.agent_channel = old_agent  # Restaurar agente anterior
+                        ctx.agent_id = old_agent_id
                         # transfer_in_progress ya está en True, no necesita restaurarse
                         self.state_store.register_unsafe(call_id, ctx)
                         self.logger.info(

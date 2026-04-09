@@ -594,7 +594,8 @@ class CallActionService:
         related_call_id: str,
         metadata: Dict[str, Any],
         webrtc_trunk: str = "kamailio-webrtc",
-        timeout: Optional[int] = None
+        timeout: Optional[int] = None,
+        channel_id: Optional[str] = None,
     ) -> Optional[str]:
         """
         Origina una llamada hacia un agente usando WebRTC trunk con headers X-OML-*.
@@ -622,6 +623,7 @@ class CallActionService:
             webrtc_trunk: Nombre del trunk WebRTC a usar (default: "kamailio-webrtc")
             timeout: Timeout en segundos para el intento de llamada (opcional).
                 Si no se proporciona, se usa 30 como valor por defecto.
+            channel_id: ID de canal opcional (UUID) para POST /channels (ARI channelId).
         
         Returns:
             ID del canal del agente creado, o None si falla
@@ -691,6 +693,7 @@ class CallActionService:
             appArgs=app_args,
             variables=variables,
             timeout=timeout_value,
+            channelId=channel_id,
         )
 
         if not result.get("ok"):
@@ -708,6 +711,14 @@ class CallActionService:
                 data,
             )
             return None
+
+        if channel_id and agent_channel_id != channel_id:
+            self.logger.warning(
+                "dial_agent_with_headers: ARI devolvió id distinto al channel_id solicitado "
+                "(solicitado=%s, recibido=%s)",
+                channel_id,
+                agent_channel_id,
+            )
 
         # Registrar metadata para LegacyEventForwarder: eventos Dial de la pierna agente
         # (call_type=2 DIALER) para que se reenvíen a process-event con call_type=to_agent.
@@ -738,6 +749,7 @@ class CallActionService:
         metadata: Dict[str, Any],
         timeout: Optional[int] = None,
         voicebot_addr: Optional[str] = None,
+        channel_id: Optional[str] = None,
     ) -> Optional[str]:
         """
         Origina una llamada hacia un voicebot en un trunk SIP externo.
@@ -793,6 +805,7 @@ class CallActionService:
             appArgs=app_args,
             variables=variables,
             timeout=timeout_value,
+            channelId=channel_id,
         )
 
         if not result.get("ok"):
@@ -810,6 +823,14 @@ class CallActionService:
                 data,
             )
             return None
+
+        if channel_id and agent_channel_id != channel_id:
+            self.logger.warning(
+                "dial_voicebot_with_headers: ARI devolvió id distinto al channel_id solicitado "
+                "(solicitado=%s, recibido=%s)",
+                channel_id,
+                agent_channel_id,
+            )
 
         if self.pending_dial_store:
             stored_meta = {

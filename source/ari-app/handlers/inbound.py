@@ -18,6 +18,7 @@ from services.campaign_config import fetch_campaign_cfg_from_redis
 from services.distribution_service import DistributionService
 from services.queue_strategy import QueueStrategyEngine
 from state import CallContext, CallRegistry
+from state_helpers import finalize_current_agent_segment
 from utils import compute_bot_agent_durations, parse_ari_args
 
 
@@ -1206,6 +1207,21 @@ class InboundCallHandler(BaseHandler):
                     if self.reporter:
                         try:
                             end_iso = datetime.now().isoformat()
+                            agent_segments: List[Dict[str, Any]] = []
+                            saved_agent_answered_ts = getattr(context, "agent_answered_ts", None)
+                            with self.state_store.lock(call_id):
+                                locked_ctx = self.state_store.get(call_id)
+                                if locked_ctx:
+                                    saved_agent_answered_ts = (
+                                        locked_ctx.agent_answered_ts or saved_agent_answered_ts
+                                    )
+                                    finalize_current_agent_segment(locked_ctx)
+                                    self.state_store.register_unsafe(call_id, locked_ctx)
+                                    agent_segments = list(locked_ctx.agent_segments)
+                            # Primera contestación humana: primer segmento guardado (tramos sucesivos tras transferencias).
+                            first_answer_ts = saved_agent_answered_ts
+                            if agent_segments:
+                                first_answer_ts = agent_segments[0].get("start_ts") or first_answer_ts
                             bridge_wait_time = 0.0
                             duracion_llamada = 0.0
                             if context.bridge_created_ts:
@@ -1214,9 +1230,9 @@ class InboundCallHandler(BaseHandler):
                                     end_dt = datetime.fromisoformat(end_iso)
                                     duracion_llamada = max(0.0, (end_dt - start_dt).total_seconds())
                                     # bridge_wait_time = tiempo en cola/MOH hasta que el agente contestó
-                                    if context.agent_answered_ts:
+                                    if first_answer_ts:
                                         agent_answered_dt = datetime.fromisoformat(
-                                            context.agent_answered_ts.replace("Z", "+00:00")
+                                            first_answer_ts.replace("Z", "+00:00")
                                         )
                                         bridge_wait_time = max(
                                             0.0, (agent_answered_dt - start_dt).total_seconds()
@@ -1239,12 +1255,16 @@ class InboundCallHandler(BaseHandler):
                                 "ts_start_iso": context.bridge_created_ts,
                                 "ts_answer_iso": context.pstn_answered_ts or context.agent_answered_ts,
                                 "agente_id": getattr(context, "agent_id", None),
+                                "agent_segments": agent_segments,
                             }
                             # Quien cortó: 1=Agente, 2=Cliente. Si el agente colgó primero, on_hangup_request
                             # marca inbound_agent_hung_up_first; si no, el PSTN colgó (StasisEnd del cliente).
                             quien_corto = 1 if getattr(context, "inbound_agent_hung_up_first", False) else 2
                             bot_duration, agent_duration = compute_bot_agent_durations(
-                                context, end_iso, duracion_llamada
+                                context,
+                                end_iso,
+                                duracion_llamada,
+                                agent_answered_ts_override=saved_agent_answered_ts,
                             )
                             self.reporter.log_segment_end(
                                 call_data=call_data,

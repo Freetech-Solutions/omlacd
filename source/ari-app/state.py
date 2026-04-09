@@ -1,8 +1,8 @@
-from typing import Optional, Dict, List
+from typing import Any, Dict, List, Optional
 import json
 import logging
 import redis
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from config import settings
 from constants import CallType, RedisKeys
@@ -77,6 +77,8 @@ class CallContext(BaseModel):
     # Campos para tracking de timestamps de respuesta (para determinar si fue contestada)
     bridge_created_ts: Optional[str] = None  # Timestamp ISO de creación del bridge
     agent_answered_ts: Optional[str] = None  # Timestamp ISO cuando el canal del agente pasó a "Up"
+    # Historial de segmentos por agente (talk time por tramo; Redis vía CallContext)
+    agent_segments: List[Dict[str, Any]] = Field(default_factory=list)
     pstn_answered_ts: Optional[str] = None  # Timestamp ISO cuando el canal PSTN pasó a "Up"
     ignore_next_agent_hangup: bool = False  # Flag para ignorar el próximo hangup del agente (transferencia consultativa)
     # True mientras se espera comando Redis o TTL tras REFER desde voicebot; no destruir PSTN/bridge si cuelga el leg voicebot

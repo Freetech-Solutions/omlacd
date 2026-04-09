@@ -239,6 +239,7 @@ class ACDReporter:
             f"agente_id={agent_id}, campana_id={camp_id}"
         )
         contact_id = call_data.get('id_customer') or call_data.get('contacto_id') or call_data.get('customer_id')
+        agent_segments = call_data.get("agent_segments", []) or []
 
         if transfer_count is not None:
             resolved_transfer_count = max(0, int(transfer_count))
@@ -316,6 +317,7 @@ class ACDReporter:
             "channel_leg_dialstatus": channel_leg_dialstatus,
             "custom_data": custom_data or {},
             "initiation_method": initiation_method,
+            "agent_segments": agent_segments,
         }
         self._send_job(msg)
 
@@ -375,7 +377,8 @@ class ACDReporter:
             'sip_reason': sip_reason,
             # Métricas integer
             'duration_ms': self._clean_id(duration_ms),
-            'talk_time': self._clean_id(talk_time),
+            # Segundos con decimales (worker → talk_time_after NUMERIC)
+            'talk_time': None if talk_time is None else self._clean_metric(talk_time),
             # Nota: 'ring_time' no está en la definición de la tabla, pero es util
             # pero suele ser útil. Si el worker lo ignora, no pasa nada.
             'ring_time': self._clean_id(ring_time),

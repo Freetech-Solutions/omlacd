@@ -9,6 +9,7 @@ Reutilizable por InboundCallHandler y futuros handlers de campañas salientes (D
 import logging
 import threading
 import time
+import uuid
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -365,8 +366,6 @@ class DistributionService:
                                 )
                                 return
                             attempt_finished.clear()
-                            with self._dialing_lock:
-                                self._active_attempts[call_id] = None
 
                             voicebot_calls_key = RedisKeys.voicebot_calls(id_camp, candidate.agent_id)
                             try:
@@ -410,6 +409,10 @@ class DistributionService:
                                     candidate.agent_id,
                                     e,
                                 )
+                            pre_generated_channel_id = str(uuid.uuid4())
+                            with self._dialing_lock:
+                                self._active_attempts[call_id] = pre_generated_channel_id
+                                self._voicebot_attempt_agent_id[call_id] = candidate.agent_id
                             try:
                                 agent_channel_id = self.call_service.dial_voicebot_with_headers(
                                     agent_sip=candidate.interface,
@@ -418,6 +421,7 @@ class DistributionService:
                                     metadata=metadata,
                                     timeout=ring_timeout,
                                     voicebot_addr=voicebot_addr or None,
+                                    channel_id=pre_generated_channel_id,
                                 )
                             except Exception as e:
                                 logger.error(
@@ -426,6 +430,9 @@ class DistributionService:
                                     e,
                                     exc_info=True,
                                 )
+                                with self._dialing_lock:
+                                    self._active_attempts.pop(call_id, None)
+                                    self._voicebot_attempt_agent_id.pop(call_id, None)
                                 try:
                                     self.redis_client.decr(voicebot_calls_key)
                                 except Exception:
@@ -434,16 +441,15 @@ class DistributionService:
                                 continue
 
                             if not agent_channel_id:
+                                with self._dialing_lock:
+                                    self._active_attempts.pop(call_id, None)
+                                    self._voicebot_attempt_agent_id.pop(call_id, None)
                                 try:
                                     self.redis_client.decr(voicebot_calls_key)
                                 except Exception:
                                     pass
                                 self.redis_client.delete(lock_key)
                                 continue
-
-                            with self._dialing_lock:
-                                self._active_attempts[call_id] = agent_channel_id
-                                self._voicebot_attempt_agent_id[call_id] = candidate.agent_id
 
                             with self.state_store.lock(call_id):
                                 ctx = self.state_store.get(call_id)
@@ -789,9 +795,6 @@ class DistributionService:
                                 return
 
                             attempt_finished.clear()
-                            with self._dialing_lock:
-                                self._active_attempts[call_id] = None
-                                self._active_attempt_agents[call_id] = None
 
                             metadata: Dict[str, Any] = {
                                 "id_customer": distribution_metadata.get("id_customer"),
@@ -806,6 +809,12 @@ class DistributionService:
                             reserved = self.redis_client.set(lock_key, "1", nx=True, ex=15)
                             if not reserved:
                                 continue
+
+                            pre_generated_channel_id = str(uuid.uuid4())
+                            with self._dialing_lock:
+                                self._active_attempts[call_id] = pre_generated_channel_id
+                                self._active_attempt_agents[call_id] = candidate.agent_id
+
                             try:
                                 agent_channel_id = self.call_service.dial_agent_with_headers(
                                     agent_sip=candidate.interface,
@@ -813,6 +822,7 @@ class DistributionService:
                                     metadata=metadata,
                                     webrtc_trunk=settings.WEBRTC_TRUNK,
                                     timeout=ring_timeout,
+                                    channel_id=pre_generated_channel_id,
                                 )
                             except Exception as e:
                                 logger.error(
@@ -821,16 +831,18 @@ class DistributionService:
                                     e,
                                     exc_info=True,
                                 )
+                                with self._dialing_lock:
+                                    self._active_attempts.pop(call_id, None)
+                                    self._active_attempt_agents.pop(call_id, None)
                                 self.redis_client.delete(lock_key)
                                 continue
 
                             if not agent_channel_id:
+                                with self._dialing_lock:
+                                    self._active_attempts.pop(call_id, None)
+                                    self._active_attempt_agents.pop(call_id, None)
                                 self.redis_client.delete(lock_key)
                                 continue
-
-                            with self._dialing_lock:
-                                self._active_attempts[call_id] = agent_channel_id
-                                self._active_attempt_agents[call_id] = candidate.agent_id
 
                             with self.state_store.lock(call_id):
                                 ctx = self.state_store.get(call_id)
