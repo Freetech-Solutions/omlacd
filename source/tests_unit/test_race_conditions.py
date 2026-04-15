@@ -358,7 +358,7 @@ class TestCommandDispatcherTakeCall(unittest.TestCase):
             call_id=call_id,
             type=CallType.MANUAL,
             bridge_id=bridge_id,
-            agent_channel=agent_channel,
+            agent_connected_channel=agent_channel,
         )
         self.state_store.register(call_id, context)
 
@@ -594,7 +594,7 @@ class TestCallRegistryRemoveRaceConditions(unittest.TestCase):
         context = CallContext(
             call_id=call_id,
             type=CallType.MANUAL,
-            agent_channel=channel_id,
+            agent_connected_channel=channel_id,
             bridge_id=bridge_id
         )
         self.registry.register(call_id, context)
@@ -620,7 +620,7 @@ class TestCallRegistryRemoveRaceConditions(unittest.TestCase):
                 with self.registry.lock(call_id):
                     ctx = self.registry.get(call_id)
                     if ctx:
-                        ctx.agent_channel = "modified-channel"
+                        ctx.agent_connected_channel = "modified-channel"
                         self.registry.register(call_id, ctx)
             except Exception as e:
                 modification_errors.append(str(e))
@@ -745,12 +745,12 @@ class TestCallEndProcessingRaceConditions(unittest.TestCase):
         # Contexto que refleja una transferencia ciega en curso:
         # - transfer_in_progress=True
         # - is_transferred=False (transferencia aún no completada)
-        # - agent_channel apunta al nuevo leg B
+        # - agent_attempt_channel apunta al nuevo leg B (ringing)
         # - uniqueid_agent mantiene el canal original del agente A
         context = CallContext(
             call_id=call_id,
             type=CallType.MANUAL,
-            agent_channel=transfer_channel,
+            agent_attempt_channel=transfer_channel,
             uniqueid_agent=agent_a_channel,
             pstn_channel=pstn_channel,
             uniqueid_pstn=pstn_channel,

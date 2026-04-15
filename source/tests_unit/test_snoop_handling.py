@@ -121,7 +121,7 @@ class TestSnoopHandling(unittest.TestCase):
         # Verify
         self.mock_state_store.get.assert_called_with(call_id)
         self.assertIn(snoop_channel_id, ctx.snoop_channels)
-        self.mock_state_store.register.assert_called_with(call_id, ctx)
+        self.mock_state_store.register_unsafe.assert_called_with(call_id, ctx)
 
     @patch('router.ChannelDestroyedEvent', new=MockChannelDestroyedEvent)
     @patch('router.parse_ari_event')
@@ -156,7 +156,7 @@ class TestSnoopHandling(unittest.TestCase):
         
         # Verify removal
         self.assertNotIn(snoop_channel_id, ctx.snoop_channels)
-        self.mock_state_store.register.assert_called_with(call_id, ctx)
+        self.mock_state_store.register_unsafe.assert_called_with(call_id, ctx)
 
 if __name__ == '__main__':
     unittest.main()

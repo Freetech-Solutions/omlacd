@@ -6,6 +6,7 @@ from services.call_manager import CallActionService
 from services.agent_status_service import AgentStatusService
 from transfer import TransferManager
 from state import CallRegistry
+from state_helpers import active_agent_channel
 
 
 class CommandDispatcher:
@@ -290,9 +291,9 @@ class CommandDispatcher:
                 self.logger.warning(f"CommandDispatcher: Call context not found for spy call_id={call_id}")
                 return
             # Canal a espiar: pata del agente para escuchar la conversación
-            channel_to_spy = ctx.agent_channel or ctx.pstn_channel
+            channel_to_spy = active_agent_channel(ctx) or ctx.pstn_channel
         if not channel_to_spy:
-            self.logger.warning(f"CommandDispatcher: No agent_channel nor pstn_channel for spy call_id={call_id}")
+            self.logger.warning(f"CommandDispatcher: No agent leg nor pstn_channel for spy call_id={call_id}")
             return
 
         # appArgs para que _handle_snoop_start complete bridge + originate usando supervisor_sip
@@ -318,7 +319,7 @@ class CommandDispatcher:
         """
         Maneja el comando take_call (tomar llamada): origina al supervisor por ARI;
         cuando conteste, el Router (StasisStart take_call_leg) añadirá su canal al
-        bridge, quitará y colgará al agente, y actualizará ctx.agent_channel.
+        bridge, quitará y colgará al agente, y actualizará ctx.agent_connected_channel.
         Mensaje esperado: action, supervisor_sip, callid (o call_id).
         """
         supervisor_sip = data.get('supervisor_sip')
@@ -335,11 +336,11 @@ class CommandDispatcher:
                 self.logger.warning(f"CommandDispatcher: Call context not found for take_call call_id={call_id}")
                 return
             bridge_id = ctx.bridge_id
-            agent_channel = ctx.agent_channel
+            agent_channel = active_agent_channel(ctx) or getattr(ctx, "agent_attempt_channel", None)
 
         if not bridge_id or not agent_channel:
             self.logger.warning(
-                f"CommandDispatcher: take_call call_id={call_id} missing bridge_id or agent_channel"
+                f"CommandDispatcher: take_call call_id={call_id} missing bridge_id or agent leg"
             )
             return
         if not self.ari_client:

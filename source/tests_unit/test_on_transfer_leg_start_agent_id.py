@@ -5,6 +5,7 @@ import sys
 import unittest
 from contextlib import nullcontext
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 _tests_dir = os.path.dirname(os.path.abspath(__file__))
@@ -54,23 +55,26 @@ class _FakeRegistry:
 
 def _base_ctx():
     start = datetime.now().astimezone() - timedelta(seconds=2)
-    ctx = MagicMock()
-    ctx.call_id = "c1"
-    ctx.type = CallType.INBOUND
-    ctx.agent_channel = "old-agent-ch"
-    ctx.pstn_channel = "pstn-ch"
-    ctx.bridge_id = "bridge-1"
-    ctx.agent_id = 1
-    ctx.target_agent_id = 2
-    ctx.transfer_in_progress = True
-    ctx.call_ended = False
-    ctx.agent_answered_ts = start.isoformat()
-    ctx.agent_segments = []
-    ctx.is_transferred = False
-    ctx.id_camp = None
-    ctx.phone_number = None
-    ctx.uniqueid_pstn = None
-    return ctx
+    return SimpleNamespace(
+        call_id="c1",
+        type=CallType.INBOUND,
+        agent_connected_channel="old-agent-ch",
+        agent_attempt_channel=None,
+        pstn_channel="pstn-ch",
+        bridge_id="bridge-1",
+        agent_id=1,
+        target_agent_id=2,
+        transfer_in_progress=True,
+        call_ended=False,
+        agent_answered_ts=start.isoformat(),
+        agent_segments=[],
+        is_transferred=False,
+        transfer_count=0,
+        id_camp=None,
+        phone_number=None,
+        uniqueid_pstn=None,
+        consultation=None,
+    )
 
 
 class TestOnTransferLegStartAgentId(unittest.TestCase):
@@ -91,8 +95,11 @@ class TestOnTransferLegStartAgentId(unittest.TestCase):
         manager.on_transfer_leg_start("new-agent-ch", {"customer_id": "c1"})
 
         self.assertEqual(ctx.agent_id, 2)
-        self.assertEqual(ctx.agent_channel, "new-agent-ch")
+        self.assertEqual(ctx.agent_connected_channel, "new-agent-ch")
+        self.assertIsNone(ctx.agent_attempt_channel)
         self.assertFalse(ctx.transfer_in_progress)
+        self.assertTrue(getattr(ctx, "is_transferred", False))
+        self.assertEqual(getattr(ctx, "transfer_count", 0), 1)
         self.assertEqual(len(ctx.agent_segments), 1)
         self.assertEqual(ctx.agent_segments[0]["agent_id"], 1)
         self.mock_ari.add_channel_to_bridge.assert_called_once_with("bridge-1", "new-agent-ch")
@@ -112,11 +119,14 @@ class TestOnTransferLegStartAgentId(unittest.TestCase):
 
         manager.on_transfer_leg_start("new-agent-ch", {"customer_id": "c1"})
 
-        self.assertEqual(ctx.agent_channel, "old-agent-ch")
+        self.assertEqual(ctx.agent_connected_channel, "old-agent-ch")
+        self.assertIsNone(ctx.agent_attempt_channel)
         self.assertEqual(ctx.agent_id, 1)
         self.assertTrue(ctx.transfer_in_progress)
-        self.assertEqual(len(ctx.agent_segments), 1)
-        self.assertEqual(ctx.agent_segments[0]["agent_id"], 1)
+        self.assertFalse(getattr(ctx, "is_transferred", False))
+        self.assertEqual(getattr(ctx, "transfer_count", 0), 0)
+        # finalize_current_agent_segment solo tras bridge OK; rollback no debe crear segmentos.
+        self.assertEqual(len(ctx.agent_segments), 0)
         self.mock_ari.hangup_channel.assert_not_called()
 
 

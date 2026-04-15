@@ -255,8 +255,10 @@ class RecordingEventHandler:
             if 'uniqueid' not in metadata:
                 metadata['uniqueid'] = context.uniqueid_pstn
                 
-        if context.agent_channel:
-             metadata['agent_channel'] = context.agent_channel
+        if context.agent_connected_channel:
+            metadata["agent_channel"] = context.agent_connected_channel
+        if getattr(context, "agent_attempt_channel", None):
+            metadata["agent_attempt_channel"] = context.agent_attempt_channel
              
         if context.pstn_channel:
             metadata['pstn_channel'] = context.pstn_channel

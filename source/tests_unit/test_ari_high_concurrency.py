@@ -238,7 +238,7 @@ class TestHighConcurrencyARIEvents(unittest.TestCase):
         context = CallContext(
             call_id=call_id,
             type=CallType.MANUAL,
-            agent_channel=channel_id,
+            agent_connected_channel=channel_id,
             bridge_id=bridge_id
         )
         self.state_store.register(call_id, context)
@@ -303,7 +303,7 @@ class TestHighConcurrencyARIEvents(unittest.TestCase):
         context = CallContext(
             call_id=call_id,
             type=CallType.MANUAL,
-            agent_channel=channel_id,
+            agent_connected_channel=channel_id,
             call_ended=False
         )
         self.state_store.register(call_id, context)
@@ -450,7 +450,7 @@ class TestConcurrentTransfers(unittest.TestCase):
             type=CallType.MANUAL,
             bridge_id=bridge_id,
             transfer_in_progress=False,
-            agent_channel="channel-agent",
+            agent_connected_channel="channel-agent",
             pstn_channel="channel-pstn"
         )
         self.state_store.register(call_id, context)
@@ -862,7 +862,7 @@ class TestCallEndRaceConditions(unittest.TestCase):
         context = CallContext(
             call_id=call_id,
             type=CallType.MANUAL,
-            agent_channel=agent_channel,
+            agent_connected_channel=agent_channel,
             pstn_channel=pstn_channel,
             # El agente ya contestó, PSTN nunca contestó
             agent_answered_ts="2024-01-01T10:00:00",

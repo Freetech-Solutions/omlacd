@@ -551,6 +551,11 @@ def insert_llamada_resumen(message):
         custom_data = message.get("custom_data")
         if not isinstance(custom_data, dict):
             custom_data = {}
+
+        agent_segments = message.get("agent_segments")
+        if agent_segments:
+            custom_data["agent_segments"] = agent_segments
+
         now_iso = datetime.now().astimezone().isoformat()
         
         # Diccionario para tabla interactions_summary (esquema migración 0013)

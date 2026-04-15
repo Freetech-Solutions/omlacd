@@ -30,6 +30,11 @@ from services.agent_status_service import AgentStatusService
 from services.call_manager import CallActionService
 from services.distribution_service import DistributionService
 from state import CallContext, CallRegistry
+from state_helpers import (
+    active_agent_channel,
+    distinct_agent_leg_ids,
+    is_agent_leg_channel,
+)
 
 if TYPE_CHECKING:
     from services.legacy_forwarder import LegacyEventForwarder
@@ -183,7 +188,6 @@ class ProgressiveCampaignHandler(BaseHandler):
             context = CallContext(
                 call_id=call_id,
                 type=CallType.PROGRESSIVE,
-                agent_channel=None,
                 pstn_channel=channel_id,
                 bridge_id=bridge_id,
                 uniqueid_agent=None,
@@ -615,32 +619,76 @@ class ProgressiveCampaignHandler(BaseHandler):
                 agent_id_str = None
             else:
                 agent_id_str = self._extract_agent_id_from_agent_channel(channel_id, event)
-            bridge_id = None
+
+            bridge_id: Optional[str] = None
+            with self.state_store.lock(call_id):
+                peek = self.state_store.get(call_id)
+                if not peek:
+                    return
+                bridge_id = peek.bridge_id
+
+            if not bridge_id:
+                logger.warning(
+                    "ProgressiveCampaignHandler.on_agent_stasis_start: sin bridge_id call_id=%s",
+                    call_id,
+                )
+                with self.state_store.lock(call_id):
+                    fc = self.state_store.get(call_id)
+                    if fc and fc.agent_attempt_channel == channel_id:
+                        fc.agent_attempt_channel = None
+                        self.state_store.register_unsafe(call_id, fc)
+                try:
+                    self.ari_client.hangup_channel(channel_id)
+                except Exception:
+                    pass
+                return
+
+            bridge_ok = False
+            try:
+                self.call_service.add_channel_to_bridge(bridge_id, channel_id)
+                bridge_ok = True
+            except Exception:
+                logger.exception("Error agregando agente %s al bridge %s", channel_id, bridge_id)
+
             queue_uniqueid = call_id
-            id_camp = None
-            agent_id_for_event = None
+            id_camp: Optional[int] = None
+            agent_id_for_event: Optional[int] = None
+            phone_number: Optional[str] = None
             with self.state_store.lock(call_id):
                 fresh = self.state_store.get(call_id)
                 if not fresh:
                     return
-                fresh.agent_channel = channel_id
-                if not fresh.uniqueid_agent:
-                    fresh.uniqueid_agent = channel_id
-                if not fresh.agent_answered_ts:
-                    fresh.agent_answered_ts = datetime.now().isoformat()
-                if getattr(fresh, "is_voicebot", False):
-                    fresh.voicebot_leg_start_ts = fresh.agent_answered_ts
-                if agent_id_str:
-                    try:
-                        fresh.agent_id = int(agent_id_str)
-                    except (ValueError, TypeError):
-                        pass
+                if bridge_ok:
+                    fresh.agent_connected_channel = channel_id
+                    if fresh.agent_attempt_channel == channel_id:
+                        fresh.agent_attempt_channel = None
+                    if not fresh.uniqueid_agent:
+                        fresh.uniqueid_agent = channel_id
+                    if not fresh.agent_answered_ts:
+                        fresh.agent_answered_ts = datetime.now().isoformat()
+                    if getattr(fresh, "is_voicebot", False):
+                        fresh.voicebot_leg_start_ts = fresh.agent_answered_ts
+                    if agent_id_str:
+                        try:
+                            fresh.agent_id = int(agent_id_str)
+                        except (ValueError, TypeError):
+                            pass
+                else:
+                    if fresh.agent_attempt_channel == channel_id:
+                        fresh.agent_attempt_channel = None
                 self.state_store.register_unsafe(call_id, fresh)
-                bridge_id = fresh.bridge_id
                 id_camp = fresh.id_camp
                 agent_id_for_event = getattr(fresh, "agent_id", None)
                 queue_uniqueid = fresh.uniqueid_pstn or call_id
                 phone_number = getattr(fresh, "phone_number", None)
+
+            if not bridge_ok:
+                try:
+                    self.ari_client.hangup_channel(channel_id)
+                except Exception:
+                    pass
+                return
+
             if self.agent_status_service and agent_id_for_event and bridge_id:
                 try:
                     self.agent_status_service.set_oncall(
@@ -657,15 +705,10 @@ class ProgressiveCampaignHandler(BaseHandler):
                         agent_id_for_event,
                         call_id,
                     )
-            if bridge_id:
-                try:
-                    self.call_service.add_channel_to_bridge(bridge_id, channel_id)
-                except Exception:
-                    logger.exception("Error agregando agente %s al bridge %s", channel_id, bridge_id)
-                try:
-                    self.call_service.stop_moh_on_bridge(bridge_id)
-                except Exception:
-                    logger.exception("Error deteniendo MOH en bridge %s", bridge_id)
+            try:
+                self.call_service.stop_moh_on_bridge(bridge_id)
+            except Exception:
+                logger.exception("Error deteniendo MOH en bridge %s", bridge_id)
             if self.queue_event_manager and id_camp is not None:
                 try:
                     self.queue_event_manager.on_answered(
@@ -708,9 +751,7 @@ class ProgressiveCampaignHandler(BaseHandler):
             if not context:
                 return
             # Si el canal destruido es el leg de agente/voicebot (ya contestó), liberar cupo voicebot
-            agent_ch = getattr(context, "agent_channel", None)
-            uniqueid_agent = getattr(context, "uniqueid_agent", None)
-            is_agent_leg = channel_id == agent_ch or channel_id == uniqueid_agent
+            is_agent_leg = is_agent_leg_channel(context, channel_id)
             if is_agent_leg and getattr(context, "is_voicebot", False) and getattr(context, "id_camp", None) and getattr(context, "agent_id", None) is not None and self.redis_client:
                 try:
                     self.redis_client.decr(RedisKeys.voicebot_calls(str(context.id_camp), context.agent_id))
@@ -768,9 +809,7 @@ class ProgressiveCampaignHandler(BaseHandler):
             )
             if type_val != CallType.PROGRESSIVE.value:
                 return
-            agent_ch = getattr(context, "agent_channel", None)
-            uniqueid_agent = getattr(context, "uniqueid_agent", None)
-            is_agent_leg = agent_ch == channel_id or uniqueid_agent == channel_id
+            is_agent_leg = is_agent_leg_channel(context, channel_id)
             if not is_agent_leg:
                 return
             if getattr(context, "transfer_in_progress", False):
@@ -834,10 +873,9 @@ class ProgressiveCampaignHandler(BaseHandler):
                     self.ari_client.destroy_bridge(bridge_id)
                 except Exception:
                     pass
-            agent_channel = getattr(context, "agent_channel", None)
-            if agent_channel and str(agent_channel).strip():
+            for agent_leg in distinct_agent_leg_ids(context):
                 try:
-                    self.ari_client.hangup_channel(agent_channel)
+                    self.ari_client.hangup_channel(agent_leg)
                 except Exception:
                     pass
             self.distribution_service.stop_distribution(call_id)
@@ -903,7 +941,7 @@ class ProgressiveCampaignHandler(BaseHandler):
                 elif bridge_wait_time >= max(0, context.queue_timeout_seconds - 1):
                     treat_as_timeout = True
 
-            if not context.agent_channel:
+            if not active_agent_channel(context):
                 if treat_as_timeout:
                     if self.queue_event_manager:
                         try:

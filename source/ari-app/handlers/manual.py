@@ -6,7 +6,13 @@ from typing import Any, Optional, Dict, Union, Tuple
 
 from handlers.base import BaseHandler
 from state import CallContext
-from state_helpers import should_block_operation_for_transfer
+from state_helpers import (
+    active_agent_channel,
+    distinct_agent_leg_ids,
+    is_agent_leg_channel,
+    is_consult_initiator_channel,
+    should_block_operation_for_transfer,
+)
 from utils import compute_bot_agent_durations, parse_ari_args, determine_who_hung_up
 from config import settings
 from services.call_manager import CallActionService
@@ -360,7 +366,7 @@ class ManualCallHandler(BaseHandler):
             context = CallContext(
                 call_id=call_id,
                 type=CallType.MANUAL.value,
-                agent_channel=channel_id,
+                agent_connected_channel=channel_id,
                 pstn_channel=None,
                 bridge_id=bridge_id,
                 uniqueid_agent=uniqueid,
@@ -760,7 +766,7 @@ class ManualCallHandler(BaseHandler):
             fresh_context = self.state_store.get(call_id)
             if not fresh_context or not is_pstn_hangup_during_blind_transfer_ringing:
                 return
-            potential_transfer_ch = getattr(fresh_context, "agent_channel", None)
+            potential_transfer_ch = getattr(fresh_context, "agent_attempt_channel", None)
             uniqueid_agent = getattr(fresh_context, "uniqueid_agent", None)
             if (
                 potential_transfer_ch
@@ -837,10 +843,12 @@ class ManualCallHandler(BaseHandler):
             if trunk_callerid is not None:
                 call_data['numero_origen'] = trunk_callerid
         if channel_id:
-            if context.agent_channel == channel_id or context.uniqueid_agent == channel_id:
+            if is_agent_leg_channel(context, channel_id):
                 channel_leg = 'AGENT'
-                channel_leg_id = context.uniqueid_agent or context.agent_channel
-                channel_leg_name = context.agent_channel
+                channel_leg_id = context.uniqueid_agent or active_agent_channel(context)
+                channel_leg_name = active_agent_channel(context) or getattr(
+                    context, "agent_attempt_channel", None
+                )
                 channel_leg_answer_ts = context.agent_answered_ts
             else:
                 channel_leg = 'PSTN'
@@ -849,8 +857,10 @@ class ManualCallHandler(BaseHandler):
                 channel_leg_answer_ts = context.pstn_answered_ts
         else:
             channel_leg = 'AGENT'
-            channel_leg_id = context.uniqueid_agent or context.agent_channel
-            channel_leg_name = context.agent_channel
+            channel_leg_id = context.uniqueid_agent or active_agent_channel(context)
+            channel_leg_name = active_agent_channel(context) or getattr(
+                context, "agent_attempt_channel", None
+            )
             channel_leg_answer_ts = context.agent_answered_ts or context.pstn_answered_ts
         bot_duration, agent_duration = compute_bot_agent_durations(context, end_ts, duracion_llamada)
         logging.info(
@@ -980,10 +990,10 @@ class ManualCallHandler(BaseHandler):
         # Incluye llamada no contestada (BUSY, CONGESTION, CHANUNAVAIL, etc.): igual hay que
         # liberar el canal del agente y destruir el bridge.
         if quien_corto == 2:
-            if not (context.agent_channel and context.bridge_id):
+            if not getattr(context, "bridge_id", None):
                 return
             should_cleanup = False
-            agent_channel = None
+            agent_legs: list = []
             bridge_id = None
             with self.state_store.lock(context.call_id):
                 verification_context = self.state_store.get(context.call_id)
@@ -999,19 +1009,20 @@ class ManualCallHandler(BaseHandler):
                     )
                 else:
                     should_cleanup = True
-                    agent_channel = verification_context.agent_channel
+                    agent_legs = distinct_agent_leg_ids(verification_context)
                     bridge_id = verification_context.bridge_id
-            if not should_cleanup:
+            if not should_cleanup or not agent_legs:
                 return
-            if agent_channel and agent_channel.strip():
-                try:
-                    hangup_result = self.ari_client.hangup_channel(agent_channel)
-                    if hangup_result:
-                        logging.info(f"✅ Canal agente {agent_channel} colgado exitosamente (PSTN colgó)")
-                    else:
-                        logging.debug(f"⚠️ hangup_channel retornó False para canal agente {agent_channel}")
-                except Exception as e:
-                    logging.error(f"❌ Error al colgar canal agente {agent_channel}: {e}", exc_info=True)
+            for agent_leg in agent_legs:
+                if agent_leg and str(agent_leg).strip():
+                    try:
+                        hangup_result = self.ari_client.hangup_channel(agent_leg)
+                        if hangup_result:
+                            logging.info(f"✅ Canal agente {agent_leg} colgado exitosamente (PSTN colgó)")
+                        else:
+                            logging.debug(f"⚠️ hangup_channel retornó False para canal agente {agent_leg}")
+                    except Exception as e:
+                        logging.error(f"❌ Error al colgar canal agente {agent_leg}: {e}", exc_info=True)
             if bridge_id and bridge_id.strip():
                 try:
                     destroy_result = self.ari_client.destroy_bridge(bridge_id)
@@ -1102,8 +1113,8 @@ class ManualCallHandler(BaseHandler):
             )
 
             # 1) Proteger hangup del agente iniciador en transferencias consultativas
-            is_initiator_agent_channel_preview = bool(
-                channel_id and preview_ctx.uniqueid_agent == channel_id
+            is_initiator_agent_channel_preview = bool(channel_id) and is_consult_initiator_channel(
+                preview_ctx, channel_id
             )
             if getattr(preview_ctx, "ignore_next_agent_hangup", False) and is_initiator_agent_channel_preview:
                 logging.info(
@@ -1181,8 +1192,8 @@ class ManualCallHandler(BaseHandler):
                 #     * El hangup de A (uniqueid_agent) se ignora.
                 #     * El hangup de B (agent_channel) se procesa normalmente y puede
                 #       gatillar el cierre de la llamada y del leg PSTN.
-                is_initiator_agent_channel = bool(
-                    channel_id and fresh_context.uniqueid_agent == channel_id
+                is_initiator_agent_channel = bool(channel_id) and is_consult_initiator_channel(
+                    fresh_context, channel_id
                 )
                 if getattr(fresh_context, "ignore_next_agent_hangup", False) and is_initiator_agent_channel:
                     logging.info(
@@ -1222,12 +1233,7 @@ class ManualCallHandler(BaseHandler):
                 # 1. El canal que colgó es el del agente
                 # 2. PSTN no se conectó (pstn_answered_ts es None)
                 # 3. Existe un PSTN leg en progreso (pstn_channel no es None)
-                is_agent_channel = bool(
-                    channel_id and (
-                        fresh_context.agent_channel == channel_id
-                        or fresh_context.uniqueid_agent == channel_id
-                    )
-                )
+                is_agent_channel = bool(channel_id and is_agent_leg_channel(fresh_context, channel_id))
                 pstn_not_answered = fresh_context.pstn_answered_ts is None
                 pstn_leg_exists = fresh_context.pstn_channel is not None
 
@@ -1353,7 +1359,9 @@ class ManualCallHandler(BaseHandler):
 
                 # Para BridgeDestroyed, intentar usar el último canal conocido
                 # Si ambos canales existen, preferir el del agente
-                channel_id = context.agent_channel or context.pstn_channel
+                channel_id = active_agent_channel(context) or getattr(
+                    context, "agent_attempt_channel", None
+                ) or context.pstn_channel
                 cause = None  # No tenemos causa directa del bridge
                 cause_txt = None
             else:
@@ -1437,10 +1445,7 @@ class ManualCallHandler(BaseHandler):
                 # 1. El canal que colgó es el del agente
                 # 2. PSTN no se conectó (pstn_answered_ts es None)
                 # 3. Existe un PSTN leg en progreso (pstn_channel no es None)
-                is_agent_channel = (
-                    fresh_context.agent_channel == channel_id
-                    or fresh_context.uniqueid_agent == channel_id
-                )
+                is_agent_channel = is_agent_leg_channel(fresh_context, channel_id)
                 pstn_not_answered = fresh_context.pstn_answered_ts is None
                 pstn_leg_exists = fresh_context.pstn_channel is not None
 
@@ -1456,7 +1461,9 @@ class ManualCallHandler(BaseHandler):
                     bridge_id = fresh_context.bridge_id
                     logging.info(
                         f"🚫 Cancelación detectada antes de conectar PSTN: call_id={call_id}, "
-                        f"agent_channel={fresh_context.agent_channel}, pstn_channel={pstn_channel}, "
+                        f"agent_connected={fresh_context.agent_connected_channel}, "
+                        f"agent_attempt={getattr(fresh_context, 'agent_attempt_channel', None)}, "
+                        f"pstn_channel={pstn_channel}, "
                         f"bridge_id={bridge_id}"
                     )
                 elif (
@@ -1467,7 +1474,7 @@ class ManualCallHandler(BaseHandler):
                     # No colgar PSTN en transferencias: consultativa (iniciador cuelga) o en curso
                     and not (
                         getattr(fresh_context, "ignore_next_agent_hangup", False)
-                        and fresh_context.uniqueid_agent == channel_id
+                        and is_consult_initiator_channel(fresh_context, channel_id)
                     )
                     and not getattr(fresh_context, "transfer_in_progress", False)
                 ):

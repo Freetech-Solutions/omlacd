@@ -1,12 +1,111 @@
 import logging
 from contextlib import contextmanager
 from datetime import datetime
-from typing import Iterator, Optional, Tuple
+from typing import Any, Iterator, List, Optional, Tuple
 
 from state import CallRegistry, CallContext
 
 
 logger = logging.getLogger(__name__)
+
+
+def active_agent_channel(ctx: CallContext) -> Optional[str]:
+    """Canal del agente activo en la llamada (consolidado en bridge). Nunca el intento."""
+    return getattr(ctx, "agent_connected_channel", None) or None
+
+
+def queue_timeout_should_suppress_cleanup(ctx: CallContext) -> bool:
+    """
+    True si _on_queue_timeout no debe ejecutar cleanup destructivo (hangup PSTN/agente, bridge, etc.).
+
+    No basta con ``active_agent_channel`` (``agent_connected_channel``): Redis migrado desde el
+    modelo legacy o estados inconsistentes pueden tener un id en ``agent_connected_channel``
+    sin que la llamada esté realmente atendida en este runtime. En flujos inbound/progressive/voicebot
+    habituales, ``agent_answered_ts`` se persiste en el mismo ``register`` que la consolidación
+    tras ``add_channel_to_bridge`` OK.
+
+    Se exigen ambas señales: pierna consolidada en el modelo y timestamp de contestación del agente.
+    """
+    if not active_agent_channel(ctx):
+        return False
+    return bool(getattr(ctx, "agent_answered_ts", None))
+
+
+def is_consult_initiator_channel(context: CallContext, channel_id: str) -> bool:
+    """True si channel_id es el iniciador en transferencia consultiva activa (initiator_agent_ch o uniqueid_agent)."""
+    if not channel_id:
+        return False
+    cons = getattr(context, "consultation", None)
+    if cons and getattr(cons, "active", False) and getattr(cons, "initiator_agent_ch", None):
+        return channel_id == cons.initiator_agent_ch
+    return getattr(context, "uniqueid_agent", None) == channel_id
+
+
+def is_agent_leg_channel(context: CallContext, channel_id: str) -> bool:
+    """True si channel_id es pierna de agente (intento o conectada) o uniqueid_agent."""
+    if not channel_id:
+        return False
+    if getattr(context, "uniqueid_agent", None) == channel_id:
+        return True
+    ac = getattr(context, "agent_attempt_channel", None)
+    cc = getattr(context, "agent_connected_channel", None)
+    return channel_id == ac or channel_id == cc
+
+
+def distinct_agent_leg_ids(context: CallContext) -> List[str]:
+    """Intento y conectado, sin duplicados (para hangup / limpieza)."""
+    seen: set = set()
+    out: List[str] = []
+    for x in (getattr(context, "agent_attempt_channel", None), getattr(context, "agent_connected_channel", None)):
+        if x and str(x).strip() and x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+
+def effective_queue_campaign_id(ctx: CallContext) -> Optional[int]:
+    """
+    Campaña de cola operativa (eventos en vivo, stats ACD, voicebot-calls).
+    Tras blind_to_campaign difiere de id_camp (atribución CDR).
+    """
+    dist = getattr(ctx, "distribution_campaign_id", None)
+    if dist is not None:
+        return dist
+    return ctx.id_camp
+
+
+def call_transfer_routing_active(ctx: Any) -> bool:
+    """
+    True mientras hay transferencia en curso o blind con pierna pendiente de cierre de reporting,
+    o ya hubo una transferencia finalizada (is_transferred). Usar en router en lugar de is_transferred solo.
+    """
+    if getattr(ctx, "is_transferred", False):
+        return True
+    if getattr(ctx, "transfer_in_progress", False):
+        return True
+    if getattr(ctx, "blind_transfer_report_state", None) == "requested":
+        return True
+    return False
+
+
+def call_has_prior_agent_handling(ctx: Any) -> bool:
+    """
+    True si la llamada ya tuvo atención de agente y/o transferencias registradas en Redis.
+
+    Tras blind_to_campaign el agente se desvincula (agent_connected_channel=None) mientras el cliente
+    espera en la cola destino; no usar la ausencia de pierna de agente como proxy de «nunca atendida».
+    """
+    if getattr(ctx, "transfer_in_progress", False):
+        return True
+    if getattr(ctx, "is_transferred", False):
+        return True
+    try:
+        if int(getattr(ctx, "transfer_count", 0) or 0) > 0:
+            return True
+    except (TypeError, ValueError):
+        pass
+    segs = getattr(ctx, "agent_segments", None) or []
+    return bool(segs)
 
 
 def finalize_current_agent_segment(ctx: CallContext) -> float:
@@ -203,8 +302,10 @@ def is_channel_in_context(context: CallContext, channel_id: str) -> bool:
     channels = set()
 
     # 1. Canales principales
-    if context.agent_channel:
-        channels.add(context.agent_channel)
+    if context.agent_attempt_channel:
+        channels.add(context.agent_attempt_channel)
+    if context.agent_connected_channel:
+        channels.add(context.agent_connected_channel)
     if context.pstn_channel:
         channels.add(context.pstn_channel)
     if context.uniqueid_agent:
@@ -226,6 +327,11 @@ def is_channel_in_context(context: CallContext, channel_id: str) -> bool:
     # 4. Otros canales asociados
     if context.other_channels:
         channels.update(context.other_channels)
+
+    # Pierna de blind transfer pendiente de consolidación/reporte
+    btl = getattr(context, "blind_transfer_leg_id", None)
+    if btl:
+        channels.add(btl)
 
     return channel_id in channels
 

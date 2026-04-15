@@ -65,7 +65,7 @@ class TestConsultativeTransferFlow(unittest.TestCase):
 
         1. A ↔ PSTN en bridge principal.
         2. Se completa una transferencia consultiva hacia B (estado post-consult_complete):
-           - ctx.agent_channel -> canal de B.
+           - ctx.agent_connected_channel -> canal de B.
            - ctx.uniqueid_agent -> canal de A (iniciador).
            - ctx.is_transferred = True.
            - ctx.ignore_next_agent_hangup = True.
@@ -91,13 +91,18 @@ class TestConsultativeTransferFlow(unittest.TestCase):
         fresh_ctx.call_id = call_id
         fresh_ctx.type = MagicMock()
         fresh_ctx.type.value = CallType.MANUAL.value
-        fresh_ctx.agent_channel = current_agent_ch
+        fresh_ctx.agent_connected_channel = current_agent_ch
+        fresh_ctx.agent_attempt_channel = None
         fresh_ctx.uniqueid_agent = initiator_ch
         fresh_ctx.pstn_channel = pstn_channel
         fresh_ctx.uniqueid_pstn = None
         fresh_ctx.bridge_id = bridge_id
         fresh_ctx.is_transferred = True
         fresh_ctx.ignore_next_agent_hangup = True
+        # Evitar hijos MagicMock truthy en campos opcionales (is_channel_in_context / consulta).
+        fresh_ctx.consultation = None
+        fresh_ctx.snoop_channels = []
+        fresh_ctx.other_channels = []
 
         # El índice por canal encuentra el contexto inicialmente
         self.mock_state_store.get_by_channel.return_value = fresh_ctx
@@ -119,12 +124,12 @@ class TestConsultativeTransferFlow(unittest.TestCase):
         self.mock_ari_client.destroy_bridge.assert_not_called()
 
         # Debe haberse persistido el consumo del flag ignore_next_agent_hangup
-        self.mock_state_store.register.assert_called_with(call_id, fresh_ctx)
+        self.mock_state_store.register_unsafe.assert_called_with(call_id, fresh_ctx)
 
         # Preparar para segundo escenario: hangup de B
         self.mock_ari_client.hangup_channel.reset_mock()
         self.mock_ari_client.destroy_bridge.reset_mock()
-        self.mock_state_store.register.reset_mock()
+        self.mock_state_store.register_unsafe.reset_mock()
         fresh_ctx.ignore_next_agent_hangup = False
 
         # Acto 2: hangup del agente actual B

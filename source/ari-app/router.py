@@ -27,9 +27,11 @@ from services.legacy_forwarder import LegacyEventForwarder
 from services.agent_status_service import AgentStatusService
 from handlers.recording import RecordingEventHandler
 from queue_events import QueueEventManager
-from state import CallRegistry
+from state import CallRegistry, TRANSFER_PHASE_ANSWERED, TRANSFER_PHASE_REQUESTED
 from config import settings
 from state_helpers import (
+    active_agent_channel,
+    call_transfer_routing_active,
     locked_context_by_channel,
     is_channel_in_context,
     should_block_operation_for_transfer,
@@ -371,7 +373,7 @@ class AcDRouter:
                 )
             return
 
-        # take_call_leg: supervisor toma la llamada; añadir al bridge, quitar y colgar agente, actualizar ctx.agent_channel
+        # take_call_leg: supervisor toma la llamada; añadir al bridge, quitar y colgar agente, actualizar ctx.agent_connected_channel
         if args_dict.get('take_call_leg') == 'true':
             bridge_id = args_dict.get('bridge_id')
             call_id = args_dict.get('customer_id')
@@ -396,7 +398,8 @@ class AcDRouter:
                 with self.state_store.lock(call_id):
                     ctx = self.state_store.get(call_id)
                     if ctx and ctx.bridge_id == bridge_id:
-                        ctx.agent_channel = channel_id
+                        ctx.agent_connected_channel = channel_id
+                        ctx.agent_attempt_channel = None
                         self.state_store.register_unsafe(call_id, ctx)
                 self.logger.info(
                     f"take_call_leg: canal {channel_id} añadido al bridge {bridge_id}, agente {agent_channel} colgado, call_id={call_id}"
@@ -663,7 +666,7 @@ class AcDRouter:
         phone_number = None
         should_update_agent_status = False
         call_type = None
-        call_id = None
+        call_id: Optional[str] = None
 
         with locked_context_by_channel(
             self.state_store,
@@ -686,6 +689,25 @@ class AcDRouter:
                 )
                 return
 
+            # Consultiva: registrar Up de la pierna consultada aunque transfer_in_progress bloquee el resto.
+            cons = getattr(fresh_context, "consultation", None)
+            if (
+                cons
+                and getattr(cons, "active", False)
+                and getattr(cons, "consult_leg_ch", None) == channel_id
+            ):
+                if not getattr(cons, "consult_leg_answered_ts", None):
+                    cons.consult_leg_answered_ts = datetime.now().astimezone().isoformat()
+                    if getattr(fresh_context, "transfer_phase", None) == TRANSFER_PHASE_REQUESTED:
+                        fresh_context.transfer_phase = TRANSFER_PHASE_ANSWERED
+                    self.state_store.register_unsafe(call_id, fresh_context)
+                    self.logger.info(
+                        "ChannelStateChange: consult_leg_answered_ts para call_id=%s channel_id=%s",
+                        call_id,
+                        channel_id,
+                    )
+                return
+
             # Política estándar para transfer_in_progress
             if should_block_operation_for_transfer(
                 fresh_context,
@@ -695,8 +717,9 @@ class AcDRouter:
                 return
 
             # Verificar condiciones dentro del lock
-            is_transferred = fresh_context.is_transferred
-            agent_channel = fresh_context.agent_channel
+            transfer_routing_active = call_transfer_routing_active(fresh_context)
+            agent_channel = active_agent_channel(fresh_context)
+            attempt_ch = getattr(fresh_context, "agent_attempt_channel", None)
             call_type = (
                 fresh_context.type.value
                 if hasattr(fresh_context.type, "value")
@@ -704,7 +727,7 @@ class AcDRouter:
             )
 
             # Blind transfer update agent status - copiar valores necesarios dentro del lock
-            if is_transferred and agent_channel == channel_id:
+            if transfer_routing_active and (agent_channel == channel_id or attempt_ch == channel_id):
                 # Copiar todos los valores necesarios a variables locales dentro del lock
                 target_agent_id = fresh_context.target_agent_id
                 bridge_id = fresh_context.bridge_id
@@ -750,6 +773,22 @@ class AcDRouter:
             handler = self.handlers.get(call_type)
             if handler:
                 handler.on_up(event)
+
+        # Blind transfer: OK final si el destino pasó a Up después de un bridge exitoso
+        if self.transfer_manager and call_id and channel_id:
+            try:
+                self.transfer_manager.try_finalize_blind_transfer_on_destination_up(
+                    call_id, channel_id
+                )
+            except Exception as e:
+                self.logger.error(
+                    "try_finalize_blind_transfer_on_destination_up "
+                    "(call_id=%s channel_id=%s): %s",
+                    call_id,
+                    channel_id,
+                    e,
+                    exc_info=True,
+                )
 
     def _cleanup_old_pstn_answer_ts(self) -> None:
         """Elimina entradas con timestamp mayor a _pstn_answer_ts_max_age_sec para evitar crecimiento indefinido."""
@@ -974,6 +1013,7 @@ class AcDRouter:
         # usando mark_call_ended_atomic() para garantizar atomicidad
 
         call_type = None
+        recover_blind_fail_call_id: Optional[str] = None
 
         with locked_context_by_channel(
             self.state_store,
@@ -1008,46 +1048,100 @@ class AcDRouter:
                 )
                 return
 
-            # Protección adicional para transferencias (blind / consultativa completada):
-            # Si la llamada ya fue marcada como transferida (`is_transferred=True`) y el canal
+            # Protección adicional para transferencias (blind / consultativa en curso o ya finalizada):
+            # Si call_transfer_routing_active (is_transferred, transfer_in_progress o blind requested) y el canal
             # destruido corresponde al agente iniciador (uniqueid_agent), pero el canal de
-            # agente actual (`agent_channel`) es distinto, ignoramos este evento de destrucción.
+            # agente actual conectado es distinto, ignoramos este evento de destrucción.
             #
             # De esta forma garantizamos que el cierre lógico de la llamada (_process_call_end)
             # se dispare únicamente por los legs activos (agente destino o PSTN), cuando ya
             # existe todo el contexto necesario para resolver correctamente EXIT_ANSWERED en
             # escenarios de transferencia.
-            is_transferred = getattr(fresh_context, "is_transferred", False)
-            initiator_agent_ch = getattr(fresh_context, "uniqueid_agent", None)
-            current_agent_ch = getattr(fresh_context, "agent_channel", None)
+            transfer_routing_active = call_transfer_routing_active(fresh_context)
+            cons = getattr(fresh_context, "consultation", None)
+            if cons and getattr(cons, "active", False) and getattr(cons, "initiator_agent_ch", None):
+                initiator_agent_ch = cons.initiator_agent_ch
+            else:
+                initiator_agent_ch = getattr(fresh_context, "uniqueid_agent", None)
+            current_agent_ch = active_agent_channel(fresh_context)
             if (
-                is_transferred
+                transfer_routing_active
                 and initiator_agent_ch
                 and channel_id == initiator_agent_ch
                 and channel_id != current_agent_ch
             ):
                 self.logger.info(
                     "ChannelDestroyed: Ignorando destrucción del canal del agente iniciador "
-                    "para llamada %s en transferencia (agent_channel actual=%s)",
+                    "para llamada %s en transferencia (agent_connected_channel actual=%s)",
                     call_id,
                     current_agent_ch,
                 )
                 return
 
-            # Política estándar para transfer_in_progress
-            if should_block_operation_for_transfer(
-                fresh_context,
-                log=self.logger,
-                operation="ChannelDestroyed",
+            # Blind transfer: pierna originada destruida antes de OK final (timeout, colgado, etc.)
+            if (
+                self.transfer_manager
+                and getattr(fresh_context, "blind_transfer_leg_id", None) == channel_id
+                and getattr(fresh_context, "blind_transfer_report_state", None) == "requested"
             ):
-                return
+                cause = getattr(event.channel, "cause", None)
+                cause_txt = getattr(event.channel, "cause_txt", None)
+                parts_bt: List[str] = []
+                if cause_txt:
+                    parts_bt.append(str(cause_txt))
+                if cause is not None:
+                    parts_bt.append(str(cause))
+                sip_reason_bt = (
+                    "; ".join(parts_bt) if parts_bt else "transfer_leg_destroyed"
+                )
+                try:
+                    if self.transfer_manager._on_blind_transfer_leg_destroyed_locked(
+                        fresh_context,
+                        call_id,
+                        channel_id,
+                        sip_reason_bt,
+                    ):
+                        recover_blind_fail_call_id = call_id
+                except Exception as e:
+                    self.logger.error(
+                        "Error en TransferManager._on_blind_transfer_leg_destroyed_locked "
+                        "(call_id=%s channel_id=%s): %s",
+                        call_id,
+                        channel_id,
+                        e,
+                        exc_info=True,
+                    )
 
-            # Leer tipo de llamada dentro del mismo contexto bloqueado
-            call_type = (
-                fresh_context.type.value
-                if hasattr(fresh_context.type, "value")
-                else fresh_context.type
-            )
+            if recover_blind_fail_call_id is None:
+                # Política estándar para transfer_in_progress
+                if should_block_operation_for_transfer(
+                    fresh_context,
+                    log=self.logger,
+                    operation="ChannelDestroyed",
+                ):
+                    return
+
+                # Leer tipo de llamada dentro del mismo contexto bloqueado
+                call_type = (
+                    fresh_context.type.value
+                    if hasattr(fresh_context.type, "value")
+                    else fresh_context.type
+                )
+
+        if recover_blind_fail_call_id and self.transfer_manager:
+            try:
+                self.transfer_manager.recover_after_blind_transfer_leg_failed(
+                    recover_blind_fail_call_id
+                )
+            except Exception as e:
+                self.logger.error(
+                    "Error en TransferManager.recover_after_blind_transfer_leg_failed "
+                    "(call_id=%s): %s",
+                    recover_blind_fail_call_id,
+                    e,
+                    exc_info=True,
+                )
+            return
 
         # Verificar tipo fuera del lock (ya leído dentro del lock) y despachar al handler correspondiente
         if call_type == CallType.MANUAL.value:
@@ -1273,17 +1367,21 @@ class AcDRouter:
                 # Leer todos los valores necesarios dentro del mismo lock
                 pstn_channel = fresh_context.pstn_channel
                 uniqueid_pstn = fresh_context.uniqueid_pstn
-                agent_channel = fresh_context.agent_channel
+                agent_connected = fresh_context.agent_connected_channel
+                agent_attempt = getattr(fresh_context, "agent_attempt_channel", None)
                 uniqueid_agent = fresh_context.uniqueid_agent
                 bridge_id = fresh_context.bridge_id
+                agent_channel = agent_connected or agent_attempt
 
                 # Identificar si es el canal PSTN
                 is_pstn_channel = (pstn_channel == channel_id) or (uniqueid_pstn == channel_id)
 
                 # Construir conjunto de canales principales conocidos dentro del mismo lock
                 # para evitar tener que recargar el contexto después
-                if agent_channel:
-                    known_main_channels.add(agent_channel)
+                if agent_connected:
+                    known_main_channels.add(agent_connected)
+                if agent_attempt:
+                    known_main_channels.add(agent_attempt)
                 if pstn_channel:
                     known_main_channels.add(pstn_channel)
                 if uniqueid_agent:
@@ -1369,10 +1467,10 @@ class AcDRouter:
             )
             return
         
-        # Si no hay bridge_id o agent_channel, no podemos hacer nada
+        # Si no hay bridge_id o pierna de agente conocida, no podemos hacer nada
         if not bridge_id or not agent_channel:
             self.logger.debug(
-                f"StasisEnd: No hay bridge_id o agent_channel para llamada {call_id}, ignorando"
+                f"StasisEnd: No hay bridge_id o pierna de agente para llamada {call_id}, ignorando"
             )
             return
         

@@ -14,6 +14,7 @@ from ari_manager import ARI
 from config import settings
 from constants import CallType, ChannelType
 from state import CallContext
+from state_helpers import is_agent_leg_channel
 
 
 class RecordingService:
@@ -199,7 +200,7 @@ class RecordingService:
             ChannelType si se puede determinar, None en caso contrario
         """
         # Comparar con los canales conocidos en el contexto (por nombre)
-        if context.agent_channel and channel_id == context.agent_channel:
+        if is_agent_leg_channel(context, channel_id):
             return ChannelType.TO_AGENT
         
         if context.pstn_channel and channel_id == context.pstn_channel:

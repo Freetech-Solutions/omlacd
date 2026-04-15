@@ -15,7 +15,11 @@ sys.modules.setdefault("redis", MagicMock())
 
 from constants import CallType  # noqa: E402
 from state import CallContext  # noqa: E402
-from state_helpers import finalize_current_agent_segment  # noqa: E402
+from state_helpers import (  # noqa: E402
+    call_has_prior_agent_handling,
+    call_transfer_routing_active,
+    finalize_current_agent_segment,
+)
 
 
 class TestFinalizeCurrentAgentSegment(unittest.TestCase):
@@ -69,6 +73,37 @@ class TestFinalizeCurrentAgentSegment(unittest.TestCase):
             d = finalize_current_agent_segment(ctx)
         self.assertGreaterEqual(d, 4.999)
         self.assertEqual(len(ctx.agent_segments), 1)
+
+
+class TestTransferRoutingHelpers(unittest.TestCase):
+    def test_call_transfer_routing_active_during_blind_requested(self):
+        ctx = CallContext(
+            call_id="c1",
+            type=CallType.INBOUND,
+            is_transferred=False,
+            transfer_in_progress=False,
+            blind_transfer_report_state="requested",
+        )
+        self.assertTrue(call_transfer_routing_active(ctx))
+
+    def test_call_transfer_routing_active_while_transfer_in_progress(self):
+        ctx = CallContext(
+            call_id="c1",
+            type=CallType.INBOUND,
+            transfer_in_progress=True,
+        )
+        self.assertTrue(call_transfer_routing_active(ctx))
+
+    def test_call_has_prior_agent_handling_during_transfer_in_progress(self):
+        ctx = CallContext(
+            call_id="c1",
+            type=CallType.INBOUND,
+            transfer_in_progress=True,
+            is_transferred=False,
+            transfer_count=0,
+            agent_segments=[],
+        )
+        self.assertTrue(call_has_prior_agent_handling(ctx))
 
 
 if __name__ == "__main__":

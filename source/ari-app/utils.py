@@ -9,6 +9,19 @@ from constants import CallType
 
 logger = logging.getLogger(__name__)
 
+
+def _is_agent_leg_for_hangup(context: Any, channel_id: str) -> bool:
+    """True si channel_id es pierna de agente (intento o conectada) o uniqueid_agent."""
+    if not channel_id:
+        return False
+    if getattr(context, "uniqueid_agent", None) == channel_id:
+        return True
+    for attr in ("agent_attempt_channel", "agent_connected_channel"):
+        ch = getattr(context, attr, None)
+        if ch and ch == channel_id:
+            return True
+    return False
+
 T = TypeVar('T')
 
 # Default de agent_answered_ts_override: leer context.agent_answered_ts
@@ -374,19 +387,17 @@ def determine_who_hung_up(channel_id: str, context: Any) -> int:
     """
     Determina quién cortó la llamada a partir del canal que se destruyó y el contexto.
 
-    context debe ser un objeto con atributos opcionales: agent_channel, uniqueid_agent,
-    pstn_channel, uniqueid_pstn (p. ej. CallContext). Se usa getattr para compatibilidad.
+    context debe ser un objeto con atributos opcionales: agent_attempt_channel, agent_connected_channel,
+    uniqueid_agent, pstn_channel, uniqueid_pstn (p. ej. CallContext). Se usa getattr para compatibilidad.
 
     Returns:
-        1 si cortó el agente (channel_id coincide con agent_channel o uniqueid_agent),
+        1 si cortó el agente (pierna de agente o uniqueid_agent),
         2 si cortó el cliente/PSTN (channel_id coincide con pstn_channel o uniqueid_pstn),
         0 si fue el sistema u otro (no coincide con ninguno).
     """
-    agent_channel = getattr(context, "agent_channel", None)
-    uniqueid_agent = getattr(context, "uniqueid_agent", None)
     pstn_channel = getattr(context, "pstn_channel", None)
     uniqueid_pstn = getattr(context, "uniqueid_pstn", None)
-    if agent_channel == channel_id or uniqueid_agent == channel_id:
+    if _is_agent_leg_for_hangup(context, channel_id):
         return 1  # Agente
     if pstn_channel == channel_id or uniqueid_pstn == channel_id:
         return 2  # Cliente/PSTN

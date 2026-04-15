@@ -7,7 +7,9 @@ import pytest
 # Asegurar que source/ari-app esté en el path (conftest también lo hace, pero
 # lo dejamos explícito para ejecución directa de este módulo).
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "ari-app"))
+sys.modules.setdefault("gearman", MagicMock())
 
+from constants import CallType  # noqa: E402
 from handlers.inbound import InboundCallHandler  # noqa: E402
 from services.queue_strategy import AgentProfile, AgentStatus  # noqa: E402
 
@@ -293,4 +295,52 @@ def test_on_pstn_stasis_end_detiene_loop_y_cancela_timer(
     # El leg de agente actual debe colgarse y limpiarse de current_agent_channel
     mock_ari_client.hangup_channel.assert_called_once_with("agent-chan-123")
     assert handler.current_agent_channel is None
+
+
+def test_on_hangup_request_does_not_hang_pstn_when_only_attempt_leg_hangs_up(mock_ari_client, mock_redis):
+    """
+    ChannelHangupRequest sobre agent_attempt_channel (rechazo de ring) no debe colgar PSTN
+    ni destruir bridge: eso era un bug que mataba la cola antes de contestar.
+    """
+    state_store = MagicMock()
+    context = MagicMock()
+    context.call_id = "c1"
+    context.type = MagicMock()
+    context.type.value = CallType.INBOUND.value
+    context.agent_attempt_channel = "attempt-ch"
+    context.agent_connected_channel = None
+    context.uniqueid_agent = None
+    context.pstn_channel = "pstn-1"
+    context.bridge_id = "br-1"
+    context.transfer_in_progress = False
+    context.voicebot_transfer_waiting = False
+    context.ignore_next_agent_hangup = False
+
+    state_store.get_by_channel.return_value = context
+    cm = MagicMock()
+    cm.__enter__ = MagicMock(return_value=None)
+    cm.__exit__ = MagicMock(return_value=False)
+    state_store.lock.return_value = cm
+    state_store.get.return_value = context
+
+    handler = InboundCallHandler(
+        ari_client=mock_ari_client,
+        state_store=state_store,
+        reporter=None,
+        call_service=MagicMock(),
+        queue_strategy_engine=MagicMock(),
+        redis_client=mock_redis,
+        queue_event_manager=None,
+        distribution_service=MagicMock(),
+        agent_status_service=None,
+    )
+
+    event = MagicMock()
+    event.channel = MagicMock()
+    event.channel.id = "attempt-ch"
+
+    handler.on_hangup_request(event)
+
+    mock_ari_client.hangup_channel.assert_not_called()
+    mock_ari_client.destroy_bridge.assert_not_called()
 

@@ -4,6 +4,13 @@ from unittest.mock import MagicMock, patch
 import sys
 import os
 
+# Settings() se evalúa al importar config (tests con pydantic real).
+os.environ.setdefault("ARI_USER", "test")
+os.environ.setdefault("ARI_PASSWORD", "test")
+os.environ.setdefault("ARI_APP", "test_app")
+os.environ.setdefault("ARI_URL", "http://127.0.0.1:8088")
+os.environ.setdefault("REDIS_URL", "redis://127.0.0.1:6379/0")
+
 # Add mocked modules to sys.modules to avoid ImportError if dependencies are missing in the env
 # usage of mocked modules for generic imports that might fail
 
@@ -16,26 +23,37 @@ mock_adapters = MagicMock()
 mock_adapters.HTTPAdapter = MagicMock
 mock_requests.adapters = mock_adapters
 
-sys.modules['redis'] = MagicMock()
+try:
+    import redis as _redis_check  # noqa: F401
+except ImportError:
+    sys.modules["redis"] = MagicMock()
+
 sys.modules['requests'] = mock_requests
 sys.modules['requests.exceptions'] = mock_exceptions
 sys.modules['requests.adapters'] = mock_adapters
 sys.modules['gearman'] = MagicMock()
 
-# Mock pydantic
-class MockBaseModel:
-    def __init__(self, **kwargs):
-        for k, v in kwargs.items():
-            setattr(self, k, v)
-    def model_dump_json(self):
-        return "{}"
-    @classmethod
-    def model_validate_json(cls, json_data):
-        return cls()
+# Mock pydantic solo si no está instalado (evita romper pydantic_settings / config con venv real).
+try:
+    import pydantic as _pydantic_check  # noqa: F401
 
-mock_pydantic = MagicMock()
-mock_pydantic.BaseModel = MockBaseModel
-sys.modules['pydantic'] = mock_pydantic
+    _pydantic_check.BaseModel  # noqa: B018
+except (ImportError, AttributeError):
+    class MockBaseModel:
+        def __init__(self, **kwargs):
+            for k, v in kwargs.items():
+                setattr(self, k, v)
+
+        def model_dump_json(self):
+            return "{}"
+
+        @classmethod
+        def model_validate_json(cls, json_data):
+            return cls()
+
+    mock_pydantic = MagicMock()
+    mock_pydantic.BaseModel = MockBaseModel
+    sys.modules["pydantic"] = mock_pydantic
 
 # Determine the project root to adjust sys.path
 # We assume this script is in source/tests_unit/
@@ -45,7 +63,7 @@ ari_app_dir = os.path.join(source_dir, 'ari-app')
 sys.path.insert(0, ari_app_dir)
 
 from handlers.manual import ManualCallHandler
-from transfer import TransferManager, ConsultationData
+from transfer import TransferManager
 from state import CallContext, CallType
 # settings might depend on other things, we might need to mock config
 with patch.dict('sys.modules', {'config': MagicMock(), 'config.settings': MagicMock()}):
@@ -70,12 +88,14 @@ class TestRedisUpdates(unittest.TestCase):
         """
         # Setup mocks
         mock_datetime.now.return_value.timestamp.return_value = 1234567890
-        
+        mock_agent_status = MagicMock()
+
         handler = ManualCallHandler(
             ari_client=self.mock_ari_client,
             state_store=self.mock_state_store,
             reporter=self.mock_reporter,
-            redis_client=self.mock_redis
+            redis_client=self.mock_redis,
+            agent_status_service=mock_agent_status,
         )
         
         # Helper to simulate ManualCallHandler._call_metadata
@@ -96,7 +116,10 @@ class TestRedisUpdates(unittest.TestCase):
         
         # Mock Context
         context = MagicMock()
-        context.agent_channel = agent_channel_id
+        context.agent_connected_channel = agent_channel_id
+        context.agent_id = int(agent_id)
+        context.bridge_id = bridge_id
+        context.transfer_in_progress = False
         context.uniqueid_agent = uniqueid_agent
         context.uniqueid_pstn = uniqueid_pstn
         context.call_id = original_call_id
@@ -105,6 +128,7 @@ class TestRedisUpdates(unittest.TestCase):
         
         # Setup state_store behavior
         self.mock_state_store.get_by_bridge_id.return_value = context
+        self.mock_state_store.get.return_value = context
         self.mock_state_store.get_all.return_value = {original_call_id: context}
         
         # Event for PSTN leg start
@@ -117,26 +141,13 @@ class TestRedisUpdates(unittest.TestCase):
         with patch.object(handler, '_parse_args_list', return_value=['channel_type:to_pstn', f'bridge_id:{bridge_id}']):
              handler.on_start(event)
              
-        # Verification
-        self.mock_redis.hset.assert_called()
-        
-        # Check call arguments
-        args, kwargs = self.mock_redis.hset.call_args
-        key = args[0]
-        mapping = kwargs['mapping']
-        
-        self.assertEqual(key, f"OML:AGENT:{agent_id}")
-        self.assertEqual(mapping['STATUS'], "ONCALL")
-        self.assertEqual(mapping['CALLID'], original_call_id)
-        # CAMPAIGN and CONTACT_NUMBER should be set
-        self.assertEqual(mapping['CAMPAIGN'], str(id_camp))
-        self.assertEqual(mapping['CONTACT_NUMBER'], phone_number)
-        # AGENT_CHANNEL_ID and PSTN_CHANNEL_ID should NOT be in the mapping
-        self.assertNotIn('AGENT_CHANNEL_ID', mapping)
-        self.assertNotIn('PSTN_CHANNEL_ID', mapping)
-        
-        # Verify that hdel was called to remove these keys
-        self.mock_redis.hdel.assert_called_once_with(key, "AGENT_CHANNEL_ID", "PSTN_CHANNEL_ID")
+        mock_agent_status.set_oncall.assert_called_once_with(
+            agent_id=int(agent_id),
+            call_id=original_call_id,
+            bridge_id=bridge_id,
+            campaign_id=id_camp,
+            contact_number=phone_number,
+        )
 
     @patch('transfer.time')
     def test_consult_complete_redis_update(self, mock_time):
@@ -152,7 +163,7 @@ class TestRedisUpdates(unittest.TestCase):
         manager = TransferManager(
             state_store=self.mock_state_store,
             ari_client=self.mock_ari_client,
-            reporter=self.mock_reporter
+            reporter=self.mock_reporter,
         )
         
         # Test Data
@@ -170,6 +181,10 @@ class TestRedisUpdates(unittest.TestCase):
         mock_ctx = MagicMock()
         mock_ctx.call_id = call_id
         mock_ctx.bridge_id = main_bridge
+        mock_ctx.agent_id = 1001
+        mock_ctx.agent_answered_ts = "2024-01-01T10:00:00+00:00"
+        mock_ctx.agent_segments = []
+        mock_ctx.transfer_count = 0
         mock_ctx.uniqueid_pstn = uniqueid_pstn
         mock_ctx.pstn_channel = pstn_channel
         mock_ctx.id_camp = id_camp
@@ -181,41 +196,74 @@ class TestRedisUpdates(unittest.TestCase):
         mock_ctx.consultation.initiator_agent_ch = 'agent-a'
         mock_ctx.consultation.consult_leg_ch = agent_b_ch
         mock_ctx.consultation.target_agent_id = target_agent_id
-        mock_ctx.consultation.target_agent_uniqueid = target_agent_uniqueid 
-        
+        mock_ctx.consultation.target_agent_uniqueid = target_agent_uniqueid
+        # Evidencia de answer (ChannelStateChange Up); sin esto un MagicMock sería truthy por error
+        mock_ctx.consultation.consult_leg_answered_ts = "2024-01-01T10:00:01+00:00"
+
         self.mock_state_store.get.return_value = mock_ctx
-        
+
         # Execute
         manager.consult_complete(call_id)
         
-        # Verification
-        self.mock_redis.hset.assert_called()
-        
-        # Find the call for the target agent
-        found = False
-        agent_key = f"OML:AGENT:{target_agent_id}"
-        for call_args in self.mock_redis.hset.call_args_list:
-            args, kwargs = call_args
-            key = args[0]
-            if key == agent_key:
-                found = True
-                mapping = kwargs['mapping']
-                self.assertEqual(mapping['STATUS'], "ONCALL")
-                self.assertEqual(mapping['CALLID'], call_id)
-                # CAMPAIGN and CONTACT_NUMBER should be set
-                self.assertEqual(mapping['CAMPAIGN'], str(id_camp))
-                self.assertEqual(mapping['CONTACT_NUMBER'], phone_number)
-                # AGENT_CHANNEL_ID and PSTN_CHANNEL_ID should NOT be in the mapping
-                self.assertNotIn('AGENT_CHANNEL_ID', mapping)
-                self.assertNotIn('PSTN_CHANNEL_ID', mapping)
-                
-        self.assertTrue(found, "Redis HSET for target agent not called")
-        
-        # Verify that hdel was called to remove these keys
-        hdel_calls = [call for call in self.mock_redis.hdel.call_args_list 
-                     if call[0][0] == agent_key]
-        self.assertTrue(len(hdel_calls) > 0, "Redis HDEL for target agent not called")
-        self.assertEqual(hdel_calls[0][0][1:], ("AGENT_CHANNEL_ID", "PSTN_CHANNEL_ID"))
+        self.mock_ari_client.add_channel_to_bridge.assert_called_with(main_bridge, agent_b_ch)
+        self.mock_ari_client.hangup_channel.assert_called_with("agent-a")
+        self.assertEqual(mock_ctx.agent_connected_channel, agent_b_ch)
+        self.assertIsNone(mock_ctx.consultation)
+        self.assertEqual(mock_ctx.agent_id, target_agent_id)
+        self.assertTrue(self.mock_state_store.register_unsafe.called)
+
+    def test_consult_complete_rejects_when_consult_leg_not_up(self):
+        """
+        Sin consult_leg_answered_ts y con ARI !Up, consult_complete no debe colgar al iniciador
+        ni promover agent_connected_channel.
+        """
+        self.mock_state_store.lock.return_value.__enter__.return_value = None
+
+        manager = TransferManager(
+            state_store=self.mock_state_store,
+            ari_client=self.mock_ari_client,
+            reporter=self.mock_reporter,
+        )
+
+        call_id = "call-123"
+        main_bridge = "bridge-1"
+        agent_b_ch = "agent-b-ch"
+        pstn_channel = "pstn-ch-1"
+        uniqueid_pstn = "unique-pstn-1"
+        target_agent_id = 1002
+        id_camp = 456
+        phone_number = "9876543210"
+
+        mock_ctx = MagicMock()
+        mock_ctx.call_id = call_id
+        mock_ctx.bridge_id = main_bridge
+        mock_ctx.agent_id = 1001
+        mock_ctx.agent_answered_ts = "2024-01-01T10:00:00+00:00"
+        mock_ctx.agent_segments = []
+        mock_ctx.transfer_count = 0
+        mock_ctx.uniqueid_pstn = uniqueid_pstn
+        mock_ctx.pstn_channel = pstn_channel
+        mock_ctx.id_camp = id_camp
+        mock_ctx.phone_number = phone_number
+        mock_ctx.consultation = MagicMock()
+        mock_ctx.consultation.active = True
+        mock_ctx.consultation.main_bridge = main_bridge
+        mock_ctx.consultation.consult_bridge = "cons-bridge"
+        mock_ctx.consultation.initiator_agent_ch = "agent-a"
+        mock_ctx.consultation.consult_leg_ch = agent_b_ch
+        mock_ctx.consultation.target_agent_id = target_agent_id
+        mock_ctx.consultation.consult_leg_answered_ts = None
+
+        self.mock_state_store.get.return_value = mock_ctx
+        self.mock_ari_client.get_channel_details.return_value = {"state": "Ringing"}
+
+        result = manager.consult_complete(call_id)
+
+        self.assertFalse(result)
+        self.mock_ari_client.get_channel_details.assert_called_with(agent_b_ch)
+        self.mock_ari_client.hangup_channel.assert_not_called()
+        self.mock_ari_client.add_channel_to_bridge.assert_not_called()
+        self.assertIsNotNone(mock_ctx.consultation)
 
     @patch('handlers.manual.datetime')
     def test_consultative_transfer_complete_ignores_old_agent_channel_destroyed(self, mock_datetime):
@@ -254,7 +302,7 @@ class TestRedisUpdates(unittest.TestCase):
         # Simular que context.type es un Enum con atributo 'value'
         context.type = MagicMock()
         context.type.value = CallType.MANUAL.value
-        context.agent_channel = agent_b_channel  # Nuevo agente
+        context.agent_connected_channel = agent_b_channel  # Nuevo agente
         context.pstn_channel = pstn_channel
         context.bridge_id = bridge_id
         context.transfer_in_progress = False  # Ya se completó la transferencia
@@ -357,7 +405,7 @@ class TestRedisUpdates(unittest.TestCase):
         context.type = MagicMock()
         context.type.value = CallType.MANUAL.value
         # El nuevo agente es B, pero el uniqueid del agente iniciador puede ser distinto
-        context.agent_channel = agent_b_channel
+        context.agent_connected_channel = agent_b_channel
         context.uniqueid_agent = agent_a_channel
         context.pstn_channel = pstn_channel
         context.bridge_id = bridge_id

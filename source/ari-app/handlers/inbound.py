@@ -18,7 +18,15 @@ from services.campaign_config import fetch_campaign_cfg_from_redis
 from services.distribution_service import DistributionService
 from services.queue_strategy import QueueStrategyEngine
 from state import CallContext, CallRegistry
-from state_helpers import finalize_current_agent_segment
+from state_helpers import (
+    active_agent_channel,
+    call_has_prior_agent_handling,
+    distinct_agent_leg_ids,
+    effective_queue_campaign_id,
+    finalize_current_agent_segment,
+    is_agent_leg_channel,
+    is_consult_initiator_channel,
+)
 from utils import compute_bot_agent_durations, parse_ari_args
 
 
@@ -257,7 +265,6 @@ class InboundCallHandler(BaseHandler):
             context = CallContext(
                 call_id=call_id,
                 type=CallType.INBOUND,
-                agent_channel=None,
                 pstn_channel=channel_id,
                 bridge_id=bridge_id,
                 uniqueid_agent=None,
@@ -516,6 +523,11 @@ class InboundCallHandler(BaseHandler):
                 )
                 return
 
+            # Cancelar timer de timeout de cola: handle_agent_answer ya detiene el loop pero no el Timer.
+            self.distribution_service.stop_distribution(
+                call_id, cancel_timer=True, hangup_agent_channel=False
+            )
+
             logger.info(
                 "[Deliver inbound call] Agente contestó: canal %s en Stasis para call_id=%s, deteniendo MOH y agregando al bridge",
                 channel_id,
@@ -526,43 +538,93 @@ class InboundCallHandler(BaseHandler):
             agent_id_str = self._extract_agent_id_from_agent_channel(channel_id, event)
 
             bridge_id: Optional[str] = None
-            queue_uniqueid: Optional[str] = None
-            id_camp: Optional[int] = None
-            agent_id_for_event: Optional[int] = None
-
             with self.state_store.lock(call_id):
-                fresh_ctx = self.state_store.get(call_id)
-                if not fresh_ctx:
+                peek = self.state_store.get(call_id)
+                if not peek:
                     logger.info(
                         "InboundCallHandler.on_agent_stasis_start: contexto desapareció para call_id=%s",
                         call_id,
                     )
                     return
+                bridge_id = peek.bridge_id
 
-                fresh_ctx.agent_channel = channel_id
-                if not fresh_ctx.uniqueid_agent:
-                    fresh_ctx.uniqueid_agent = channel_id
+            if not bridge_id:
+                logger.warning(
+                    "InboundCallHandler.on_agent_stasis_start: sin bridge_id para call_id=%s, no se consolida agente",
+                    call_id,
+                )
+                with self.state_store.lock(call_id):
+                    fc = self.state_store.get(call_id)
+                    if fc and fc.agent_attempt_channel == channel_id:
+                        fc.agent_attempt_channel = None
+                        self.state_store.register_unsafe(call_id, fc)
+                try:
+                    self.ari_client.hangup_channel(channel_id)
+                except Exception:
+                    pass
+                return
 
-                fresh_ctx.transfer_in_progress = False
+            bridge_ok = False
+            try:
+                self.call_service.add_channel_to_bridge(bridge_id, channel_id)
+                bridge_ok = True
+                logger.info(
+                    "[Deliver inbound call] Canal agente %s agregado al bridge %s para call_id=%s",
+                    channel_id,
+                    bridge_id,
+                    call_id,
+                )
+            except Exception:
+                logger.exception(
+                    "InboundCallHandler.on_agent_stasis_start: error agregando canal de agente %s al bridge %s",
+                    channel_id,
+                    bridge_id,
+                )
 
-                if not fresh_ctx.agent_answered_ts:
-                    fresh_ctx.agent_answered_ts = datetime.now().isoformat()
-                if getattr(fresh_ctx, "is_voicebot", False):
-                    fresh_ctx.voicebot_leg_start_ts = fresh_ctx.agent_answered_ts
+            queue_uniqueid: Optional[str] = None
+            id_camp: Optional[int] = None
+            agent_id_for_event: Optional[int] = None
+            phone_number: Optional[str] = None
 
-                if agent_id_str:
-                    try:
-                        fresh_ctx.agent_id = int(agent_id_str)
-                    except (ValueError, TypeError):
-                        pass
-
+            with self.state_store.lock(call_id):
+                fresh_ctx = self.state_store.get(call_id)
+                if not fresh_ctx:
+                    logger.info(
+                        "InboundCallHandler.on_agent_stasis_start: contexto desapareció tras bridge para call_id=%s",
+                        call_id,
+                    )
+                    return
+                if bridge_ok:
+                    fresh_ctx.agent_connected_channel = channel_id
+                    if fresh_ctx.agent_attempt_channel == channel_id:
+                        fresh_ctx.agent_attempt_channel = None
+                    if not fresh_ctx.uniqueid_agent:
+                        fresh_ctx.uniqueid_agent = channel_id
+                    fresh_ctx.transfer_in_progress = False
+                    if not fresh_ctx.agent_answered_ts:
+                        fresh_ctx.agent_answered_ts = datetime.now().isoformat()
+                    if getattr(fresh_ctx, "is_voicebot", False):
+                        fresh_ctx.voicebot_leg_start_ts = fresh_ctx.agent_answered_ts
+                    if agent_id_str:
+                        try:
+                            fresh_ctx.agent_id = int(agent_id_str)
+                        except (ValueError, TypeError):
+                            pass
+                else:
+                    if fresh_ctx.agent_attempt_channel == channel_id:
+                        fresh_ctx.agent_attempt_channel = None
                 self.state_store.register_unsafe(call_id, fresh_ctx)
-
-                bridge_id = fresh_ctx.bridge_id
                 queue_uniqueid = fresh_ctx.uniqueid_pstn or fresh_ctx.call_id
-                id_camp = fresh_ctx.id_camp
+                id_camp = effective_queue_campaign_id(fresh_ctx)
                 agent_id_for_event = getattr(fresh_ctx, "agent_id", None)
                 phone_number = getattr(fresh_ctx, "phone_number", None)
+
+            if not bridge_ok:
+                try:
+                    self.ari_client.hangup_channel(channel_id)
+                except Exception:
+                    pass
+                return
 
             if self.agent_status_service and agent_id_for_event and bridge_id:
                 try:
@@ -581,31 +643,14 @@ class InboundCallHandler(BaseHandler):
                         call_id,
                     )
 
-            if bridge_id:
-                try:
-                    self.call_service.add_channel_to_bridge(bridge_id, channel_id)
-                    logger.info(
-                        "[Deliver inbound call] Canal agente %s agregado al bridge %s para call_id=%s",
-                        channel_id,
-                        bridge_id,
-                        call_id,
-                    )
-                except Exception:
-                    logger.exception(
-                        "InboundCallHandler.on_agent_stasis_start: error agregando canal de agente %s "
-                        "al bridge %s",
-                        channel_id,
-                        bridge_id,
-                    )
-
-                try:
-                    self.call_service.stop_moh_on_bridge(bridge_id)
-                    logger.info("[Deliver inbound call] MOH detenido en bridge %s", bridge_id)
-                except Exception:
-                    logger.exception(
-                        "InboundCallHandler.on_agent_stasis_start: error deteniendo MOH en bridge %s",
-                        bridge_id,
-                    )
+            try:
+                self.call_service.stop_moh_on_bridge(bridge_id)
+                logger.info("[Deliver inbound call] MOH detenido en bridge %s", bridge_id)
+            except Exception:
+                logger.exception(
+                    "InboundCallHandler.on_agent_stasis_start: error deteniendo MOH en bridge %s",
+                    bridge_id,
+                )
 
             if self.queue_event_manager and queue_uniqueid and id_camp is not None:
                 try:
@@ -663,13 +708,14 @@ class InboundCallHandler(BaseHandler):
             # -----------------------------------------------------------------
             ctx_agent = self.state_store.get_by_channel(channel_id)
             if ctx_agent and self.distribution_service.handle_channel_failure(ctx_agent.call_id, channel_id):
-                if getattr(ctx_agent, "is_voicebot", False) and getattr(ctx_agent, "id_camp", None) and getattr(ctx_agent, "agent_id", None) is not None:
+                vb_camp = effective_queue_campaign_id(ctx_agent)
+                if getattr(ctx_agent, "is_voicebot", False) and vb_camp is not None and getattr(ctx_agent, "agent_id", None) is not None:
                     try:
-                        self.redis_client.decr(RedisKeys.voicebot_calls(str(ctx_agent.id_camp), ctx_agent.agent_id))
+                        self.redis_client.decr(RedisKeys.voicebot_calls(str(vb_camp), ctx_agent.agent_id))
                     except Exception as e:
                         logger.warning(
                             "InboundCallHandler.on_failure: error DECR VOICEBOT-CALLS para campaña %s: %s",
-                            ctx_agent.id_camp,
+                            vb_camp,
                             e,
                         )
                 logger.info(
@@ -692,16 +738,15 @@ class InboundCallHandler(BaseHandler):
                 return
 
             # Si el canal destruido es el leg de agente/voicebot (ya contestó), liberar cupo voicebot
-            agent_ch = getattr(context, "agent_channel", None)
-            uniqueid_agent = getattr(context, "uniqueid_agent", None)
-            is_agent_leg = channel_id == agent_ch or channel_id == uniqueid_agent
-            if is_agent_leg and getattr(context, "is_voicebot", False) and getattr(context, "id_camp", None) and getattr(context, "agent_id", None) is not None:
+            is_agent_leg = is_agent_leg_channel(context, channel_id)
+            vb_camp_leg = effective_queue_campaign_id(context)
+            if is_agent_leg and getattr(context, "is_voicebot", False) and vb_camp_leg is not None and getattr(context, "agent_id", None) is not None:
                 try:
-                    self.redis_client.decr(RedisKeys.voicebot_calls(str(context.id_camp), context.agent_id))
+                    self.redis_client.decr(RedisKeys.voicebot_calls(str(vb_camp_leg), context.agent_id))
                 except Exception as e:
                     logger.warning(
                         "InboundCallHandler.on_failure: error DECR VOICEBOT-CALLS (leg agente) campaña %s: %s",
-                        context.id_camp,
+                        vb_camp_leg,
                         e,
                     )
 
@@ -807,12 +852,8 @@ class InboundCallHandler(BaseHandler):
                 )
                 return
 
-            # Solo actuar cuando cuelga el agente conectado (no el PSTN)
-            agent_ch = getattr(context, "agent_channel", None)
-            uniqueid_agent = getattr(context, "uniqueid_agent", None)
-            is_agent_leg = (
-                agent_ch == channel_id or uniqueid_agent == channel_id
-            )
+            # Solo actuar cuando cuelga pierna de agente (intento o conectado), no el PSTN
+            is_agent_leg = is_agent_leg_channel(context, channel_id)
             if not is_agent_leg:
                 logger.debug(
                     "InboundCallHandler.on_hangup_request: canal %s no es leg de agente, ignorando",
@@ -820,20 +861,19 @@ class InboundCallHandler(BaseHandler):
                 )
                 return
 
-            # Transferencia consultiva: al completar, colgamos al agente iniciador a propósito.
-            # No colgar PSTN ni destruir bridge por ese hangup; consumir el flag y salir.
+            # Tras consult_complete: ignorar solo el hangup del agente iniciador (consultation o
+            # uniqueid_agent), no el del destino. Debe ir ANTES de exigir channel_id == active_agent:
+            # el estado ya puede apuntar al agente B mientras llega el ChannelHangupRequest de A;
+            # si no consumimos el flag aquí, queda True y el cuelgue de B se ignoraba por error.
             try:
                 with self.state_store.lock(context.call_id):
                     fresh = self.state_store.get(context.call_id)
                     if fresh:
                         ignore_next = getattr(fresh, "ignore_next_agent_hangup", False)
-                        is_initiator = bool(
-                            getattr(fresh, "uniqueid_agent", None) == channel_id
-                        )
-                        if ignore_next and is_initiator:
+                        if ignore_next and is_consult_initiator_channel(fresh, channel_id):
                             logger.info(
                                 "InboundCallHandler.on_hangup_request: ignorando hangup del agente "
-                                "iniciador en transferencia consultiva (call_id=%s, channel_id=%s)",
+                                "iniciador por transferencia consultiva (call_id=%s, channel_id=%s)",
                                 context.call_id,
                                 channel_id,
                             )
@@ -845,6 +885,17 @@ class InboundCallHandler(BaseHandler):
                     "InboundCallHandler.on_hangup_request: no se pudo verificar ignore_next_agent_hangup: %s",
                     e,
                 )
+
+            # Hangup sobre pierna de solo-intento (rechazo de ring, busy, cancel): la distribución
+            # y ChannelDestroyed siguen el flujo; no es "el agente colgó una llamada ya contestada".
+            if channel_id != active_agent_channel(context):
+                logger.debug(
+                    "InboundCallHandler.on_hangup_request: canal %s no es la pierna consolidada "
+                    "(active_agent=%s); omitiendo colgar PSTN/bridge",
+                    channel_id,
+                    active_agent_channel(context),
+                )
+                return
 
             # No colgar PSTN si hay transferencia en curso (futuro soporte INBOUND transfer)
             if getattr(context, "transfer_in_progress", False):
@@ -945,7 +996,7 @@ class InboundCallHandler(BaseHandler):
         SAFETY NET (Tierra Quemada): La llamada depende del PSTN leg. Si el PSTN se va,
         al inicio del método se purgan de forma incondicional los recursos físicos
         presentes en el contexto: destruir bridge (context.bridge_id) y colgar agente
-        (context.agent_channel), independientemente del estado lógico (Queue vs Answered).
+        (piernas de agente en intento o conectadas), independientemente del estado lógico (Queue vs Answered).
         Evita agentes "zombie" en bridge mudo por desfasaje de estado en Redis/LockError.
 
         Objetivos adicionales:
@@ -1016,15 +1067,14 @@ class InboundCallHandler(BaseHandler):
                     except Exception:
                         pass
 
-                agent_channel = getattr(context, "agent_channel", None)
-                if agent_channel and str(agent_channel).strip():
+                for agent_leg in distinct_agent_leg_ids(context):
                     logger.warning(
                         "InboundCallHandler.on_pstn_stasis_end: PSTN Hangup - Colgando agente remanente %s (call_id=%s)",
-                        agent_channel,
+                        agent_leg,
                         call_id,
                     )
                     try:
-                        self.ari_client.hangup_channel(agent_channel)
+                        self.ari_client.hangup_channel(agent_leg)
                     except Exception:
                         pass
 
@@ -1067,148 +1117,21 @@ class InboundCallHandler(BaseHandler):
                     )
                     return
 
-                # Si la llamada nunca fue atendida por agente, notificar salida de cola y enviar a Gearman
-                # (acd-log-processor). Corte desde la app (timeout de cola) → EXIT_TIMEOUT;
-                # corte desde el leg PSTN externo → EXIT_ABANDON (según flag hangup iniciado por app).
-                if not context.agent_channel:
-                    uniqueid = uniqueid_pstn or call_id
-                    end_iso = datetime.now().isoformat()
-                    bridge_wait_time = 0.0
-                    duracion_llamada = 0.0
-                    if context.bridge_created_ts:
-                        try:
-                            start_dt = datetime.fromisoformat(context.bridge_created_ts)
-                            end_dt = datetime.fromisoformat(end_iso)
-                            duracion_llamada = max(0.0, (end_dt - start_dt).total_seconds())
-                            bridge_wait_time = duracion_llamada
-                        except Exception:
-                            pass
-                    with self._pstn_hangup_lock:
-                        treat_as_timeout = channel_id in self._pstn_hangup_initiated_by_app
-                        if treat_as_timeout:
-                            self._pstn_hangup_initiated_by_app.discard(channel_id)
-
-                    # Si no tenemos flag de hangup por app pero la llamada estuvo en cola >= queue_timeout,
-                    # tratarla como EXIT_TIMEOUT (evita EXIT_ABANDON cuando el caller cuelga justo al vencer
-                    # el timeout o hay condición de carrera con el timeout de cola).
-                    if not treat_as_timeout and context.queue_timeout_seconds is not None:
-                        if bridge_wait_time >= max(0, context.queue_timeout_seconds - 1):
-                            treat_as_timeout = True
-                            logger.info(
-                                "InboundCallHandler.on_pstn_stasis_end: tratando como EXIT_TIMEOUT por tiempo en cola "
-                                "(call_id=%s, bridge_wait_time=%.1fs, queue_timeout=%ss)",
-                                call_id,
-                                bridge_wait_time,
-                                context.queue_timeout_seconds,
-                            )
-
-                    if treat_as_timeout:
-                        if self.queue_event_manager:
-                            try:
-                                self.queue_event_manager.on_timeout(
-                                    callid=call_id, uniqueid=uniqueid, campana_id=str(context.id_camp or "")
-                                )
-                            except Exception:
-                                logger.exception(
-                                    "InboundCallHandler.on_pstn_stasis_end: error notificando timeout para %s",
-                                    call_id,
-                                )
-                        if self.reporter:
-                            try:
-                                call_data = {
-                                    "callid": call_id,
-                                    "id_camp": context.id_camp,
-                                    "id_customer": context.id_customer,
-                                    "phone_number": context.phone_number,
-                                    "tel_dialed": getattr(context, "tel_dialed", None),
-                                    "call_type": context.call_type or CallType.INBOUND_ID,
-                                    "is_voicebot": getattr(context, "is_voicebot", False),
-                                    "is_voicebot_transfer": getattr(context, "is_voicebot_transfer", False),
-                                    "transfer_count": getattr(context, "transfer_count", 0),
-                                    "ts_start_iso": context.bridge_created_ts,
-                                    "ts_answer_iso": context.pstn_answered_ts or context.agent_answered_ts,
-                                }
-                                self.reporter.log_segment_end(
-                                    call_data=call_data,
-                                    event_final="EXIT_TIMEOUT",
-                                    is_transfer=False,
-                                    quien_corto=0,
-                                    uniqueid=uniqueid,
-                                    callid=call_id,
-                                    end_iso=end_iso,
-                                    bridge_wait_time=bridge_wait_time,
-                                    duracion_llamada=duracion_llamada,
-                                    bot_duration=0.0,
-                                    agent_duration=0.0,
-                                    channel_leg="PSTN",
-                                    channel_leg_id=uniqueid_pstn or channel_id,
-                                    channel_leg_name=context.pstn_channel or channel_id,
-                                    channel_leg_start_ts=context.bridge_created_ts,
-                                    channel_leg_answer_ts=context.pstn_answered_ts,
-                                    channel_leg_end_ts=end_iso,
-                                )
-                            except Exception:
-                                logger.exception(
-                                    "InboundCallHandler.on_pstn_stasis_end: error enviando reporte EXIT_TIMEOUT para %s",
-                                    call_id,
-                                )
-                    else:
-                        if self.queue_event_manager:
-                            try:
-                                self.queue_event_manager.on_abandon(
-                                    callid=call_id, uniqueid=uniqueid, campana_id=str(context.id_camp or "")
-                                )
-                            except Exception:
-                                logger.exception(
-                                    "InboundCallHandler.on_pstn_stasis_end: error notificando abandono para %s",
-                                    call_id,
-                                )
-                        if self.reporter:
-                            try:
-                                call_data = {
-                                    "callid": call_id,
-                                    "id_camp": context.id_camp,
-                                    "id_customer": context.id_customer,
-                                    "phone_number": context.phone_number,
-                                    "tel_dialed": getattr(context, "tel_dialed", None),
-                                    "call_type": context.call_type or CallType.INBOUND_ID,
-                                    "is_voicebot": getattr(context, "is_voicebot", False),
-                                    "is_voicebot_transfer": getattr(context, "is_voicebot_transfer", False),
-                                    "transfer_count": getattr(context, "transfer_count", 0),
-                                    "ts_start_iso": context.bridge_created_ts,
-                                    "ts_answer_iso": context.pstn_answered_ts or context.agent_answered_ts,
-                                }
-                                self.reporter.log_segment_end(
-                                    call_data=call_data,
-                                    event_final="EXIT_ABANDON",
-                                    is_transfer=False,
-                                    quien_corto=2,
-                                    uniqueid=uniqueid,
-                                    callid=call_id,
-                                    end_iso=end_iso,
-                                    bridge_wait_time=bridge_wait_time,
-                                    duracion_llamada=duracion_llamada,
-                                    bot_duration=0.0,
-                                    agent_duration=0.0,
-                                    channel_leg="PSTN",
-                                    channel_leg_id=uniqueid_pstn or channel_id,
-                                    channel_leg_name=context.pstn_channel or channel_id,
-                                    channel_leg_start_ts=context.bridge_created_ts,
-                                    channel_leg_answer_ts=context.pstn_answered_ts,
-                                    channel_leg_end_ts=end_iso,
-                                )
-                            except Exception:
-                                logger.exception(
-                                    "InboundCallHandler.on_pstn_stasis_end: error enviando reporte EXIT_ABANDON para %s",
-                                    call_id,
-                                )
-                else:
+                with self.state_store.lock(call_id):
+                    fresh_ctx = self.state_store.get(call_id)
+                if not fresh_ctx:
+                    logger.warning(
+                        "InboundCallHandler.on_pstn_stasis_end: sin contexto Redis tras call_ended "
+                        "(call_id=%s); se omite reporte de cierre",
+                        call_id,
+                    )
+                elif active_agent_channel(fresh_ctx) or call_has_prior_agent_handling(fresh_ctx):
                     # Llamada fue atendida por agente; reportar fin de segmento (cliente/PSTN colgó).
                     if self.reporter:
                         try:
                             end_iso = datetime.now().isoformat()
                             agent_segments: List[Dict[str, Any]] = []
-                            saved_agent_answered_ts = getattr(context, "agent_answered_ts", None)
+                            saved_agent_answered_ts = getattr(fresh_ctx, "agent_answered_ts", None)
                             with self.state_store.lock(call_id):
                                 locked_ctx = self.state_store.get(call_id)
                                 if locked_ctx:
@@ -1224,9 +1147,9 @@ class InboundCallHandler(BaseHandler):
                                 first_answer_ts = agent_segments[0].get("start_ts") or first_answer_ts
                             bridge_wait_time = 0.0
                             duracion_llamada = 0.0
-                            if context.bridge_created_ts:
+                            if fresh_ctx.bridge_created_ts:
                                 try:
-                                    start_dt = datetime.fromisoformat(context.bridge_created_ts)
+                                    start_dt = datetime.fromisoformat(fresh_ctx.bridge_created_ts)
                                     end_dt = datetime.fromisoformat(end_iso)
                                     duracion_llamada = max(0.0, (end_dt - start_dt).total_seconds())
                                     # bridge_wait_time = tiempo en cola/MOH hasta que el agente contestó
@@ -1241,35 +1164,39 @@ class InboundCallHandler(BaseHandler):
                                         bridge_wait_time = 0.0
                                 except Exception:
                                     pass
-                            uniqueid = uniqueid_pstn or call_id
+                            uniqueid = fresh_ctx.uniqueid_pstn or call_id
                             call_data = {
                                 "callid": call_id,
-                                "id_camp": context.id_camp,
-                                "id_customer": context.id_customer,
-                                "phone_number": context.phone_number,
-                                "tel_dialed": getattr(context, "tel_dialed", None),
-                                "call_type": context.call_type or CallType.INBOUND_ID,
-                                "is_voicebot": getattr(context, "is_voicebot", False),
-                                "is_voicebot_transfer": getattr(context, "is_voicebot_transfer", False),
-                                "transfer_count": getattr(context, "transfer_count", 0),
-                                "ts_start_iso": context.bridge_created_ts,
-                                "ts_answer_iso": context.pstn_answered_ts or context.agent_answered_ts,
-                                "agente_id": getattr(context, "agent_id", None),
+                                "id_camp": fresh_ctx.id_camp,
+                                "id_customer": fresh_ctx.id_customer,
+                                "phone_number": fresh_ctx.phone_number,
+                                "tel_dialed": getattr(fresh_ctx, "tel_dialed", None),
+                                "call_type": fresh_ctx.call_type or CallType.INBOUND_ID,
+                                "is_voicebot": getattr(fresh_ctx, "is_voicebot", False),
+                                "is_voicebot_transfer": getattr(fresh_ctx, "is_voicebot_transfer", False),
+                                "transfer_count": getattr(fresh_ctx, "transfer_count", 0),
+                                "ts_start_iso": fresh_ctx.bridge_created_ts,
+                                "ts_answer_iso": fresh_ctx.pstn_answered_ts or fresh_ctx.agent_answered_ts,
+                                "agente_id": getattr(fresh_ctx, "agent_id", None),
                                 "agent_segments": agent_segments,
                             }
                             # Quien cortó: 1=Agente, 2=Cliente. Si el agente colgó primero, on_hangup_request
                             # marca inbound_agent_hung_up_first; si no, el PSTN colgó (StasisEnd del cliente).
-                            quien_corto = 1 if getattr(context, "inbound_agent_hung_up_first", False) else 2
+                            quien_corto = 1 if getattr(fresh_ctx, "inbound_agent_hung_up_first", False) else 2
                             bot_duration, agent_duration = compute_bot_agent_durations(
-                                context,
+                                fresh_ctx,
                                 end_iso,
                                 duracion_llamada,
                                 agent_answered_ts_override=saved_agent_answered_ts,
                             )
+                            is_transfer_for_report = bool(
+                                getattr(fresh_ctx, "is_transferred", False)
+                                or getattr(fresh_ctx, "blind_transfer_attempted", False)
+                            )
                             self.reporter.log_segment_end(
                                 call_data=call_data,
                                 event_final="EXIT_ANSWERED",
-                                is_transfer=getattr(context, "is_transferred", False),
+                                is_transfer=is_transfer_for_report,
                                 quien_corto=quien_corto,
                                 uniqueid=uniqueid,
                                 callid=call_id,
@@ -1279,10 +1206,10 @@ class InboundCallHandler(BaseHandler):
                                 bot_duration=bot_duration,
                                 agent_duration=agent_duration,
                                 channel_leg="PSTN",
-                                channel_leg_id=uniqueid_pstn or channel_id,
-                                channel_leg_name=context.pstn_channel or channel_id,
-                                channel_leg_start_ts=context.bridge_created_ts,
-                                channel_leg_answer_ts=context.pstn_answered_ts,
+                                channel_leg_id=fresh_ctx.uniqueid_pstn or channel_id,
+                                channel_leg_name=fresh_ctx.pstn_channel or channel_id,
+                                channel_leg_start_ts=fresh_ctx.bridge_created_ts,
+                                channel_leg_answer_ts=fresh_ctx.pstn_answered_ts,
                                 channel_leg_end_ts=end_iso,
                             )
                         except Exception:
@@ -1290,6 +1217,141 @@ class InboundCallHandler(BaseHandler):
                                 "InboundCallHandler.on_pstn_stasis_end: error enviando reporte EXIT_ANSWERED para %s",
                                 call_id,
                             )
+                else:
+                    # Sin agente conectado ahora: primera cola sin contestar, o re-cola tras blind_to_campaign
+                    # (sin agent_connected actual no implica «nunca hubo agente»).
+                    uniqueid = fresh_ctx.uniqueid_pstn or call_id
+                    end_iso = datetime.now().isoformat()
+                    bridge_wait_time = 0.0
+                    duracion_llamada = 0.0
+                    if fresh_ctx.bridge_created_ts:
+                        try:
+                            start_dt = datetime.fromisoformat(fresh_ctx.bridge_created_ts)
+                            end_dt = datetime.fromisoformat(end_iso)
+                            duracion_llamada = max(0.0, (end_dt - start_dt).total_seconds())
+                            bridge_wait_time = duracion_llamada
+                        except Exception:
+                            pass
+                    with self._pstn_hangup_lock:
+                        treat_as_timeout = channel_id in self._pstn_hangup_initiated_by_app
+                        if treat_as_timeout:
+                            self._pstn_hangup_initiated_by_app.discard(channel_id)
+
+                    # Si no tenemos flag de hangup por app pero la llamada estuvo en cola >= queue_timeout,
+                    # tratarla como EXIT_TIMEOUT (evita EXIT_ABANDON cuando el caller cuelga justo al vencer
+                    # el timeout o hay condición de carrera con el timeout de cola).
+                    if not treat_as_timeout and fresh_ctx.queue_timeout_seconds is not None:
+                        if bridge_wait_time >= max(0, fresh_ctx.queue_timeout_seconds - 1):
+                            treat_as_timeout = True
+                            logger.info(
+                                "InboundCallHandler.on_pstn_stasis_end: tratando como EXIT_TIMEOUT por tiempo en cola "
+                                "(call_id=%s, bridge_wait_time=%.1fs, queue_timeout=%ss)",
+                                call_id,
+                                bridge_wait_time,
+                                fresh_ctx.queue_timeout_seconds,
+                            )
+
+                    queue_camp = str(effective_queue_campaign_id(fresh_ctx) or "")
+                    prior_agent = call_has_prior_agent_handling(fresh_ctx)
+                    agent_segments_snapshot = list(getattr(fresh_ctx, "agent_segments", None) or [])
+                    transfer_count_val = int(getattr(fresh_ctx, "transfer_count", 0) or 0)
+
+                    def _call_data_queue_close() -> Dict[str, Any]:
+                        return {
+                            "callid": call_id,
+                            "id_camp": fresh_ctx.id_camp,
+                            "id_customer": fresh_ctx.id_customer,
+                            "phone_number": fresh_ctx.phone_number,
+                            "tel_dialed": getattr(fresh_ctx, "tel_dialed", None),
+                            "call_type": fresh_ctx.call_type or CallType.INBOUND_ID,
+                            "is_voicebot": getattr(fresh_ctx, "is_voicebot", False),
+                            "is_voicebot_transfer": getattr(fresh_ctx, "is_voicebot_transfer", False),
+                            "transfer_count": transfer_count_val,
+                            "agent_segments": agent_segments_snapshot,
+                            "ts_start_iso": fresh_ctx.bridge_created_ts,
+                            "ts_answer_iso": fresh_ctx.pstn_answered_ts or fresh_ctx.agent_answered_ts,
+                        }
+
+                    if treat_as_timeout:
+                        if self.queue_event_manager:
+                            try:
+                                self.queue_event_manager.on_timeout(
+                                    callid=call_id,
+                                    uniqueid=uniqueid,
+                                    campana_id=queue_camp,
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "InboundCallHandler.on_pstn_stasis_end: error notificando timeout para %s",
+                                    call_id,
+                                )
+                        if self.reporter:
+                            try:
+                                self.reporter.log_segment_end(
+                                    call_data=_call_data_queue_close(),
+                                    event_final="EXIT_TIMEOUT",
+                                    is_transfer=prior_agent,
+                                    quien_corto=0,
+                                    uniqueid=uniqueid,
+                                    callid=call_id,
+                                    end_iso=end_iso,
+                                    bridge_wait_time=bridge_wait_time,
+                                    duracion_llamada=duracion_llamada,
+                                    bot_duration=0.0,
+                                    agent_duration=0.0,
+                                    channel_leg="PSTN",
+                                    channel_leg_id=fresh_ctx.uniqueid_pstn or channel_id,
+                                    channel_leg_name=fresh_ctx.pstn_channel or channel_id,
+                                    channel_leg_start_ts=fresh_ctx.bridge_created_ts,
+                                    channel_leg_answer_ts=fresh_ctx.pstn_answered_ts,
+                                    channel_leg_end_ts=end_iso,
+                                    transfer_count=transfer_count_val,
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "InboundCallHandler.on_pstn_stasis_end: error enviando reporte EXIT_TIMEOUT para %s",
+                                    call_id,
+                                )
+                    else:
+                        if self.queue_event_manager:
+                            try:
+                                self.queue_event_manager.on_abandon(
+                                    callid=call_id,
+                                    uniqueid=uniqueid,
+                                    campana_id=queue_camp,
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "InboundCallHandler.on_pstn_stasis_end: error notificando abandono para %s",
+                                    call_id,
+                                )
+                        if self.reporter:
+                            try:
+                                self.reporter.log_segment_end(
+                                    call_data=_call_data_queue_close(),
+                                    event_final="EXIT_ABANDON",
+                                    is_transfer=prior_agent,
+                                    quien_corto=2,
+                                    uniqueid=uniqueid,
+                                    callid=call_id,
+                                    end_iso=end_iso,
+                                    bridge_wait_time=bridge_wait_time,
+                                    duracion_llamada=duracion_llamada,
+                                    bot_duration=0.0,
+                                    agent_duration=0.0,
+                                    channel_leg="PSTN",
+                                    channel_leg_id=fresh_ctx.uniqueid_pstn or channel_id,
+                                    channel_leg_name=fresh_ctx.pstn_channel or channel_id,
+                                    channel_leg_start_ts=fresh_ctx.bridge_created_ts,
+                                    channel_leg_answer_ts=fresh_ctx.pstn_answered_ts,
+                                    channel_leg_end_ts=end_iso,
+                                    transfer_count=transfer_count_val,
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "InboundCallHandler.on_pstn_stasis_end: error enviando reporte EXIT_ABANDON para %s",
+                                    call_id,
+                                )
             finally:
                 # Limpieza obligatoria de Redis (evita memory leak de claves huérfanas)
                 self.state_store.unregister(call_id)

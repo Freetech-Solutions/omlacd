@@ -22,6 +22,12 @@ from queue_events import QueueEventManager
 from services.call_manager import CallActionService
 from services.queue_strategy import AgentProfile, QueueStrategyEngine
 from state import CallContext, CallRegistry
+from state_helpers import (
+    active_agent_channel,
+    call_has_prior_agent_handling,
+    effective_queue_campaign_id,
+    queue_timeout_should_suppress_cleanup,
+)
 from utils import compute_bot_agent_durations
 
 
@@ -297,7 +303,7 @@ class DistributionService:
                             return
                         if getattr(context, "call_ended", False):
                             return
-                        if context.agent_channel:
+                        if active_agent_channel(context):
                             return
 
                         now = time.monotonic()
@@ -454,7 +460,7 @@ class DistributionService:
                             with self.state_store.lock(call_id):
                                 ctx = self.state_store.get(call_id)
                                 if ctx:
-                                    ctx.agent_channel = agent_channel_id
+                                    ctx.agent_attempt_channel = agent_channel_id
                                     ctx.is_voicebot = True
                                     ctx.agent_id = candidate.agent_id
                                     self.state_store.register_unsafe(call_id, ctx)
@@ -486,7 +492,7 @@ class DistributionService:
                                 with self.state_store.lock(call_id):
                                     ctx = self.state_store.get(call_id)
                                     if ctx:
-                                        ctx.agent_channel = None
+                                        ctx.agent_attempt_channel = None
                                         ctx.is_voicebot = False
                                         self.state_store.register_unsafe(call_id, ctx)
                                 self.redis_client.delete(lock_key)
@@ -510,7 +516,7 @@ class DistributionService:
                             with self.state_store.lock(call_id):
                                 ctx = self.state_store.get(call_id)
                                 if ctx:
-                                    ctx.agent_channel = None
+                                    ctx.agent_attempt_channel = None
                                     ctx.is_voicebot = False
                                     self.state_store.register_unsafe(call_id, ctx)
                             self.redis_client.delete(lock_key)
@@ -631,10 +637,11 @@ class DistributionService:
         if answered_agent_id is not None:
             try:
                 context = self.state_store.get(call_id)
-                if context and not getattr(context, "is_voicebot", False) and getattr(context, "id_camp", None) is not None:
+                q_camp = effective_queue_campaign_id(context) if context else None
+                if context and not getattr(context, "is_voicebot", False) and q_camp is not None:
                     self.queue_strategy_engine.update_stats_after_call(
                         agent_id=int(answered_agent_id),
-                        queue_name=str(context.id_camp),
+                        queue_name=str(q_camp),
                     )
             except Exception:
                 logger.exception(
@@ -708,11 +715,11 @@ class DistributionService:
                                 call_id,
                             )
                             return
-                        if context.agent_channel:
+                        if active_agent_channel(context):
                             logger.info(
-                                "DistributionLoop: llamada %s ya tiene leg de agente (%s), saliendo del loop",
+                                "DistributionLoop: llamada %s ya tiene agente conectado (%s), saliendo del loop",
                                 call_id,
-                                context.agent_channel,
+                                context.agent_connected_channel,
                             )
                             return
 
@@ -847,7 +854,7 @@ class DistributionService:
                             with self.state_store.lock(call_id):
                                 ctx = self.state_store.get(call_id)
                                 if ctx:
-                                    ctx.agent_channel = agent_channel_id
+                                    ctx.agent_attempt_channel = agent_channel_id
                                     self.state_store.register_unsafe(call_id, ctx)
 
                             answered_or_failed = attempt_finished.wait(timeout=ring_timeout)
@@ -867,7 +874,7 @@ class DistributionService:
                                 with self.state_store.lock(call_id):
                                     ctx = self.state_store.get(call_id)
                                     if ctx:
-                                        ctx.agent_channel = None
+                                        ctx.agent_attempt_channel = None
                                         self.state_store.register_unsafe(call_id, ctx)
                                 self.redis_client.delete(lock_key)
                                 continue
@@ -886,7 +893,7 @@ class DistributionService:
                             with self.state_store.lock(call_id):
                                 ctx = self.state_store.get(call_id)
                                 if ctx:
-                                    ctx.agent_channel = None
+                                    ctx.agent_attempt_channel = None
                                     self.state_store.register_unsafe(call_id, ctx)
                             self.redis_client.delete(lock_key)
 
@@ -987,11 +994,11 @@ class DistributionService:
                     call_id,
                 )
                 return
-            if context.agent_channel:
+            if queue_timeout_should_suppress_cleanup(context):
                 logger.info(
-                    "_on_queue_timeout: llamada %s ya conectada a agente (%s), ignorando timeout",
+                    "_on_queue_timeout: llamada %s ya atendida (connected=%s, agent_answered_ts set), ignorando timeout",
                     call_id,
-                    context.agent_channel,
+                    context.agent_connected_channel,
                 )
                 return
             context_for_report = context
@@ -1046,6 +1053,11 @@ class DistributionService:
                 is_vb_xfer = bool(getattr(context_for_report, "is_voicebot_transfer", False)) or bool(
                     getattr(context_for_report, "voicebot_leg_end_ts", None)
                 )
+                transfer_count_val = int(getattr(context_for_report, "transfer_count", 0) or 0)
+                agent_segments_list = list(
+                    getattr(context_for_report, "agent_segments", None) or []
+                )
+                prior_agent = call_has_prior_agent_handling(context_for_report)
                 call_data = {
                     "callid": call_id,
                     "id_camp": id_camp_val,
@@ -1058,6 +1070,8 @@ class DistributionService:
                         getattr(context_for_report, "is_voicebot", False) or is_vb_xfer
                     ),
                     "is_voicebot_transfer": is_vb_xfer,
+                    "transfer_count": transfer_count_val,
+                    "agent_segments": agent_segments_list,
                     "ts_start_iso": context_for_report.bridge_created_ts,
                     "ts_answer_iso": context_for_report.pstn_answered_ts or context_for_report.agent_answered_ts,
                 }
@@ -1079,7 +1093,7 @@ class DistributionService:
                 self.reporter.log_segment_end(
                     call_data=call_data,
                     event_final=timeout_event,
-                    is_transfer=False,
+                    is_transfer=prior_agent,
                     quien_corto=0,
                     uniqueid=uniqueid,
                     callid=call_id,

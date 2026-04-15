@@ -6,11 +6,20 @@ from unittest.mock import MagicMock
 import sys
 import os
 
+# Otros tests reemplazan `sys.modules['redis']` por MagicMock; necesitamos el módulo real
+# para `redis.ConnectionError` / `redis.TimeoutError` en route_validator.
+if isinstance(sys.modules.get("redis"), MagicMock):
+    del sys.modules["redis"]
+if "services.route_validator" in sys.modules:
+    del sys.modules["services.route_validator"]
+
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 SOURCE_DIR = os.path.dirname(CURRENT_DIR)
 ARI_APP_DIR = os.path.join(SOURCE_DIR, "ari-app")
 if ARI_APP_DIR not in sys.path:
     sys.path.insert(0, ARI_APP_DIR)
+
+import importlib
 
 from services.route_validator import RouteValidator  # noqa: E402
 
@@ -19,10 +28,16 @@ class TestRouteValidatorGetTrunkCallerid(unittest.TestCase):
     """Tests para get_trunk_callerid."""
 
     def setUp(self):
+        # Otros tests dejan `redis` como MagicMock; recargar route_validator con el módulo real.
+        if isinstance(sys.modules.get("redis"), MagicMock):
+            del sys.modules["redis"]
+        import services.route_validator as rv
+
+        importlib.reload(rv)
+        self.RouteValidator = rv.RouteValidator
         self.redis = MagicMock()
-        self.validator = RouteValidator(redis_client=self.redis)
-        # Limpiar cache de clase para no arrastrar estado entre tests
-        RouteValidator._CALLERID_CACHE.clear()
+        self.validator = self.RouteValidator(redis_client=self.redis)
+        self.RouteValidator._CALLERID_CACHE.clear()
 
     def test_returns_value_when_callerid_key_exists(self):
         """Cuando OML:TRUNK:{trunk_id}:CALLERID existe, retorna su valor."""

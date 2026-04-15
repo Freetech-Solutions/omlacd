@@ -16,6 +16,7 @@ from typing import Any, Callable, Dict, Optional, Protocol, TYPE_CHECKING, Union
 
 from config import settings
 from constants import RedisKeys
+from state_helpers import active_agent_channel
 
 if TYPE_CHECKING:
     from state import CallRegistry
@@ -268,9 +269,12 @@ class VerloopReferHandler:
         luego start_distribution. campaign_id es el efectivo (target_val si existe, si no ctx.id_camp).
         """
         call_id = ctx.call_id
-        agent_channel = ctx.agent_channel
+        agent_channel = active_agent_channel(ctx) or getattr(ctx, "agent_attempt_channel", None)
         if not agent_channel:
-            self.logger.warning("[Verloop] REFER voicebot sin agent_channel en contexto call_id=%s", call_id)
+            self.logger.warning(
+                "[Verloop] REFER voicebot sin pierna de agente (connected/attempt) en contexto call_id=%s",
+                call_id,
+            )
             return False
 
         tm = refer_ctx.transfer_manager
@@ -297,7 +301,8 @@ class VerloopReferHandler:
             if fresh:
                 fresh.voicebot_leg_end_ts = datetime.now().isoformat()
                 fresh.is_voicebot_transfer = True
-                fresh.agent_channel = None
+                fresh.agent_attempt_channel = None
+                fresh.agent_connected_channel = None
                 fresh.uniqueid_agent = None
                 fresh.agent_answered_ts = None  # para que al contestar el agente humano se setee el ts correcto
                 fresh.is_voicebot = False

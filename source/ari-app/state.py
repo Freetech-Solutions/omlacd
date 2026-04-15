@@ -2,10 +2,18 @@ from typing import Any, Dict, List, Optional
 import json
 import logging
 import redis
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from config import settings
 from constants import CallType, RedisKeys
+
+# Fases del ciclo de vida de una transferencia (semántica unificada; ver TransferManager).
+# none → requested (admitida / originate o consulta creada) → answered (destino Up / pierna consulta Up)
+# → finalized (bridge consolidado y contadores de negocio); luego se vuelve a none hasta la próxima.
+TRANSFER_PHASE_NONE = "none"
+TRANSFER_PHASE_REQUESTED = "requested"
+TRANSFER_PHASE_ANSWERED = "answered"
+TRANSFER_PHASE_FINALIZED = "finalized"
 
 
 class ConsultationData(BaseModel):
@@ -16,6 +24,8 @@ class ConsultationData(BaseModel):
     target_endpoint: Optional[str] = None
     consult_bridge: Optional[str] = None
     consult_leg_ch: Optional[str] = None
+    # ISO8601: pierna consultada pasó a Up (ChannelStateChange); habilita consult_complete de forma segura
+    consult_leg_answered_ts: Optional[str] = None
     target_agent_uniqueid: Optional[str] = None
 
 
@@ -23,22 +33,45 @@ class CallContext(BaseModel):
     """
     Representa el contexto de una llamada con toda la información relevante.
     Utiliza Pydantic para serialización/deserialización robusta.
-    
+
+    Canales de agente (semántica estricta):
+        agent_attempt_channel: pierna originada / ringing aún no consolidada en el bridge principal.
+        agent_connected_channel: pierna del agente activo en la llamada (tras add_channel_to_bridge OK).
+
+    Invariantes típicos: en cola ambos None; en intento solo attempt; conversación estable solo connected;
+    en transferencia pueden coexistir (el agente activo es siempre agent_connected_channel).
+
     Attributes:
         call_id: Identificador único de la llamada
         type: Tipo de llamada (CallType enum)
-        agent_channel: ID del canal del agente (opcional)
         pstn_channel: ID del canal PSTN (opcional)
         bridge_id: ID del bridge de la llamada (opcional)
         recording_id: ID de la grabación activa (opcional)
         recording_started: Flag para evitar múltiples inicios de grabación
+        id_camp: Campaña de atribución / BI (entrada); no debe sobrescribirse en re-encolado
+        distribution_campaign_id: Cola ACD efectiva tras blind_to_campaign; None si coincide con id_camp
+        blind_transfer_leg_id: Canal ARI de la pierna originada (índice Redis hasta OK/FAILED final).
+        blind_transfer_report_state: requested | finalized (solo reporting blind_to_endpoint).
+        transfer_phase: Fase del ciclo de transferencia actual (none|requested|answered|finalized).
+            Matriz por flujo:
+            - Blind→endpoint: requested al persistir pierna tras originate; answered al Up del destino
+              (si aplica); finalized en on_transfer_leg_start tras add_channel_to_bridge OK (junto transfer_count).
+            - Blind→campaña: requested al iniciar ventana transfer_in_progress; finalized tras I/O OK
+              junto finalize_current_agent_segment y transfer_count (is_transferred solo ahí).
+            - Consultiva: requested al consult_start activo; answered vía consult_leg_answered_ts (router);
+              finalized en consult_complete.
+        is_transferred: True solo tras al menos una transferencia finalized (reporting / CDR), no en requested.
     """
+
+    model_config = ConfigDict(extra="ignore")
+
     call_id: str
     type: CallType
-    agent_channel: Optional[str] = None
+    agent_attempt_channel: Optional[str] = None
+    agent_connected_channel: Optional[str] = None
     pstn_channel: Optional[str] = None
     bridge_id: Optional[str] = None
-    
+
     # Identificadores unicos de cada leg
     uniqueid_agent: Optional[str] = None
     uniqueid_pstn: Optional[str] = None
@@ -47,6 +80,8 @@ class CallContext(BaseModel):
     agent_id: Optional[int] = None
     id_customer: Optional[int] = None
     id_camp: Optional[int] = None
+    # Cola donde se distribuye la llamada (ej. destino tras blind_to_campaign); CDR sigue usando id_camp
+    distribution_campaign_id: Optional[int] = None
 
     phone_number: Optional[str] = None
     tel_dialed: Optional[str] = None  # Inbound: número marcado (destino de la llamada)
@@ -56,12 +91,21 @@ class CallContext(BaseModel):
     is_voicebot_transfer: bool = False
     is_transferred: bool = False
     transfer_count: int = 0
+    transfer_phase: str = TRANSFER_PHASE_NONE
     transfer_in_progress: bool = False
     pstn_channel_bridged: bool = False
     consultation: Optional[ConsultationData] = None
     custom_sip_headers: Optional[Dict[str, str]] = None
     target_agent_id: Optional[int] = None  # ID del agente destino en transferencias blind
-    
+    # Blind transfer → reporting: ventana entre originate aceptado y OK/FAILED final (ver TransferManager)
+    blind_transfer_leg_id: Optional[str] = None
+    blind_transfer_report_state: Optional[str] = None  # "requested" | "finalized"
+    blind_transfer_pending_up_report: bool = False
+    blind_transfer_numero_extra: Optional[str] = None  # endpoint EXTERNAL para log final coherente
+    blind_transfer_agente_origen_id: Optional[int] = None  # agente A antes de sobrescribir ctx.agent_id
+    blind_transfer_initiated_by: Optional[str] = None  # "VOICEBOT" | "AGENTE"
+    blind_transfer_attempted: bool = False  # True al admitir una blind, aunque falle antes de consolidarse
+
     # Campos para grabación de llamadas
     recording_id: Optional[str] = None
     recording_started: bool = False
@@ -89,6 +133,23 @@ class CallContext(BaseModel):
     call_ended: bool = False  # Flag para evitar procesar el evento de finalización múltiples veces
     # Inbound: True si el agente colgó primero (on_hangup_request); usado en on_pstn_stasis_end para reportar quien_corto=1
     inbound_agent_hung_up_first: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_legacy_agent_channel(cls, data: Any) -> Any:
+        """Redis antiguo puede traer solo agent_channel; mapa a attempt o connected y lo elimina."""
+        if not isinstance(data, dict):
+            return data
+        legacy = data.pop("agent_channel", None)
+        if not legacy or not str(legacy).strip():
+            return data
+        if data.get("agent_attempt_channel") or data.get("agent_connected_channel"):
+            return data
+        if data.get("agent_answered_ts"):
+            data["agent_connected_channel"] = legacy
+        else:
+            data["agent_attempt_channel"] = legacy
+        return data
 
 
 class CallRegistry:
@@ -186,8 +247,12 @@ class CallRegistry:
         channels = set()
         
         # 1. Canales principales
-        if ctx.agent_channel: channels.add(ctx.agent_channel)
-        if ctx.pstn_channel: channels.add(ctx.pstn_channel)
+        if ctx.agent_attempt_channel:
+            channels.add(ctx.agent_attempt_channel)
+        if ctx.agent_connected_channel:
+            channels.add(ctx.agent_connected_channel)
+        if ctx.pstn_channel:
+            channels.add(ctx.pstn_channel)
         if ctx.uniqueid_agent: channels.add(ctx.uniqueid_agent)
         if ctx.uniqueid_pstn: channels.add(ctx.uniqueid_pstn)
         
@@ -195,8 +260,7 @@ class CallRegistry:
         if ctx.consultation:
             if ctx.consultation.consult_leg_ch: 
                 channels.add(ctx.consultation.consult_leg_ch)
-            # initiator_agent_ch generalmente es el mismo que agent_channel, 
-            # pero lo agregamos por si acaso
+            # initiator_agent_ch suele coincidir con agent_connected_channel del iniciador
             if ctx.consultation.initiator_agent_ch:
                 channels.add(ctx.consultation.initiator_agent_ch)
                 
@@ -207,6 +271,10 @@ class CallRegistry:
         # 4. Otros canales
         if ctx.other_channels:
             channels.update(ctx.other_channels)
+
+        # Pierna originada por blind_to_endpoint (índice antes de agent_attempt_channel)
+        if getattr(ctx, "blind_transfer_leg_id", None):
+            channels.add(ctx.blind_transfer_leg_id)
             
         return channels
 
