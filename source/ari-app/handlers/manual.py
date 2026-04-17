@@ -451,7 +451,9 @@ class ManualCallHandler(BaseHandler):
             channel_name = channel.get('name', channel_id) if isinstance(channel, dict) else channel_id
 
         start_ts = datetime.now().isoformat()
-        tipo_campana = 0
+        # Debe coincidir con Campana.TYPE_MANUAL (1): si va 0, update_redis_call_stats no marca is_outbound
+        # y no se publica CAMP/DIAL a CALLEVENTS (supervisión salientes no recibe "dialed" por WS).
+        tipo_campana = CallType.MANUAL_ID
         uniqueid_tecnico_agent = context.uniqueid_agent if context else call_data['uniqueid']
         channel_leg_id_agent = uniqueid_tecnico_agent if uniqueid_tecnico_agent else channel_id
 

@@ -701,8 +701,9 @@ CAMP_DIALER_NO_CONTACT_EVENTS = frozenset([
 
 def _publish_camp_event(redis_client, campana_id, event_name, call_type="2"):
     """
-    Publica un evento CAMP a CALLEVENTS_CHANNEL para que Supervisión (DialerDataManager)
-    actualice la vista en tiempo real. Formato: {"type": "CAMP", "event": event_name, "id": campana_id, "call_type": call_type}.
+    Publica un evento CAMP a CALLEVENTS_CHANNEL para supervisión en tiempo real
+    (DialerDataManager, OutboundDataManager). Formato:
+    {"type": "CAMP", "event": event_name, "id": campana_id, "call_type": call_type}.
     """
     if campana_id is None:
         return
@@ -776,7 +777,20 @@ def update_redis_call_stats(message):
         # CORRECCIÓN 1: Determinar si es inbound o outbound basándose en tipo_campana
         # tipo_campana=3 es inbound, tipo_campana en [1,2,4] son outbound (manual, dialer, preview)
         is_inbound = (t_campana == CallType.INBOUND_ID)  # tipo_campana=3 es inbound según TIPO_CAMPANA_MAPPING
-        is_outbound = (t_campana in [CallType.MANUAL_ID, CallType.DIALER_ID, CallType.PREVIEW_ID])  # manual=1, dialer=2, preview=4
+        # Outbound: por tipo de campaña o por tipo de llamada (p. ej. log_dial manual enviaba tipo_campana=0).
+        _outbound_camp = (
+            CallType.MANUAL_ID,
+            CallType.DIALER_ID,
+            CallType.PREVIEW_ID,
+            CallType.PROGRESSIVE_ID,
+        )
+        _outbound_llam = (
+            CallType.MANUAL_ID,
+            CallType.DIALER_ID,
+            CallType.PREVIEW_ID,
+            CallType.PROGRESSIVE_ID,
+        )
+        is_outbound = (t_campana in _outbound_camp) or (t_llamada in _outbound_llam)
         is_dialer = (t_campana == CallType.DIALER_ID or t_llamada == CallType.DIALER_ID)
         
         # CORRECCIÓN 1: No registrar DIAL para llamadas inbound
@@ -820,8 +834,8 @@ def update_redis_call_stats(message):
         # Siempre registrar el evento específico con su tipo de llamada (excepto DIAL para inbound, ANSWER y EXIT_SHORTCALL)
         field_event = f'CALL_TYPE:{t_llamada}:{event_name}'
         redis_client.hincrby(redis_key, field_event, 1)
-        # Supervisión Dialer: publicar CAMP DIAL para campañas dialer
-        if event_name == 'DIAL' and is_dialer:
+        # Supervisión salientes: DIAL ya excluyó inbound arriba; publicar siempre (evita perder WS si tipo_campana viene 0).
+        if event_name == 'DIAL':
             _publish_camp_event(redis_client, campana_id, 'DIAL')
         
         # Mapeo de eventos a claves de estadísticas específicas
@@ -878,6 +892,12 @@ def update_redis_call_stats(message):
                 _publish_inbound_wait_time(redis_client, campana_id, bridge_wait_time)
             elif is_dialer:
                 _publish_camp_event(redis_client, campana_id, 'CONNECT')
+            elif is_outbound:
+                _publish_camp_event(
+                    redis_client,
+                    campana_id,
+                    'EXIT_ANSWERED_BOT' if atendida_por_voicebot else 'EXIT_ANSWERED_HUMAN',
+                )
         elif event_name in [HangupCause.COMPLETEAGENT.value, HangupCause.COMPLETEOUTNUM.value]:
             # Estos eventos también indican que la llamada fue atendida
             # Determinar si fue atendida por voicebot o humano
@@ -929,6 +949,12 @@ def update_redis_call_stats(message):
                 _publish_inbound_wait_time(redis_client, campana_id, bridge_wait_time)
             elif is_dialer:
                 _publish_camp_event(redis_client, campana_id, 'CONNECT')
+            elif is_outbound:
+                _publish_camp_event(
+                    redis_client,
+                    campana_id,
+                    'EXIT_ANSWERED_BOT' if atendida_por_voicebot else 'EXIT_ANSWERED_HUMAN',
+                )
         
         # EXIT_ABANDON: llamadas abandonadas
         # CORRECCIÓN: Solo normalizar si el evento NO es exactamente EXIT_ABANDON (para evitar duplicación)
@@ -965,8 +991,8 @@ def update_redis_call_stats(message):
                     e,
                     exc_info=True,
                 )
-        # Supervisión Dialer: eventos de no contactación / no diálogo para campañas dialer
-        if is_dialer and event_name in CAMP_DIALER_NO_CONTACT_EVENTS:
+        # Supervisión salientes: no contactación / no diálogo (manual, preview, dialer)
+        if is_outbound and event_name in CAMP_DIALER_NO_CONTACT_EVENTS:
             _publish_camp_event(redis_client, campana_id, event_name)
         
         # CORRECCIÓN 2: No duplicar EXIT_EXPIRE cuando ya se registró EXIT_TIMEOUT
