@@ -290,6 +290,7 @@ class ARIApp:
             'CIRCUIT_BREAKER_SATURATION_FAILURE_THRESHOLD': settings_obj.CIRCUIT_BREAKER_SATURATION_FAILURE_THRESHOLD,
             'CIRCUIT_BREAKER_SATURATION_TIME_WINDOW': settings_obj.CIRCUIT_BREAKER_SATURATION_TIME_WINDOW,
             'CIRCUIT_BREAKER_SATURATION_MIN_EVENTS': settings_obj.CIRCUIT_BREAKER_SATURATION_MIN_EVENTS,
+            'EVENT_QUEUE_MAX_SIZE': settings_obj.EVENT_QUEUE_MAX_SIZE,
             'REDIS_LOCK_TIMEOUT': settings_obj.REDIS_LOCK_TIMEOUT,
             'REDIS_LOCK_BLOCKING_TIMEOUT': settings_obj.REDIS_LOCK_BLOCKING_TIMEOUT,
         }
@@ -319,8 +320,9 @@ class ARIApp:
             recovery_time=int(settings.CIRCUIT_BREAKER_RECOVERY_TIMEOUT),
         )
         
-        # Cola FIFO infinita y único hilo consumidor (Event Loop) para procesamiento secuencial
-        self.event_queue = queue.Queue()
+        # Cola FIFO acotada y único hilo consumidor (Event Loop) para procesamiento secuencial
+        self.event_queue = queue.Queue(maxsize=settings.EVENT_QUEUE_MAX_SIZE)
+        self.reconnect_count = 0  # Usado para restablecer cuenta tras conexión exitosa
         self.consumer_thread = threading.Thread(
             target=self._event_worker,
             name="EventLoop",
@@ -391,41 +393,41 @@ class ARIApp:
         )
         
         self.consumer_thread.start()
-        reconnect_count = 0
+        # reconnect_count se maneja como variable de clase ahora.
         while not self.shutting_down:
             try:
                 self._connect()
             except ConnectionError as e:
-                reconnect_count += 1
+                self.reconnect_count += 1
                 logger.error(
                     f"🔥 Error de conexión al intentar conectar a {self.ari.host}:{self.ari.port}: {e}. "
-                    f"Reintento #{reconnect_count}"
+                    f"Reintento #{self.reconnect_count}"
                 )
             except TimeoutError as e:
-                reconnect_count += 1
+                self.reconnect_count += 1
                 logger.error(
                     f"🔥 Timeout al intentar conectar a {self.ari.host}:{self.ari.port}: {e}. "
-                    f"Reintento #{reconnect_count}"
+                    f"Reintento #{self.reconnect_count}"
                 )
             except OSError as e:
-                reconnect_count += 1
+                self.reconnect_count += 1
                 logger.error(
                     f"🔥 Error del sistema operativo al conectar a {self.ari.host}:{self.ari.port}: {e}. "
-                    f"Reintento #{reconnect_count}",
+                    f"Reintento #{self.reconnect_count}",
                     exc_info=True
                 )
             except websocket.WebSocketException as e:
-                reconnect_count += 1
+                self.reconnect_count += 1
                 logger.error(
                     f"🔥 Error del WebSocket al conectar a {self.ari.host}:{self.ari.port}: {e}. "
-                    f"Reintento #{reconnect_count}",
+                    f"Reintento #{self.reconnect_count}",
                     exc_info=True
                 )
             except Exception as e:
-                reconnect_count += 1
+                self.reconnect_count += 1
                 logger.error(
                     f"🔥 Excepción inesperada en loop de conexión WebSocket hacia {self.ari.host}:{self.ari.port}: "
-                    f"{type(e).__name__}: {e}. Reintento #{reconnect_count}",
+                    f"{type(e).__name__}: {e}. Reintento #{self.reconnect_count}",
                     exc_info=True
                 )
             
@@ -451,20 +453,23 @@ class ARIApp:
             on_message=self._on_message,
             on_error=self._on_error,
             on_close=self._on_close,
-            on_open=lambda ws: logger.info(
-                f"✅ Conectado exitosamente a ARI App: {self.ari_app}"
-            )
+            on_open=self._on_open,
         )
         
         self.ws.run_forever(ping_interval=20, ping_timeout=10)
     
+    def _on_open(self, ws):
+        """Callback ejecutado al conectar exitosamente."""
+        self.reconnect_count = 0
+        logger.info(f"✅ Conectado exitosamente a ARI App: {self.ari_app}")
+
     def _event_worker(self):
         """
         Hilo consumidor que procesa eventos de la cola de forma secuencial (FIFO).
         Garantiza que un error en el router no mate al worker.
         Establece el callid en contexto de logging por evento y lo restaura al salir.
         """
-        while not self.shutting_down:
+        while not self.shutting_down or not self.event_queue.empty():
             try:
                 event_dict = self.event_queue.get(timeout=1.0)
             except queue.Empty:
@@ -614,8 +619,16 @@ class ARIApp:
                 )
                 return
             
-            self.event_queue.put(event_dict)
-            self.circuit_breaker.record_event(dropped=False)
+            try:
+                self.event_queue.put(event_dict, block=False)
+                self.circuit_breaker.record_event(dropped=False)
+            except queue.Full:
+                self.metrics.record_dropped(event_type)
+                self.circuit_breaker.record_event(dropped=True)
+                logger.error(
+                    f"🚨 Cola llena (OOM protection): Evento descartado sin procesar. "
+                    f"Tipo: {event_type}."
+                )
             
         except json.JSONDecodeError as e:
             logger.debug(f"⚠️ Error parseando mensaje JSON del WebSocket: {e}")

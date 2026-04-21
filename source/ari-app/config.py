@@ -135,6 +135,9 @@ class Settings(BaseSettings):
     CIRCUIT_BREAKER_SATURATION_MIN_EVENTS: int = Field(
         default=100, ge=1, description="Mínimo de eventos en la ventana para activar el breaker de saturación"
     )
+    EVENT_QUEUE_MAX_SIZE: int = Field(
+        default=10000, ge=1, description="Tamaño máximo de la cola de eventos en memoria (protege OOM y dispara circuit breaker)"
+    )
     REDIS_LOCK_TIMEOUT: int = Field(default=30, ge=1, description="Tiempo máximo del lock en Redis (segundos)")
     REDIS_LOCK_BLOCKING_TIMEOUT: int = Field(default=15, ge=1, description="Tiempo máximo para adquirir lock (segundos)")
     # Redis del dialer (DB donde está OML:CALLS:{id_camp}:DIALER). El decremento lo realiza naive.py; ari-app no modifica esta clave. Si no se setea REDIS_DIALER_URL, se deriva de REDIS_URL con este DB.
