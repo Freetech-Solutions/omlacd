@@ -2,36 +2,36 @@
 
 set -euo pipefail
 
-#####################################
-# Configuración base
-#####################################
+######################
+# Configuración base #
+######################
 
 DEFAULT_ASTERISK_CMD=(/usr/sbin/asterisk -T -U omnileads -p -f)
 
 # Helper: evaluación booleana (true/1/yes, case-insensitive)
 is_true() {
   local val="${1:-}"
-  val="${val,,}"          # minúsculas
+  val="${val,,}"
   case "$val" in
     true|1|yes|y) return 0 ;;
     *)            return 1 ;;
   esac
 }
 
-#####################################
-# Validación de variables base
-#####################################
+################################
+# Validación de variables base #
+################################
 
-for var in ENV TZ AMI_USER AMI_PASSWORD; do
-  if [ -z "${!var:-}" ]; then
-    echo "ERROR: environment variable '$var' must be set" >&2
+for var in ENV TZ AMI_USER AMI_PASSWORD;do
+  if [ -z "${!var:-}" ];then
+    echo "ERROR: Environment variable '$var' must be set" >&2
     exit 1
   fi
 done
 
-#####################################
-# Defaults globales seguros
-#####################################
+#############################
+# Defaults globales seguros #
+#############################
 
 LOG_LEVEL=${LOG_LEVEL:-0}
 
@@ -63,26 +63,24 @@ DIALER_HOST=${DIALER_HOST:-""}
 ASTERISK_HOSTNAME=${ASTERISK_HOSTNAME:-"localhost"}
 ASTERISK_VIP=${ASTERISK_VIP:-"$ASTERISK_HOSTNAME"}
 
-#####################################
-# Funciones de configuración
-#####################################
+##############################
+# Funciones de configuración #
+##############################
 
 set_public_ip() {
-  # Dev: típicamente no queremos depender de un servicio externo
-  if [[ "${ENV}" == "dev" ]]; then
+  if [[ "${ENV}" == "dev" ]];then
     PUBLIC_IP="127.0.0.1"
     return
   fi
 
-  # Para otros entornos, si ya viene seteada la respetamos
-  if [[ -n "${PUBLIC_IP}" ]]; then
+  if [[ -n "${PUBLIC_IP}" ]];then
     return
   fi
 
-  if PUBLIC_IP="$(curl --retry 3 --connect-timeout 5 --max-time 10 -fsSL http://ipinfo.io/ip)"; then
+  if PUBLIC_IP="$(curl --retry 3 --connect-timeout 5 --max-time 10 -fsSL http://ipinfo.io/ip)";then
     :
   else
-    echo "WARN: could not fetch public IP, defaulting to 127.0.0.1" >&2
+    echo "WARNING: Could not fetch PUBLIC_IP, defaulting to 127.0.0.1" >&2
     PUBLIC_IP="127.0.0.1"
   fi
 }
@@ -92,7 +90,7 @@ configure_timezone() {
 
   local tz_file="/usr/share/zoneinfo/${TZ}"
 
-  if [[ ! -f "${tz_file}" ]]; then
+  if [[ ! -f "${tz_file}" ]];then
     echo "ERROR: Timezone file '${tz_file}' does not exist. Check TZ env var." >&2
     exit 1
   fi
@@ -102,11 +100,11 @@ configure_timezone() {
 }
 
 configure_ami_ari() {
-  echo "**[omlacd] Writing the AMI config"
+  echo "**[omlacd] Writing the AMI configuration"
   sed -i "s/amiuser/${AMI_USER}/g" /etc/asterisk/oml_manager.conf
   sed -i "s/amipassword/${AMI_PASSWORD}/g" /etc/asterisk/oml_manager.conf
 
-  echo "**[omlacd] Writing the ARI config"
+  echo "**[omlacd] Writing the ARI configuration"
   sed -i "s/ariuser/${AMI_USER}/g" /etc/asterisk/oml_ari.conf
   sed -i "s/aripassword/${AMI_PASSWORD}/g" /etc/asterisk/oml_ari.conf
 }
@@ -114,151 +112,152 @@ configure_ami_ari() {
 configure_env_bindings() {
   case "${ENV}" in
     dev)
-      echo "devenv docker-compose"
+      echo "[acd-entrypoint] ENV=devenv"
       sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_manager.conf
       sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_http.conf
-      ;;
+    ;;
 
     custom)
-      echo "production custom VoIP environment"
+      echo "[acd-entrypoint] ENV=custom"
       sed -i "s/bindaddr=127.0.0.1/bindaddr=${API_LISTEN_IP:?API_LISTEN_IP must be set for ENV=custom}/g" /etc/asterisk/oml_manager.conf
       sed -i "s/bindaddr=127.0.0.1/bindaddr=${API_LISTEN_IP:?API_LISTEN_IP must be set for ENV=custom}/g" /etc/asterisk/oml_http.conf
       sed -i "s/bind=0.0.0.0:5160/bind=${PJSIP_IP_AGENT:?PJSIP_IP_AGENT must be set for ENV=custom}:5160/g" /etc/asterisk/oml_pjsip_transports.conf
       sed -i "s/bind=0.0.0.0:5060/bind=${PJSIP_IP_TRUNK:?PJSIP_IP_TRUNK must be set for ENV=custom}:5060/g" /etc/asterisk/oml_pjsip_transports.conf
       sed -i "s/bind=127.0.0.1:5260/bind=${PJSIP_IP_DIALER:?PJSIP_IP_DIALER must be set for ENV=custom}:5260/g" /etc/asterisk/oml_pjsip_transports.conf
-      if [[ -n "${PUBLIC_IP}" ]]; then
-        sed -i "s/;external_media_address=extern_ip_nat/external_media_address=${PUBLIC_IP}/g" /etc/asterisk/oml_pjsip_transports.conf
-        sed -i "s/;external_signaling_address=extern_ip_nat/external_signaling_address=${PUBLIC_IP}/g" /etc/asterisk/oml_pjsip_transports.conf
+      if [[ "${PJSIP_IP_TRUNK_EXTERNAL_MEDIA_ADDR}" != "NO_NAT" ]];then
+        sed -i "s/;external_media_address=extern_ip_nat/external_media_address=${PJSIP_IP_TRUNK_EXTERNAL_MEDIA_ADDR}/g" /etc/asterisk/oml_pjsip_transports.conf
       fi
-      ;;
+      if [[ "${PJSIP_IP_TRUNK_EXTERNAL_SIGNALING_ADDR}" != "NO_NAT" ]];then
+        sed -i "s/;external_signaling_address=extern_ip_nat/external_signaling_address=${PJSIP_IP_TRUNK_EXTERNAL_SIGNALING_ADDR}/g" /etc/asterisk/oml_pjsip_transports.conf
+      fi
+    ;;
 
     prod)
-      echo "production env with docker-compose"
+      echo "[acd-entrypoint] ENV=prod"
       sed -i "s/bindaddr=127.0.0.1/bindaddr=${ASTERISK_HOSTNAME}/g" /etc/asterisk/oml_manager.conf
       sed -i "s/bindaddr=127.0.0.1/bindaddr=${ASTERISK_HOSTNAME}/g" /etc/asterisk/oml_http.conf
       sed -i "s/bind=0.0.0.0:5160/bind=${ASTERISK_HOSTNAME}:5160/g" /etc/asterisk/oml_pjsip_transports.conf
 
-      # Lógica corregida para NAT vs no NAT
-      if is_true "${VOIP_NAT_FLAG}"; then
+      if is_true "${VOIP_NAT_FLAG}";then
         # NAT: bind en hostname, external_* apuntando a PUBLIC_IP
         sed -i "s/bind=0.0.0.0:5060/bind=${ASTERISK_HOSTNAME}:5060/g" /etc/asterisk/oml_pjsip_transports.conf
         sed -i "s/;external_media_address=extern_ip_nat/external_media_address=${PUBLIC_IP}/g" /etc/asterisk/oml_pjsip_transports.conf
         sed -i "s/;external_signaling_address=extern_ip_nat/external_signaling_address=${PUBLIC_IP}/g" /etc/asterisk/oml_pjsip_transports.conf
       else
         # Sin NAT: bind directo a PUBLIC_IP si es distinta del hostname
-        if [[ "${PUBLIC_IP}" != "${ASTERISK_HOSTNAME}" ]]; then
+        if [[ "${PUBLIC_IP}" != "${ASTERISK_HOSTNAME}" ]];then
           sed -i "s/bind=0.0.0.0:5060/bind=${PUBLIC_IP}:5060/g" /etc/asterisk/oml_pjsip_transports.conf
         else
           sed -i "s/bind=0.0.0.0:5060/bind=${ASTERISK_HOSTNAME}:5060/g" /etc/asterisk/oml_pjsip_transports.conf
         fi
       fi
-      ;;
+    ;;
 
     cloud)
-      echo "******* cloud scenary *******"
+      echo "[acd-entrypoint] ENV=cloud"
       sed -i "s/bindaddr=127.0.0.1/bindaddr=${ASTERISK_HOSTNAME}/g" /etc/asterisk/oml_manager.conf
       sed -i "s/bind=0.0.0.0:5160/bind=${ASTERISK_HOSTNAME}:5160/g" /etc/asterisk/oml_pjsip_transports.conf
       sed -i "s/bind=0.0.0.0:5060/bind=${PUBLIC_IP}:5060/g" /etc/asterisk/oml_pjsip_transports.conf
-      if [[ "${ARQ}" == "cluster" ]]; then
+      if [[ "${ARQ}" == "cluster" ]];then
         sed -i "s/bindaddr=127.0.0.1/bindaddr=${ASTERISK_HOSTNAME}/g" /etc/asterisk/oml_http.conf
       fi
       sed -i "s/10.22.22.199:5060/${PUBLIC_IP}:5060/g" /etc/asterisk/oml_pjsip_wizard.conf
-      ;;
+    ;;
 
     cloud_external_dialer)
-      echo "******* cloud scenary with external dialer *******"
+      echo "[acd-entrypoint] ENV=cloud_external_dialer"
       sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_manager.conf
       sed -i "s/bind=0.0.0.0:5160/bind=${ASTERISK_HOSTNAME}:5160/g" /etc/asterisk/oml_pjsip_transports.conf
       sed -i "s/bind=0.0.0.0:5060/bind=${PUBLIC_IP}:5060/g" /etc/asterisk/oml_pjsip_transports.conf
-      if [[ "${ARQ}" == "cluster" ]]; then
+      if [[ "${ARQ}" == "cluster" ]];then
         sed -i "s/bindaddr=127.0.0.1/bindaddr=${ASTERISK_HOSTNAME}/g" /etc/asterisk/oml_http.conf
       fi
-      ;;
+    ;;
 
     lan)
-      echo "******** lan scenary *******"
+      echo "[acd-entrypoint] ENV=lan"
       sed -i "s/bindaddr=127.0.0.1/bindaddr=${ASTERISK_HOSTNAME}/g" /etc/asterisk/oml_manager.conf
       sed -i "s/bind=0.0.0.0:5160/bind=${ASTERISK_HOSTNAME}:5160/g" /etc/asterisk/oml_pjsip_transports.conf
       sed -i "s/bind=0.0.0.0:5060/bind=${ASTERISK_HOSTNAME}:5060/g" /etc/asterisk/oml_pjsip_transports.conf
-      if [[ "${ARQ}" == "cluster" ]]; then
+      if [[ "${ARQ}" == "cluster" ]];then
         sed -i "s/bindaddr=127.0.0.1/bindaddr=${ASTERISK_HOSTNAME}/g" /etc/asterisk/oml_http.conf
       fi
-      ;;
+    ;;
 
     nat)
-      echo "********* nat scenary *******"
+      echo "[acd-entrypoint] ENV=nat"
       sed -i "s/bindaddr=127.0.0.1/bindaddr=${ASTERISK_HOSTNAME}/g" /etc/asterisk/oml_manager.conf
       sed -i "s/bind=0.0.0.0:5160/bind=${ASTERISK_HOSTNAME}:5160/g" /etc/asterisk/oml_pjsip_transports.conf
       sed -i "s/bind=0.0.0.0:5060/bind=${ASTERISK_HOSTNAME}:5060/g" /etc/asterisk/oml_pjsip_transports.conf
       sed -i "s/;external_media_address=extern_ip_nat/external_media_address=${PUBLIC_IP}/g" /etc/asterisk/oml_pjsip_transports.conf
       sed -i "s/;external_signaling_address=extern_ip_nat/external_signaling_address=${PUBLIC_IP}/g" /etc/asterisk/oml_pjsip_transports.conf
-      if [[ "${ARQ}" == "cluster" ]]; then
+      if [[ "${ARQ}" == "cluster" ]];then
         sed -i "s/bindaddr=127.0.0.1/bindaddr=${ASTERISK_HOSTNAME}/g" /etc/asterisk/oml_http.conf
       fi
-      ;;
+    ;;
 
     hybrid)
-      echo "********* hybrid scenary *******"
+      echo "[acd-entrypoint] ENV=hybrid"
       sed -i "s/bindaddr=127.0.0.1/bindaddr=${ASTERISK_HOSTNAME}/g" /etc/asterisk/oml_manager.conf
       sed -i "s/bind=0.0.0.0:5160/bind=${ASTERISK_HOSTNAME}:5160/g" /etc/asterisk/oml_pjsip_transports.conf
       sed -i "s/bind=0.0.0.0:5060/bind=${ASTERISK_HOSTNAME}:5060/g" /etc/asterisk/oml_pjsip_transports.conf
-      if [[ "${ARQ}" == "cluster" ]]; then
+      if [[ "${ARQ}" == "cluster" ]];then
         sed -i "s/bindaddr=127.0.0.1/bindaddr=${ASTERISK_HOSTNAME}/g" /etc/asterisk/oml_http.conf
       fi
-      ;;
+    ;;
 
     all)
-      echo "******* open 0.0.0.0 + nat scenary *******"
+      echo "[acd-entrypoint] ENV=all"
       sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_manager.conf
       sed -i "s/bind=0.0.0.0:5160/bind=0.0.0.0:5160/g" /etc/asterisk/oml_pjsip_transports.conf
       sed -i "s/bind=0.0.0.0:5060/bind=0.0.0.0:5060/g" /etc/asterisk/oml_pjsip_transports.conf
       sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_http.conf
-      ;;
+    ;;
 
     all_ait)
-      echo "******* open 0.0.0.0 scenary *******"
+      echo "[acd-entrypoint] ENV=all_ait"
       sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_manager.conf
       sed -i "s/bind=0.0.0.0:5160/bind=0.0.0.0:5160/g" /etc/asterisk/oml_pjsip_transports.conf
       sed -i "s/bind=0.0.0.0:5060/bind=0.0.0.0:5060/g" /etc/asterisk/oml_pjsip_transports.conf
       sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_http.conf
-      ;;
+    ;;
 
     all_ait_nat)
-      echo "******* open 0.0.0.0 scenary *******"
+      echo "[acd-entrypoint] ENV=all_ait_nat"
       sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_manager.conf
       sed -i "s/bind=0.0.0.0:5160/bind=0.0.0.0:5160/g" /etc/asterisk/oml_pjsip_transports.conf
       sed -i "s/bind=0.0.0.0:5060/bind=0.0.0.0:5060/g" /etc/asterisk/oml_pjsip_transports.conf
       sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_http.conf
       sed -i "s/;external_media_address=extern_ip_nat/external_media_address=${PUBLIC_IP}/g" /etc/asterisk/oml_pjsip_transports.conf
       sed -i "s/;external_signaling_address=extern_ip_nat/external_signaling_address=${PUBLIC_IP}/g" /etc/asterisk/oml_pjsip_transports.conf
-      ;;
+    ;;
 
     all_ait_nat_mediaonly)
-      echo "******* open 0.0.0.0 scenary *******"
+      echo "[acd-entrypoint] ENV=all_ait_nat_mediaonly"
       sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_manager.conf
       sed -i "s/bind=0.0.0.0:5160/bind=0.0.0.0:5160/g" /etc/asterisk/oml_pjsip_transports.conf
       sed -i "s/bind=0.0.0.0:5060/bind=0.0.0.0:5060/g" /etc/asterisk/oml_pjsip_transports.conf
       sed -i "s/bindaddr=127.0.0.1/bindaddr=0.0.0.0/g" /etc/asterisk/oml_http.conf
       sed -i "s/;external_media_address=extern_ip_nat/external_media_address=${PUBLIC_IP}/g" /etc/asterisk/oml_pjsip_transports.conf
-      ;;
+    ;;
 
     ha)
-      echo "******** HA scenary *******"
+      echo "[acd-entrypoint] ENV=ha"
       sed -i "s/bindaddr=127.0.0.1/bindaddr=${ASTERISK_VIP}/g" /etc/asterisk/oml_manager.conf
       sed -i "s/bind=0.0.0.0:5160/bind=${ASTERISK_HOSTNAME}:5160/g" /etc/asterisk/oml_pjsip_transports.conf
       sed -i "s/bind=0.0.0.0:5060/bind=${ASTERISK_VIP}:5060/g" /etc/asterisk/oml_pjsip_transports.conf
       sed -i "s/bindaddr=127.0.0.1/bindaddr=${ASTERISK_VIP}/g" /etc/asterisk/oml_http.conf
-      ;;
+    ;;
 
     *)
       echo "ERROR: Invalid ENV='${ENV}'. Valid values: dev, custom, prod, cloud, cloud_external_dialer, lan, nat, hybrid, all, all_ait, all_ait_nat, all_ait_nat_mediaonly, ha" >&2
       exit 1
-      ;;
+    ;;
   esac
 }
 
 configure_homer() {
-  if ! is_true "${HOMER_ENABLE}"; then
+  if ! is_true "${HOMER_ENABLE}";then
     return
   fi
 
@@ -269,9 +268,8 @@ configure_homer() {
   sed -i -E "s#^(capture_name\s*=\s*).*#\1${TENANT_ID}#" /etc/asterisk/hep.conf
 }
 
-
 configure_scale() {
-  if ! is_true "${SCALE:-}"; then
+  if ! is_true "${SCALE:-}";then
     return
   fi
 
@@ -290,11 +288,11 @@ configure_scale() {
 }
 
 configure_dialer() {
-  if [[ -n "${DIALER_HOST}" ]]; then
+  if [[ -n "${DIALER_HOST}" ]];then
     sed -i "s/dialer-asterisk/${DIALER_HOST}/g" /etc/asterisk/oml_pjsip_wizard.conf
   fi
 
-  if [[ -n "${DIALER_HOST}" && "${DIALER_HOST}" != "127.0.0.1" ]]; then
+  if [[ -n "${DIALER_HOST}" && "${DIALER_HOST}" != "127.0.0.1" ]];then
     sed -i "s/127.0.0.1:5260/${ASTERISK_HOSTNAME}:5260/g" /etc/asterisk/oml_pjsip_transports.conf
   fi
 }
@@ -314,20 +312,20 @@ fix_permissions() {
     /var/spool/asterisk/monitor
   )
 
-  for p in "${paths[@]}"; do
-    if [[ -e "${p}" ]]; then
+  for p in "${paths[@]}";do
+    if [[ -e "${p}" ]];then
       chown -R omnileads:omnileads "${p}"
     fi
   done
 }
 
 start_asterisk() {
-  echo "**[omlacd] Initializing asterisk"
+  echo "**[omlacd] Starting asterisk"
 
   fix_permissions
 
   # Set log-level
-  if [[ "${LOG_LEVEL}" == "3" ]]; then
+  if [[ "${LOG_LEVEL}" == "3" ]];then
     sed -i -e "s/security/security,dtmf/g" /etc/asterisk/logger.conf
     exec "${DEFAULT_ASTERISK_CMD[@]}" -vvv "$@"
   else
@@ -335,9 +333,9 @@ start_asterisk() {
   fi
 }
 
-#####################################
-# Lógica principal / manejo de args
-#####################################
+###########################################
+# Lógica principal / Manejo de argumentos #
+###########################################
 
 main() {
   # Determinar si estamos arrancando Asterisk o un comando arbitrario
@@ -345,19 +343,19 @@ main() {
 
   local run_asterisk="false"
 
-  if [[ -z "${first_arg}" ]]; then
+  if [[ -z "${first_arg}" ]];then
     # Sin argumentos -> comportamiento clásico: configurar + asterisk
     run_asterisk="true"
-  elif [[ "${first_arg}" == "asterisk" ]]; then
+  elif [[ "${first_arg}" == "asterisk" ]];then
     # docker run imagen asterisk ...
     run_asterisk="true"
     shift
-  elif [[ "${first_arg}" == -* ]]; then
+  elif [[ "${first_arg}" == -* ]];then
     # docker run imagen -vvv (flags para asterisk)
     run_asterisk="true"
   fi
 
-  if [[ "${run_asterisk}" == "true" ]]; then
+  if [[ "${run_asterisk}" == "true" ]];then
     # Configuración completa antes de levantar Asterisk
     set_public_ip
     configure_timezone
