@@ -499,7 +499,10 @@ class ProgressiveCampaignHandler(BaseHandler):
                         "ts_answer_iso": None,
                     }
                     if id_camp and self.route_validator:
-                        trunk_callerid = self.route_validator.get_trunk_callerid(id_camp)
+                        trunk_callerid = self.route_validator.get_trunk_callerid(
+                            id_camp,
+                            override_route_id=pending_data.get("effective_route_id"),
+                        )
                         if trunk_callerid is not None:
                             call_data["numero_origen"] = trunk_callerid
                     self.reporter.log_segment_end(
@@ -1015,7 +1018,10 @@ class ProgressiveCampaignHandler(BaseHandler):
                             "is_voicebot_transfer": bool(is_post_voicebot_handoff),
                         }
                         if call_type == CallType.DIALER_ID and context.id_camp and self.route_validator:
-                            trunk_callerid = self.route_validator.get_trunk_callerid(context.id_camp)
+                            trunk_callerid = self.route_validator.get_trunk_callerid(
+                                context.id_camp,
+                                override_route_id=getattr(context, "effective_route_id", None),
+                            )
                             if trunk_callerid is not None:
                                 call_data["numero_origen"] = trunk_callerid
                         self.reporter.log_segment_end(
@@ -1069,7 +1075,10 @@ class ProgressiveCampaignHandler(BaseHandler):
                             "is_voicebot_transfer": getattr(context, "is_voicebot_transfer", False),
                         }
                         if call_type == CallType.DIALER_ID and context.id_camp and self.route_validator:
-                            trunk_callerid = self.route_validator.get_trunk_callerid(context.id_camp)
+                            trunk_callerid = self.route_validator.get_trunk_callerid(
+                                context.id_camp,
+                                override_route_id=getattr(context, "effective_route_id", None),
+                            )
                             if trunk_callerid is not None:
                                 call_data["numero_origen"] = trunk_callerid
                         quien_corto = 1 if getattr(context, "inbound_agent_hung_up_first", False) else 2

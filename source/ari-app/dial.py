@@ -192,6 +192,7 @@ def dial_to_omlagent(
     # Si campaign_id > 0, validar que el número cumpla los patrones de la ruta
     external_sip_trunk = None
     prepend = ""
+    effective_route_id = None
     if campaign_id and int(campaign_id) > 0:
         # Usar route_validator inyectado o crear instancia temporal para compatibilidad hacia atrás
         if route_validator is None:
@@ -199,7 +200,7 @@ def dial_to_omlagent(
             logger.debug("dial_to_omlagent: Creando instancia temporal de RouteValidator")
 
         # Validar que el número cumpla los patrones de la ruta saliente
-        valid, prepend = route_validator.validate_route(phone_number, campaign_id)
+        valid, prepend, effective_route_id = route_validator.validate_route(phone_number, campaign_id)
         if not valid:
             logger.warning(
                 f"dial_to_omlagent: ❌ Validación de ruta fallida para número {phone_number} "
@@ -245,7 +246,10 @@ def dial_to_omlagent(
             return None
 
         # Obtener el trunk SIP asociado a la campaña (para enviarlo en appArgs)
-        external_sip_trunk = route_validator.get_sip_trunk(campaign_id)
+        external_sip_trunk = route_validator.get_sip_trunk(
+            campaign_id,
+            override_route_id=effective_route_id,
+        )
         if external_sip_trunk:
             logger.debug(
                 f"dial_to_omlagent: Trunk SIP obtenido para campaña {campaign_id}: {external_sip_trunk}"
@@ -276,6 +280,8 @@ def dial_to_omlagent(
     }
     if campaign_id and int(campaign_id) > 0:
         metadata['outbound_prepend'] = prepend
+    if effective_route_id:
+        metadata['effective_route_id'] = effective_route_id
 
     # Agregar external_sip_trunk si está disponible (usado por manual.py para originar hacia PSTN)
     if external_sip_trunk:

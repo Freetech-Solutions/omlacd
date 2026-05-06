@@ -29,6 +29,12 @@ The repository is organized as follows:
 
 This component is not intended for standalone deployment. It is built into a Docker image using the provided `Dockerfile` and deployed as a service within the Omnileads ecosystem. The entire lifecycle, from build to deployment and configuration, is managed by the `omldeploytool`.
 
+### Operational note for outbound-route autorouting
+
+When deploying versions that include RouteValidator fallback routing (campaign without explicit `OUTR`), Redis outbound-route families must be regenerated so `OML:OUTR:{id}` contains `ORDEN` and the sorted index `OML:OUTR:INDEX` is populated.
+
+Run the usual Django/Asterisk sync step that triggers `regenerar_familys_rutas()` before restarting ACD workers. Without this refresh, the fallback still works via `SCAN` as a compatibility mode, but route selection order may be stale until families are regenerated.
+
 ## Versioning
 
 *   The component version is tracked with git `tags`.

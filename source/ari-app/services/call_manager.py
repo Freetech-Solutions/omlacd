@@ -149,9 +149,10 @@ class CallActionService:
         # Validar ruta y obtener troncal SIP desde Redis (OML:CAMP → OML:OUTR → OML:TRUNK)
         external_sip_trunk = None
         prepend = ""
+        effective_route_id = None
         if campaign_id and int(campaign_id) > 0 and redis_client:
             route_validator = self.route_validator or RouteValidator(redis_client=redis_client)
-            valid, prepend = route_validator.validate_route(number, campaign_id)
+            valid, prepend, effective_route_id = route_validator.validate_route(number, campaign_id)
             if not valid:
                 self.logger.warning(f"Route validation failed for {number} in campaign {campaign_id} (progressive dial)")
                 if self.reporter:
@@ -193,7 +194,10 @@ class CallActionService:
                             number, campaign_id,
                         )
                 return
-            external_sip_trunk = route_validator.get_sip_trunk(campaign_id)
+            external_sip_trunk = route_validator.get_sip_trunk(
+                campaign_id,
+                override_route_id=effective_route_id,
+            )
             if not external_sip_trunk:
                 self.logger.warning(
                     "Progressive dial: no se encontró troncal SIP para campaña %s (OML:OUTR/OML:TRUNK). "
@@ -214,6 +218,8 @@ class CallActionService:
             'call_type': CallType.DIALER_ID,  # 2 = dialer progressive (reporting / acd-log-processor)
             'progressive': 1,  # Marcador para router: StasisStart → ProgressiveCampaignHandler
         }
+        if effective_route_id:
+            metadata['effective_route_id'] = effective_route_id
         attributes = payload.get('attributes', {})
         if isinstance(attributes, dict):
             metadata.update(attributes)
@@ -273,12 +279,13 @@ class CallActionService:
 
         external_sip_trunk = None
         prepend = ""
+        effective_route_id = None
         if campaign_id and int(campaign_id) > 0:
             if not redis_client:
                 self.logger.error("Redis client not available for route validation")
                 return
             route_validator = self.route_validator or RouteValidator(redis_client=redis_client)
-            valid, prepend = route_validator.validate_route(number, campaign_id)
+            valid, prepend, effective_route_id = route_validator.validate_route(number, campaign_id)
             if not valid:
                 self.logger.warning(f"Route validation failed for {number} in campaign {campaign_id}")
                 if self.reporter:
@@ -319,7 +326,10 @@ class CallActionService:
                             number, campaign_id,
                         )
                 return
-            external_sip_trunk = route_validator.get_sip_trunk(campaign_id)
+            external_sip_trunk = route_validator.get_sip_trunk(
+                campaign_id,
+                override_route_id=effective_route_id,
+            )
             prepend = prepend or ""
 
         metadata = {
@@ -334,6 +344,8 @@ class CallActionService:
         }
         if campaign_id and int(campaign_id) > 0:
             metadata['outbound_prepend'] = prepend
+        if effective_route_id:
+            metadata['effective_route_id'] = effective_route_id
         if external_sip_trunk:
             metadata['external_sip_trunk'] = external_sip_trunk
 
@@ -434,7 +446,10 @@ class CallActionService:
         id_camp = metadata.get('id_camp', '')
         tel_customer = metadata.get('tel_customer', number)
         if self.route_validator and id_camp:
-            caller_id = self.route_validator.get_trunk_callerid(id_camp)
+            caller_id = self.route_validator.get_trunk_callerid(
+                id_camp,
+                override_route_id=metadata.get("effective_route_id"),
+            )
         else:
             caller_id = None
         if caller_id is None or caller_id == '':

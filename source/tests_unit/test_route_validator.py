@@ -38,6 +38,12 @@ class TestRouteValidatorGetTrunkCallerid(unittest.TestCase):
         self.redis = MagicMock()
         self.validator = self.RouteValidator(redis_client=self.redis)
         self.RouteValidator._CALLERID_CACHE.clear()
+        self.RouteValidator._CALLERID_CACHE_BY_ROUTE.clear()
+        self.RouteValidator._TRUNK_CACHE.clear()
+        self.RouteValidator._TRUNK_CACHE_BY_ROUTE.clear()
+        self.RouteValidator._ROUTE_CACHE.clear()
+        self.RouteValidator._ROUTE_INDEX_CACHE = []
+        self.RouteValidator._ROUTE_INDEX_CACHE_EXPIRES_AT = 0.0
 
     def test_returns_value_when_callerid_key_exists(self):
         """Cuando OML:TRUNK:{trunk_id}:CALLERID existe, retorna su valor."""
@@ -100,3 +106,137 @@ class TestRouteValidatorGetTrunkCallerid(unittest.TestCase):
         self.assertEqual(r1, "+15559999999")
         self.assertEqual(r2, "+15559999999")
         self.assertEqual(self.redis.get.call_count, 1)
+
+
+class TestRouteValidatorRouteResolution(unittest.TestCase):
+    """Tests para fallback de rutas por pattern matching y overrides."""
+
+    def setUp(self):
+        if isinstance(sys.modules.get("redis"), MagicMock):
+            del sys.modules["redis"]
+        import services.route_validator as rv
+        importlib.reload(rv)
+        self.RouteValidator = rv.RouteValidator
+        self.redis = MagicMock()
+        self.validator = self.RouteValidator(redis_client=self.redis)
+        self.RouteValidator._ROUTE_CACHE.clear()
+        self.RouteValidator._ROUTE_INDEX_CACHE = []
+        self.RouteValidator._ROUTE_INDEX_CACHE_EXPIRES_AT = 0.0
+        self.RouteValidator._TRUNK_CACHE.clear()
+        self.RouteValidator._TRUNK_CACHE_BY_ROUTE.clear()
+
+    def test_validate_route_without_campaign_outr_uses_first_matching_route(self):
+        self.redis.hget.side_effect = lambda k, f: None if f == "OUTR" else None
+        self.redis.zrange.return_value = ["10"]
+        self.redis.hgetall.return_value = {
+            "DP-COUNT": 1,
+            "DP-1-MATCH": "_123.",
+            "DP-1-PREPEND": "9",
+        }
+
+        valid, prepend, route_id = self.validator.validate_route("123456789", "42")
+
+        self.assertTrue(valid)
+        self.assertEqual(prepend, "9")
+        self.assertEqual(route_id, "10")
+
+    def test_validate_route_without_campaign_outr_prefers_lowest_order_from_index(self):
+        self.redis.hget.side_effect = lambda k, f: None if f == "OUTR" else None
+        self.redis.zrange.return_value = ["20", "10"]
+
+        def hgetall_side_effect(key):
+            if str(key).endswith(":20"):
+                return {"DP-COUNT": 1, "DP-1-MATCH": "_123.", "DP-1-PREPEND": "20"}
+            if str(key).endswith(":10"):
+                return {"DP-COUNT": 1, "DP-1-MATCH": "_123.", "DP-1-PREPEND": "10"}
+            return {}
+
+        self.redis.hgetall.side_effect = hgetall_side_effect
+        valid, prepend, route_id = self.validator.validate_route("123456789", "42")
+
+        self.assertTrue(valid)
+        self.assertEqual(route_id, "20")
+        self.assertEqual(prepend, "20")
+
+    def test_validate_route_without_campaign_outr_blocks_when_no_route_matches(self):
+        self.redis.hget.side_effect = lambda k, f: None if f == "OUTR" else None
+        self.redis.zrange.return_value = ["10"]
+        self.redis.hgetall.return_value = {
+            "DP-COUNT": 1,
+            "DP-1-MATCH": "_999.",
+            "DP-1-PREPEND": "0",
+        }
+
+        valid, prepend, route_id = self.validator.validate_route("123456789", "42")
+
+        self.assertFalse(valid)
+        self.assertIsNone(prepend)
+        self.assertIsNone(route_id)
+
+    def test_validate_route_without_index_fallback_scan_uses_order_field(self):
+        self.redis.hget.side_effect = lambda k, f: None if f == "OUTR" else None
+        self.redis.zrange.return_value = []
+        self.redis.scan.side_effect = [
+            ("0", ["OML:OUTR:2", "OML:OUTR:1"]),
+        ]
+
+        def hgetall_side_effect(key):
+            key = str(key)
+            if key == "OML:OUTR:2":
+                return {
+                    "ORDEN": "2",
+                    "NAME": "R2",
+                    "DP-COUNT": 1,
+                    "DP-1-MATCH": "_123.",
+                    "DP-1-PREPEND": "2",
+                }
+            if key == "OML:OUTR:1":
+                return {
+                    "ORDEN": "1",
+                    "NAME": "R1",
+                    "DP-COUNT": 1,
+                    "DP-1-MATCH": "_123.",
+                    "DP-1-PREPEND": "1",
+                }
+            return {}
+
+        self.redis.hgetall.side_effect = hgetall_side_effect
+        valid, prepend, route_id = self.validator.validate_route("123456789", "42")
+
+        self.assertTrue(valid)
+        self.assertEqual(route_id, "1")
+        self.assertEqual(prepend, "1")
+
+    def test_get_sip_trunk_supports_override_route_id(self):
+        def hget_side_effect(key, field):
+            key_text = str(key)
+            if key_text == "OML:OUTR:55" and field == "TRUNK-1":
+                return "7"
+            if key_text == "OML:TRUNK:7" and field == "NAME":
+                return "TroncalSIP7"
+            if field == "OUTR":
+                return None
+            return None
+
+        self.redis.hget.side_effect = hget_side_effect
+        trunk_name = self.validator.get_sip_trunk("42", override_route_id="55")
+        self.assertEqual(trunk_name, "TroncalSIP7")
+
+    def test_campaign_with_explicit_outr_keeps_fail_closed_behavior(self):
+        def hget_side_effect(key, field):
+            if field == "OUTR":
+                return "99"
+            return None
+
+        self.redis.hget.side_effect = hget_side_effect
+        self.redis.hgetall.return_value = {
+            "DP-COUNT": 1,
+            "DP-1-MATCH": "_999.",
+            "DP-1-PREPEND": "",
+        }
+        self.redis.zrange.return_value = ["10"]
+
+        valid, prepend, route_id = self.validator.validate_route("123456789", "42")
+        self.assertFalse(valid)
+        self.assertIsNone(prepend)
+        self.assertIsNone(route_id)

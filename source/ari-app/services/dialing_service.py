@@ -120,11 +120,12 @@ class DialingService:
 
         external_sip_trunk = None
         prepend = ""
+        effective_route_id = None
         if campaign_id and int(campaign_id) > 0:
             if not self.route_validator:
                 self.logger.error("RouteValidator not available for route validation")
                 return None
-            valid, prepend = self.route_validator.validate_route(number, campaign_id)
+            valid, prepend, effective_route_id = self.route_validator.validate_route(number, campaign_id)
             if not valid:
                 self.logger.warning(
                     "Route validation failed for %s in campaign %s",
@@ -175,7 +176,10 @@ class DialingService:
                     campaign_id=campaign_id,
                 )
                 return None
-            external_sip_trunk = self.route_validator.get_sip_trunk(campaign_id)
+            external_sip_trunk = self.route_validator.get_sip_trunk(
+                campaign_id,
+                override_route_id=effective_route_id,
+            )
             prepend = prepend or ""
 
         callid = f"{int(time.time())}.{agent_id}"
@@ -190,6 +194,8 @@ class DialingService:
         }
         if campaign_id and int(campaign_id) > 0:
             metadata["outbound_prepend"] = prepend
+        if effective_route_id:
+            metadata["effective_route_id"] = effective_route_id
         if external_sip_trunk:
             metadata["external_sip_trunk"] = external_sip_trunk
 
@@ -271,11 +277,12 @@ class DialingService:
             return None
 
         prepend = ""
+        effective_route_id = None
         if campaign_id and int(campaign_id) > 0:
             if not self.route_validator:
                 self.logger.error("RouteValidator not available for route validation")
                 return None
-            valid, prepend = self.route_validator.validate_route(number, campaign_id)
+            valid, prepend, effective_route_id = self.route_validator.validate_route(number, campaign_id)
             if not valid:
                 self.logger.warning(
                     "Route validation failed for %s (Progressive PSTN dial)",
@@ -336,10 +343,15 @@ class DialingService:
             "tel_customer": number,
             "callid": uniqueid,
         }
+        if effective_route_id:
+            metadata["effective_route_id"] = effective_route_id
 
         external_sip_trunk = None
         if campaign_id and int(campaign_id) > 0 and self.route_validator:
-            external_sip_trunk = self.route_validator.get_sip_trunk(campaign_id)
+            external_sip_trunk = self.route_validator.get_sip_trunk(
+                campaign_id,
+                override_route_id=effective_route_id,
+            )
             if not external_sip_trunk:
                 self.logger.warning(
                     "Progressive dial: no SIP trunk for campaign %s; will use config SIP_TRUNK if set.",
@@ -444,8 +456,9 @@ class DialingService:
 
         external_sip_trunk = None
         prepend = ""
+        effective_route_id = None
         if campaign_id and int(campaign_id) > 0:
-            valid, prepend = self.route_validator.validate_route(phone_number, campaign_id)
+            valid, prepend, effective_route_id = self.route_validator.validate_route(phone_number, campaign_id)
             if not valid:
                 self.logger.warning(
                     "dial_predictive: route validation failed for %s campaign %s",
@@ -494,7 +507,10 @@ class DialingService:
                         campaign_id, contact_id, phone_number
                     )
                 return None
-            external_sip_trunk = self.route_validator.get_sip_trunk(campaign_id)
+            external_sip_trunk = self.route_validator.get_sip_trunk(
+                campaign_id,
+                override_route_id=effective_route_id,
+            )
             if not external_sip_trunk:
                 self.logger.warning(
                     "dial_predictive: no SIP trunk for campaign %s",
@@ -518,6 +534,8 @@ class DialingService:
         }
         if campaign_id and int(campaign_id) > 0:
             metadata["outbound_prepend"] = prepend
+        if effective_route_id:
+            metadata["effective_route_id"] = effective_route_id
         if external_sip_trunk:
             metadata["external_sip_trunk"] = external_sip_trunk
 

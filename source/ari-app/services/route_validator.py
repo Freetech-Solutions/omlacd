@@ -121,11 +121,16 @@ class RouteValidator:
     _ROUTE_CACHE = {}
     _ROUTE_CACHE_LOCK = threading.RLock()  # Lock para proteger _ROUTE_CACHE
     ROUTE_CACHE_TTL = 10  # segundos
+    ROUTES_INDEX_KEY = "OML:OUTR:INDEX"
+    _ROUTE_INDEX_CACHE = []
+    _ROUTE_INDEX_CACHE_EXPIRES_AT = 0.0
+    _ROUTE_INDEX_CACHE_LOCK = threading.RLock()
     
     # Cache local de troncales SIP: {campaign_id: (trunk_name, expires_at_ts)}
     # Compartido entre todas las instancias para eficiencia
     _TRUNK_CACHE = {}
     _TRUNK_CACHE_LOCK = threading.RLock()  # Lock para proteger _TRUNK_CACHE
+    _TRUNK_CACHE_BY_ROUTE = {}
     TRUNK_CACHE_TTL = 3600  # 1 hora en segundos
     
     def __init__(self, redis_client: redis.Redis):
@@ -140,8 +145,106 @@ class RouteValidator:
         if redis_client is None:
             raise TypeError("redis_client es requerido y no puede ser None")
         self.redis_client = redis_client
+
+    @staticmethod
+    def _normalize_redis_value(value):
+        """Normaliza valores de Redis a str manteniendo None."""
+        if value is None:
+            return None
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="replace")
+        return str(value)
+
+    def _resolve_route_id_from_campaign(self, id_campaign):
+        """Obtiene OUTR de una campaña y lo normaliza a str."""
+        camp_key = RedisKeys.campaign_config(id_campaign)
+        route_id = self.redis_client.hget(camp_key, "OUTR")
+        return self._normalize_redis_value(route_id)
+
+    def _get_ordered_route_ids(self) -> List[str]:
+        """
+        Obtiene IDs de rutas ordenadas por ORDEN.
+
+        Prioriza el zset OML:OUTR:INDEX y usa fallback SCAN+sort por campo ORDEN
+        para entornos que aún no migraron el índice.
+        """
+        now = time.time()
+        with RouteValidator._ROUTE_INDEX_CACHE_LOCK:
+            if RouteValidator._ROUTE_INDEX_CACHE_EXPIRES_AT > now:
+                return list(RouteValidator._ROUTE_INDEX_CACHE)
+
+        route_ids: List[str] = []
+        try:
+            ordered = self.redis_client.zrange(self.ROUTES_INDEX_KEY, 0, -1) or []
+            route_ids = [
+                route_id for route_id in
+                (self._normalize_redis_value(value) for value in ordered)
+                if route_id
+            ]
+        except (redis.ConnectionError, redis.TimeoutError) as e:
+            logger.error("Error Redis leyendo índice de rutas salientes: %s", e, exc_info=True)
+            route_ids = []
+        except Exception as e:
+            logger.error("Error inesperado leyendo índice de rutas salientes: %s", e, exc_info=True)
+            route_ids = []
+
+        if not route_ids:
+            cursor = 0
+            found = []
+            try:
+                while True:
+                    cursor, keys = self.redis_client.scan(cursor=cursor, match="OML:OUTR:*", count=200)
+                    for key in keys or []:
+                        key_text = self._normalize_redis_value(key) or ""
+                        if key_text == self.ROUTES_INDEX_KEY:
+                            continue
+                        route_id = key_text.rsplit(":", 1)[-1] if ":" in key_text else None
+                        if not route_id:
+                            continue
+                        route_info = self.redis_client.hgetall(key_text) or {}
+                        raw_order = route_info.get("ORDEN")
+                        raw_name = route_info.get("NAME")
+                        if raw_order is None or raw_name is None:
+                            continue
+                        try:
+                            order_num = int(self._normalize_redis_value(raw_order) or 0)
+                        except (TypeError, ValueError):
+                            order_num = 0
+                        found.append((order_num, route_id))
+                    if cursor == 0 or cursor == "0":
+                        break
+                found.sort(key=lambda item: item[0])
+                route_ids = [route_id for _, route_id in found]
+            except (redis.ConnectionError, redis.TimeoutError) as e:
+                logger.error("Error Redis en fallback SCAN de rutas salientes: %s", e, exc_info=True)
+                route_ids = []
+            except Exception as e:
+                logger.error("Error inesperado en fallback SCAN de rutas salientes: %s", e, exc_info=True)
+                route_ids = []
+
+        with RouteValidator._ROUTE_INDEX_CACHE_LOCK:
+            RouteValidator._ROUTE_INDEX_CACHE = list(route_ids)
+            RouteValidator._ROUTE_INDEX_CACHE_EXPIRES_AT = now + RouteValidator.ROUTE_CACHE_TTL
+        return route_ids
+
+    def _find_matching_route(self, phone_number: str) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Busca la primera ruta (por ORDEN) cuyo patrón matchee el número.
+
+        Returns:
+            Tuple(route_id, prepend) o (None, None) si no existe match.
+        """
+        phone_str = str(phone_number)
+        for route_id in self._get_ordered_route_ids():
+            patterns_with_prepend = self._get_patterns_for_route(route_id)
+            if not patterns_with_prepend:
+                continue
+            for pattern, prepend in patterns_with_prepend:
+                if RouteValidator.MATCHER.match(phone_str, [pattern]):
+                    return route_id, (prepend or "")
+        return None, None
     
-    def get_sip_trunk(self, id_campaign):
+    def get_sip_trunk(self, id_campaign, override_route_id: Optional[str] = None):
         """
         Obtiene el nombre de la troncal SIP para una campaña desde Redis.
         Sigue la cadena: OML:CAMP -> OUTR -> OML:OUTR -> TRUNK-1 -> OML:TRUNK -> NAME
@@ -160,9 +263,10 @@ class RouteValidator:
         # Si es una llamada fuera de campaña (campaign_id=0), no hay troncal configurada
         # Estas son llamadas especiales (manuales externas, agent2agent, etc.)
         # que no requieren validación de ruta ni troncal específica
+        override_route_id = self._normalize_redis_value(override_route_id)
         try:
             campaign_id_int = int(id_campaign)
-            if campaign_id_int == 0:
+            if campaign_id_int == 0 and not override_route_id:
                 logger.debug(
                     f'Campaign {id_campaign}: Llamada especial (campaign_id=0). '
                     f'No se requiere troncal específica, se usará el trunk por defecto.'
@@ -179,6 +283,17 @@ class RouteValidator:
         
         # Verificar cache local primero (protegido con lock)
         now = time.time()
+        if override_route_id:
+            with RouteValidator._TRUNK_CACHE_LOCK:
+                cached = RouteValidator._TRUNK_CACHE_BY_ROUTE.get(override_route_id)
+                if cached:
+                    trunk_name, expires_at = cached
+                    if expires_at > now:
+                        logger.debug(
+                            'Route %s: SIP trunk found in route cache: %s',
+                            override_route_id, trunk_name
+                        )
+                        return trunk_name
         with RouteValidator._TRUNK_CACHE_LOCK:
             cached = RouteValidator._TRUNK_CACHE.get(id_campaign)
             if cached:
@@ -191,7 +306,10 @@ class RouteValidator:
             # 1. Obtener OUTR (ID de ruta saliente) de la campaña
             camp_key = RedisKeys.campaign_config(id_campaign)
             try:
-                outr_id = self.redis_client.hget(camp_key, 'OUTR')
+                if override_route_id:
+                    outr_id = override_route_id
+                else:
+                    outr_id = self._resolve_route_id_from_campaign(id_campaign)
             except (redis.ConnectionError, redis.TimeoutError) as e:
                 logger.error(
                     f'Campaign {id_campaign}: Error de conexión a Redis al obtener OUTR: {e}. '
@@ -219,6 +337,7 @@ class RouteValidator:
                 )
                 return None
             
+            outr_id = self._normalize_redis_value(outr_id)
             logger.debug(f'Campaign {id_campaign}: OUTR={outr_id}')
             
             # 2. Obtener TRUNK-1 de la ruta saliente
@@ -251,6 +370,7 @@ class RouteValidator:
                 )
                 return None
             
+            trunk_id = self._normalize_redis_value(trunk_id)
             logger.debug(f'Campaign {id_campaign}: TRUNK-1={trunk_id}')
             
             # 3. Obtener NAME de la troncal SIP
@@ -283,11 +403,17 @@ class RouteValidator:
                 )
                 return None
             
+            trunk_name = self._normalize_redis_value(trunk_name)
             logger.debug(f'Campaign {id_campaign}: SIP trunk name={trunk_name}')
             
             # Cachear el resultado localmente con TTL de 1 hora (protegido con lock)
             with RouteValidator._TRUNK_CACHE_LOCK:
                 RouteValidator._TRUNK_CACHE[id_campaign] = (trunk_name, now + RouteValidator.TRUNK_CACHE_TTL)
+                if override_route_id:
+                    RouteValidator._TRUNK_CACHE_BY_ROUTE[override_route_id] = (
+                        trunk_name,
+                        now + RouteValidator.TRUNK_CACHE_TTL,
+                    )
             logger.debug(f'Campaign {id_campaign}: SIP trunk cached locally')
             
             return trunk_name
@@ -315,9 +441,10 @@ class RouteValidator:
     # Cache local de CALLERID por campaña: {campaign_id: (callerid_value, expires_at_ts)}
     _CALLERID_CACHE = {}
     _CALLERID_CACHE_LOCK = threading.RLock()
+    _CALLERID_CACHE_BY_ROUTE = {}
     CALLERID_CACHE_TTL = 3600  # 1 hora, igual que troncales
 
-    def get_trunk_callerid(self, id_campaign):
+    def get_trunk_callerid(self, id_campaign, override_route_id: Optional[str] = None):
         """
         Obtiene el CallerID de la troncal para una campaña desde Redis.
         Sigue la cadena: OML:CAMP -> OUTR -> OML:OUTR -> TRUNK-1 -> GET OML:TRUNK:{trunk_id}:CALLERID.
@@ -329,14 +456,22 @@ class RouteValidator:
         Returns:
             str: Valor de OML:TRUNK:{trunk_id}:CALLERID o None si no existe o hay error.
         """
+        override_route_id = self._normalize_redis_value(override_route_id)
         try:
             campaign_id_int = int(id_campaign)
-            if campaign_id_int == 0:
+            if campaign_id_int == 0 and not override_route_id:
                 return None
         except (TypeError, ValueError):
             return None
 
         now = time.time()
+        if override_route_id:
+            with RouteValidator._CALLERID_CACHE_LOCK:
+                cached = RouteValidator._CALLERID_CACHE_BY_ROUTE.get(override_route_id)
+                if cached:
+                    callerid_val, expires_at = cached
+                    if expires_at > now:
+                        return callerid_val
         with RouteValidator._CALLERID_CACHE_LOCK:
             cached = RouteValidator._CALLERID_CACHE.get(id_campaign)
             if cached:
@@ -346,22 +481,30 @@ class RouteValidator:
 
         try:
             camp_key = RedisKeys.campaign_config(id_campaign)
-            outr_id = self.redis_client.hget(camp_key, 'OUTR')
+            if override_route_id:
+                outr_id = override_route_id
+            else:
+                outr_id = self._resolve_route_id_from_campaign(id_campaign)
             if not outr_id:
                 return None
             outr_key = f'OML:OUTR:{outr_id}'
             trunk_id = self.redis_client.hget(outr_key, 'TRUNK-1')
+            trunk_id = self._normalize_redis_value(trunk_id)
             if not trunk_id:
                 return None
             callerid_key = f'OML:TRUNK:{trunk_id}:CALLERID'
             callerid_val = self.redis_client.get(callerid_key)
-            if callerid_val is not None and not isinstance(callerid_val, str):
-                callerid_val = str(callerid_val) if callerid_val else None
+            callerid_val = self._normalize_redis_value(callerid_val)
             with RouteValidator._CALLERID_CACHE_LOCK:
                 RouteValidator._CALLERID_CACHE[id_campaign] = (
                     callerid_val,
                     now + RouteValidator.CALLERID_CACHE_TTL,
                 )
+                if override_route_id:
+                    RouteValidator._CALLERID_CACHE_BY_ROUTE[override_route_id] = (
+                        callerid_val,
+                        now + RouteValidator.CALLERID_CACHE_TTL,
+                    )
             return callerid_val
         except (redis.ConnectionError, redis.TimeoutError) as e:
             logger.debug(
@@ -396,6 +539,7 @@ class RouteValidator:
         """
         if not route_id:
             return []
+        route_id = self._normalize_redis_value(route_id)
 
         now = time.time()
         # Verificar cache local primero (protegido con lock)
@@ -444,13 +588,9 @@ class RouteValidator:
         patterns_with_prepend: List[Tuple[str, str]] = []
         for i in range(1, dp_count + 1):
             match_pattern = ruta_info.get(f"DP-{i}-MATCH")
+            match_pattern = self._normalize_redis_value(match_pattern)
             prepend = ruta_info.get(f"DP-{i}-PREPEND") or ""
-            if isinstance(prepend, bytes):
-                prepend = prepend.decode("utf-8", errors="replace") if prepend else ""
-            elif prepend is None:
-                prepend = ""
-            else:
-                prepend = str(prepend)
+            prepend = self._normalize_redis_value(prepend) or ""
             if match_pattern:
                 patterns_with_prepend.append((match_pattern, prepend))
 
@@ -459,7 +599,7 @@ class RouteValidator:
             RouteValidator._ROUTE_CACHE[route_id] = (patterns_with_prepend, now + RouteValidator.ROUTE_CACHE_TTL)
         return patterns_with_prepend
     
-    def validate_route(self, phone_number, id_campaign) -> Tuple[bool, Optional[str]]:
+    def validate_route(self, phone_number, id_campaign) -> Tuple[bool, Optional[str], Optional[str]]:
         """
         Valida que el número telefónico cumpla al menos uno de los patrones de
         la ruta saliente asociada a la campaña y devuelve el PREPEND del patrón que coincida.
@@ -473,8 +613,10 @@ class RouteValidator:
             id_campaign: ID de la campaña
             
         Returns:
-            Tuple[bool, Optional[str]]: (True, prepend) si el número es válido (prepend puede ser ""),
-                (False, None) en caso contrario. Para campaign_id=0 retorna (True, None).
+            Tuple[bool, Optional[str], Optional[str]]:
+                (True, prepend, route_id) si el número es válido (prepend puede ser ""),
+                (False, None, None) en caso contrario.
+                Para campaign_id=0 retorna (True, None, None).
                 
         Thread-safety:
             Este método es thread-safe. Utiliza un cache local con TTL para reducir
@@ -484,7 +626,7 @@ class RouteValidator:
             logger.warning(
                 "Validación de ruta: número telefónico vacío o None. Bloqueando llamada."
             )
-            return (False, None)
+            return (False, None, None)
 
         # Campaña 0 se usa para llamadas especiales (manuales externas, agent2agent, etc.)
         # No forzamos validación de rutas en ese contexto - se permite la llamada
@@ -495,44 +637,52 @@ class RouteValidator:
                     f"Validación de ruta: Campaign {id_campaign} es especial (campaign_id=0). "
                     f"Saltando validación de patrones - se permite la llamada."
                 )
-                return (True, None)
+                return (True, None, None)
             elif campaign_id_int < 0:
                 logger.warning(
                     f"Validación de ruta: Campaign {id_campaign} tiene ID negativo. "
                     f"Bloqueando llamada."
                 )
-                return (False, None)
+                return (False, None, None)
         except (TypeError, ValueError):
             logger.warning(
                 f"Validación de ruta: ID de campaña inválido: {id_campaign!r}. Bloqueando llamada."
             )
-            return (False, None)
+            return (False, None, None)
 
         try:
             camp_key = RedisKeys.campaign_config(id_campaign)
-            route_id = self.redis_client.hget(camp_key, "OUTR")
+            route_id = self._resolve_route_id_from_campaign(id_campaign)
         except (redis.ConnectionError, redis.TimeoutError) as e:
             logger.error(
                 "Validación de ruta: Error de conexión a Redis obteniendo OUTR para campaign %s: %s. "
                 "Bloqueando llamada por seguridad.",
                 id_campaign, e, exc_info=True
             )
-            return (False, None)
+            return (False, None, None)
         except Exception as e:
             logger.error(
                 "Validación de ruta: Error inesperado obteniendo OUTR para campaign %s: %s. "
                 "Bloqueando llamada por seguridad.",
                 id_campaign, e, exc_info=True
             )
-            return (False, None)
+            return (False, None, None)
 
         if not route_id:
-            logger.warning(
-                "Validación de ruta: Campaign %s: OUTR not found in %s. "
-                "La campaña no tiene ruta saliente configurada. Bloqueando llamada.",
-                id_campaign, camp_key
+            fallback_route_id, fallback_prepend = self._find_matching_route(phone_number)
+            if not fallback_route_id:
+                logger.warning(
+                    "Validación de ruta: Campaign %s: OUTR not found in %s y ningún patrón global matchea "
+                    "phone_number %s. Bloqueando llamada.",
+                    id_campaign, camp_key, phone_number
+                )
+                return (False, None, None)
+            logger.info(
+                "Validación de ruta: Campaign %s sin OUTR explícita. "
+                "phone_number %s cursado por OUTR=%s según patrón y orden global.",
+                id_campaign, phone_number, fallback_route_id
             )
-            return (False, None)
+            return (True, fallback_prepend or "", fallback_route_id)
 
         patterns_with_prepend = self._get_patterns_for_route(route_id)
         if not patterns_with_prepend:
@@ -541,7 +691,7 @@ class RouteValidator:
                 "La ruta saliente no tiene patrones de discado configurados. Bloqueando llamada.",
                 id_campaign, route_id
             )
-            return (False, None)
+            return (False, None, None)
 
         phone_str = str(phone_number)
         for pattern, prepend in patterns_with_prepend:
@@ -550,11 +700,11 @@ class RouteValidator:
                     "Validación de ruta: Campaign %s: phone_number %s matches outbound pattern for OUTR=%s",
                     id_campaign, phone_number, route_id
                 )
-                return (True, prepend or "")
+                return (True, prepend or "", route_id)
 
         logger.warning(
             "Validación de ruta: Campaign %s: phone_number %s does not match any outbound pattern for OUTR=%s. "
             "El número no cumple con los patrones de discado configurados. Bloqueando llamada.",
             id_campaign, phone_number, route_id
         )
-        return (False, None)
+        return (False, None, None)

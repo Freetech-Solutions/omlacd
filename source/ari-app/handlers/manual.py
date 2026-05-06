@@ -841,7 +841,10 @@ class ManualCallHandler(BaseHandler):
             'ts_answer_iso': context.pstn_answered_ts or context.agent_answered_ts,
         }
         if call_type == 1 and context.id_camp and self.route_validator:
-            trunk_callerid = self.route_validator.get_trunk_callerid(context.id_camp)
+            trunk_callerid = self.route_validator.get_trunk_callerid(
+                context.id_camp,
+                override_route_id=getattr(context, "effective_route_id", None),
+            )
             if trunk_callerid is not None:
                 call_data['numero_origen'] = trunk_callerid
         if channel_id:

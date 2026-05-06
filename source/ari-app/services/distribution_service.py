@@ -1076,7 +1076,10 @@ class DistributionService:
                     "ts_answer_iso": context_for_report.pstn_answered_ts or context_for_report.agent_answered_ts,
                 }
                 if call_type == 2 and id_camp_val and self.route_validator:
-                    trunk_callerid = self.route_validator.get_trunk_callerid(id_camp_val)
+                    trunk_callerid = self.route_validator.get_trunk_callerid(
+                        id_camp_val,
+                        override_route_id=getattr(context_for_report, "effective_route_id", None),
+                    )
                     if trunk_callerid is not None:
                         call_data["numero_origen"] = trunk_callerid
                 timeout_event = (

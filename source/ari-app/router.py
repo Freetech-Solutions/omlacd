@@ -856,7 +856,10 @@ class AcDRouter:
                         "ts_answer_iso": None,
                     }
                     if id_camp and self.route_validator:
-                        trunk_callerid = self.route_validator.get_trunk_callerid(id_camp)
+                        trunk_callerid = self.route_validator.get_trunk_callerid(
+                            id_camp,
+                            override_route_id=meta.get("effective_route_id") if meta else None,
+                        )
                         if trunk_callerid is not None:
                             call_data["numero_origen"] = trunk_callerid
                     self.reporter.log_segment_end(
@@ -961,7 +964,10 @@ class AcDRouter:
                                 "ts_answer_iso": answer_ts_iso,
                             }
                             if id_camp and self.route_validator:
-                                trunk_callerid = self.route_validator.get_trunk_callerid(id_camp)
+                                trunk_callerid = self.route_validator.get_trunk_callerid(
+                                    id_camp,
+                                    override_route_id=meta.get("effective_route_id") if meta else None,
+                                )
                                 if trunk_callerid is not None:
                                     call_data["numero_origen"] = trunk_callerid
                             self.reporter.log_segment_end(
