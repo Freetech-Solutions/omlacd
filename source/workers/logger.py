@@ -346,19 +346,19 @@ def log_transfer_to_postgres(message):
         # destination_type: AGENT, CAMPAIGN, EXTERNAL
         if target_agent_id is not None:
             destination_type = "AGENT"
-            destination_target = f"agent-{target_agent_id}"[:128]
+            destination_id = str(target_agent_id)[:128]
         elif target_campaign_id is not None:
             destination_type = "CAMPAIGN"
-            destination_target = f"campaign-{target_campaign_id}"[:128]
+            destination_id = str(target_campaign_id)[:128]
         elif destination_external_endpoint:
             destination_type = "EXTERNAL"
-            destination_target = destination_external_endpoint
+            destination_id = destination_external_endpoint
         elif numero_extra:
             destination_type = "EXTERNAL"
-            destination_target = numero_extra[:128]
+            destination_id = numero_extra[:128]
         else:
             destination_type = "EXTERNAL"
-            destination_target = "unknown"
+            destination_id = "unknown"
 
         # Normalizar target explícitos por tipo.
         if destination_type != "AGENT":
@@ -388,7 +388,7 @@ def log_transfer_to_postgres(message):
             "journey_entry_id": clean_int(message.get("journey_entry_id")),
             "source_agent_id": clean_int(message.get("agente_origen_id")),
             "source_channel": _truncate(message.get("leg_unique_id"), 128),
-            "destination_target": destination_target,
+            "destination_id": destination_id,
             "destination_type": _truncate(destination_type, 32),
             "destination_agent_id": target_agent_id,
             "destination_campaign_id": target_campaign_id,
