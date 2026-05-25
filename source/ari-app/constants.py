@@ -166,3 +166,8 @@ class RedisKeys:
     def agent_hash(agent_id: str) -> str:
         """Hash del agente (OML:AGENT:{agent_id}). Incluye STATUS, SIP, VOICEBOT_ADDR, etc."""
         return f"OML:AGENT:{agent_id}"
+
+    @staticmethod
+    def agent_lock(agent_id: str) -> str:
+        """Lock de reserva de agente durante distribución (TTL = ring_timeout + margen)."""
+        return f"acd:lock:agent:{agent_id}"

@@ -152,6 +152,12 @@ class Settings(BaseSettings):
         ge=0.5,
         description="Intervalo en segundos entre vueltas del loop de distribución cuando no hay agentes READY o la cola está vacía",
     )
+    # Margen sobre ring_timeout para el TTL del lock de reserva de agente en distribución
+    AGENT_RESERVATION_MARGIN_SEC: int = Field(
+        default=10,
+        ge=0,
+        description="Segundos extra sobre ring_timeout para el TTL del lock acd:lock:agent durante el ring",
+    )
     # TTL de espera del comando Redis tras REFER desde voicebot antes de iniciar distribución
     VOICEBOT_TRANSFER_WAIT_TTL_SEC: int = Field(
         default=120,

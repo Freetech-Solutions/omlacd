@@ -1,9 +1,14 @@
 # Python bytecode
 __pycache__/
+__pycache__
 *.py[cod]
 *$py.class
 
-source/astconf/oml_pjsip_agents.conf
+# Test / coverage
+.coverage
+htmlcov/
+.pytest_cache/
+
 source/astconf/oml_pjsip_trunks.conf
 source/astconf/oml_queues.conf
 source/astconf/oml_extensions_outr.conf

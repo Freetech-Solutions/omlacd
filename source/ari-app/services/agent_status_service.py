@@ -14,6 +14,15 @@ import redis
 from config import settings
 from constants import AgentStatus
 
+_TRANSITION_STATUS_SCRIPT = """
+local current = redis.call('HGET', KEYS[1], 'STATUS')
+if current == ARGV[1] then
+    redis.call('HSET', KEYS[1], 'STATUS', ARGV[2], 'TIMESTAMP', ARGV[3])
+    return 1
+end
+return 0
+"""
+
 
 class AgentStatusService:
     """
@@ -115,6 +124,52 @@ class AgentStatusService:
                 f"AgentStatusService.set_status: Error actualizando estado de agente "
                 f"{agent_id} en Redis: {e}",
                 exc_info=True
+            )
+            return False
+
+    def try_transition_status(
+        self,
+        agent_id: Any,
+        from_status: AgentStatus,
+        to_status: AgentStatus,
+    ) -> bool:
+        """
+        Transición atómica de STATUS solo si el valor actual coincide con from_status.
+
+        Returns:
+            True si la transición se aplicó, False si el estado actual difiere o hubo error.
+        """
+        if not agent_id:
+            self.logger.warning("try_transition_status: agent_id vacío")
+            return False
+
+        if not self.redis_client:
+            self.logger.error(
+                "try_transition_status: redis_client no disponible para agente %s",
+                agent_id,
+            )
+            return False
+
+        try:
+            agent_key = self._get_agent_key(agent_id)
+            current_timestamp = str(int(datetime.now().timestamp()))
+            result = self.redis_client.eval(
+                _TRANSITION_STATUS_SCRIPT,
+                1,
+                agent_key,
+                from_status.value,
+                to_status.value,
+                current_timestamp,
+            )
+            return bool(result)
+        except Exception as e:
+            self.logger.error(
+                "try_transition_status: error transicionando agente %s de %s a %s: %s",
+                agent_id,
+                from_status.value,
+                to_status.value,
+                e,
+                exc_info=True,
             )
             return False
     

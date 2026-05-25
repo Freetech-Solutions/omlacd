@@ -167,6 +167,10 @@ class RegenerarConfiguracion(object):
         'oml_moh.conf': RELOAD_RES_MOH,
     }
 
+    IGNORED_CONF_FILES = {
+        'oml_pjsip_agents.conf',
+    }
+
     def __init__(self, logger):
         super().__init__()
         self.logger = logger
@@ -181,6 +185,11 @@ class RegenerarConfiguracion(object):
             tipo_archivo = archivo['type']
             self.logger.info(f'  -- Procesando archivo de tipo: {tipo_archivo}')
             if archivo['type'] == 'CONF_FILE':
+                if archivo['archivo'] in self.IGNORED_CONF_FILES:
+                    self.logger.info(
+                        f'  -- Se omite archivo deprecado: {archivo["archivo"]}'
+                    )
+                    continue
                 if self._escribe_archivo_conf(archivo):
                     comando = self._get_comando_regeneracion_asterisk(archivo['archivo'])
                     if comando and comando not in comandos:

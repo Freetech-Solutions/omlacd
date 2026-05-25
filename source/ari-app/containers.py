@@ -176,6 +176,7 @@ class ACDContainer(containers.DeclarativeContainer):
         reporter=reporter,
         queue_event_manager=queue_event_manager,
         route_validator=route_validator,
+        agent_status_service=agent_status_service,
     )
 
     # Recording Service
