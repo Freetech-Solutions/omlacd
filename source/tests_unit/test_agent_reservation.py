@@ -191,3 +191,48 @@ def test_distribution_loop_skips_dial_when_cas_fails(mock_redis, agent_status_se
         )
 
     svc.call_service.dial_agent_with_headers.assert_not_called()
+
+
+def test_handle_agent_answer_releases_lock_without_restore_ready(
+    mock_redis, agent_status_service
+):
+    agent_status_service.try_transition_status = MagicMock(return_value=True)
+    svc = _build_distribution_service(mock_redis, agent_status_service)
+    channel_id = "agent-ch-1"
+    with svc._dialing_lock:
+        svc._active_attempts["call-1"] = channel_id
+        svc._active_attempt_agents["call-1"] = 42
+
+    assert svc.handle_agent_answer("call-1", channel_id) is True
+
+    mock_redis.delete.assert_called_once_with(RedisKeys.agent_lock("42"))
+    agent_status_service.try_transition_status.assert_not_called()
+
+
+def test_handle_agent_answer_no_op_when_channel_mismatch(mock_redis, agent_status_service):
+    svc = _build_distribution_service(mock_redis, agent_status_service)
+    with svc._dialing_lock:
+        svc._active_attempts["call-1"] = "agent-ch-1"
+        svc._active_attempt_agents["call-1"] = 42
+
+    assert svc.handle_agent_answer("call-1", "other-ch") is False
+
+    mock_redis.delete.assert_not_called()
+
+
+def test_handle_channel_failure_releases_lock_with_restore_ready(
+    mock_redis, agent_status_service
+):
+    agent_status_service.try_transition_status = MagicMock(return_value=True)
+    svc = _build_distribution_service(mock_redis, agent_status_service)
+    channel_id = "agent-ch-1"
+    with svc._dialing_lock:
+        svc._active_attempts["call-1"] = channel_id
+        svc._active_attempt_agents["call-1"] = 42
+
+    assert svc.handle_channel_failure("call-1", channel_id) is True
+
+    mock_redis.delete.assert_called_once_with(RedisKeys.agent_lock("42"))
+    agent_status_service.try_transition_status.assert_called_once_with(
+        42, AgentStatus.DIAL_CALL, AgentStatus.READY
+    )
