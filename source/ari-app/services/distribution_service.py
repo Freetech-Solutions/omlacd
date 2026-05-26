@@ -708,6 +708,9 @@ class DistributionService:
         """
         Señaliza que el agente contestó para este intento. Retorna True si channel_id
         era el agente actual en intento; False si no (el handler no debe seguir con bridge/MOH).
+
+        Libera el lock Redis acd:lock:agent:{id} sin revertir DIAL_CALL→READY; el handler
+        invocante debe pasar el agente a ONCALL vía AgentStatusService.
         """
         answered_agent_id: Optional[int] = None
         with self._dialing_lock:
@@ -719,6 +722,11 @@ class DistributionService:
                 return False
 
         if answered_agent_id is not None:
+            self._release_agent_reservation(
+                answered_agent_id,
+                RedisKeys.agent_lock(str(answered_agent_id)),
+                restore_ready=False,
+            )
             try:
                 context = self.state_store.get(call_id)
                 q_camp = effective_queue_campaign_id(context) if context else None
@@ -745,12 +753,22 @@ class DistributionService:
         Si channel_id es el agente actual en intento, desbloquea el loop para probar
         el siguiente candidato (solo attempt_finished, no stop_event). Retorna True
         si era el agente actual; False si no.
+
+        Libera el lock Redis y revierte DIAL_CALL→READY para que el agente vuelva a ser candidato.
         """
+        failed_agent_id: Optional[int] = None
         with self._dialing_lock:
             current = self._active_attempts.get(call_id)
             if current is None or channel_id != current:
                 return False
-            self._active_attempt_agents.pop(call_id, None)
+            failed_agent_id = self._active_attempt_agents.pop(call_id, None)
+
+        if failed_agent_id is not None:
+            self._release_agent_reservation(
+                failed_agent_id,
+                RedisKeys.agent_lock(str(failed_agent_id)),
+                restore_ready=True,
+            )
 
         _, attempt_finished = self._get_or_create_call_events(call_id)
         attempt_finished.set()
