@@ -17,7 +17,7 @@ import redis
 
 from ari_manager import ARI
 from config import settings
-from constants import AgentStatus, HangupCause, RedisKeys
+from constants import HangupCause, RedisKeys
 from queue_events import QueueEventManager
 from services.call_manager import CallActionService
 from services.queue_strategy import AgentProfile, QueueStrategyEngine
@@ -168,23 +168,28 @@ class DistributionService:
         cas_ready: bool = False,
     ) -> Optional[str]:
         """
-        Reserva un agente: transición READY→DIALING opcional + lock Redis NX con TTL dinámico.
+        Reserva un agente para distribución.
+        - cas_ready=True: reserva atómica READY→DIALING + lock + lease (requiere agent_status_service).
+        - cas_ready=False: solo lock Redis NX (voicebot, sin cambio de STATUS).
         Retorna la clave del lock si la reserva fue exitosa, None en caso contrario.
         """
         lock_key = RedisKeys.agent_lock(str(agent_id))
+        ttl = self._agent_lock_ttl(ring_timeout)
+
         if cas_ready:
             if not self.agent_status_service:
                 logger.warning(
                     "DistributionService._reserve_agent: agent_status_service no disponible, "
-                    "reservando agente %s sin CAS READY→DIALING",
+                    "no se reserva agente %s (fail-closed)",
                     agent_id,
                 )
-            elif not self.agent_status_service.try_transition_status(
-                agent_id, AgentStatus.READY, AgentStatus.DIAL_CALL
+                return None
+            if not self.agent_status_service.try_reserve_for_distribution(
+                agent_id, call_id, ttl
             ):
                 return None
+            return lock_key
 
-        ttl = self._agent_lock_ttl(ring_timeout)
         try:
             reserved = self.redis_client.set(lock_key, call_id, nx=True, ex=ttl)
         except Exception as e:
@@ -193,39 +198,37 @@ class DistributionService:
                 lock_key,
                 e,
             )
-            if cas_ready and self.agent_status_service:
-                self.agent_status_service.try_transition_status(
-                    agent_id, AgentStatus.DIAL_CALL, AgentStatus.READY
-                )
             return None
 
         if not reserved:
-            if cas_ready and self.agent_status_service:
-                self.agent_status_service.try_transition_status(
-                    agent_id, AgentStatus.DIAL_CALL, AgentStatus.READY
-                )
             return None
         return lock_key
 
     def _release_agent_reservation(
         self,
         agent_id: int,
+        call_id: str,
         lock_key: str,
         *,
         restore_ready: bool = False,
+        use_status_reservation: bool = False,
     ) -> None:
-        """Libera el lock de agente y opcionalmente revierte DIALING→READY."""
+        """Libera reserva de agente (lock/lease + opcional DIALING→READY)."""
+        if use_status_reservation and self.agent_status_service:
+            self.agent_status_service.release_distribution_reservation(
+                agent_id, call_id, restore_ready=restore_ready
+            )
+            return
+
         try:
-            self.redis_client.delete(lock_key)
+            current = self.redis_client.get(lock_key)
+            if current is None or str(current) == str(call_id):
+                self.redis_client.delete(lock_key)
         except Exception as e:
             logger.debug(
                 "DistributionService._release_agent_reservation: error borrando %s: %s",
                 lock_key,
                 e,
-            )
-        if restore_ready and self.agent_status_service:
-            self.agent_status_service.try_transition_status(
-                agent_id, AgentStatus.DIAL_CALL, AgentStatus.READY
             )
 
     def start_distribution(
@@ -522,7 +525,9 @@ class DistributionService:
                                     self.redis_client.decr(voicebot_calls_key)
                                 except Exception:
                                     pass
-                                self._release_agent_reservation(candidate.agent_id, lock_key)
+                                self._release_agent_reservation(
+                                    candidate.agent_id, call_id, lock_key
+                                )
                                 continue
 
                             if not agent_channel_id:
@@ -533,7 +538,9 @@ class DistributionService:
                                     self.redis_client.decr(voicebot_calls_key)
                                 except Exception:
                                     pass
-                                self._release_agent_reservation(candidate.agent_id, lock_key)
+                                self._release_agent_reservation(
+                                    candidate.agent_id, call_id, lock_key
+                                )
                                 continue
 
                             with self.state_store.lock(call_id):
@@ -553,7 +560,9 @@ class DistributionService:
                                         self.redis_client.decr(voicebot_calls_key)
                                     except Exception:
                                         pass
-                                self._release_agent_reservation(candidate.agent_id, lock_key)
+                                self._release_agent_reservation(
+                                    candidate.agent_id, call_id, lock_key
+                                )
                                 return
 
                             if not answered_or_failed:
@@ -574,7 +583,9 @@ class DistributionService:
                                         ctx.agent_attempt_channel = None
                                         ctx.is_voicebot = False
                                         self.state_store.register_unsafe(call_id, ctx)
-                                self._release_agent_reservation(candidate.agent_id, lock_key)
+                                self._release_agent_reservation(
+                                    candidate.agent_id, call_id, lock_key
+                                )
                                 continue
 
                             logger.info(
@@ -598,7 +609,9 @@ class DistributionService:
                                     ctx.agent_attempt_channel = None
                                     ctx.is_voicebot = False
                                     self.state_store.register_unsafe(call_id, ctx)
-                            self._release_agent_reservation(candidate.agent_id, lock_key)
+                            self._release_agent_reservation(
+                                candidate.agent_id, call_id, lock_key
+                            )
 
                         if stop_event.wait(1.0):
                             break
@@ -618,6 +631,7 @@ class DistributionService:
                 if attempt_agent_id is not None:
                     self._release_agent_reservation(
                         attempt_agent_id,
+                        call_id,
                         RedisKeys.agent_lock(str(attempt_agent_id)),
                     )
                 if agent_ch:
@@ -709,8 +723,8 @@ class DistributionService:
         Señaliza que el agente contestó para este intento. Retorna True si channel_id
         era el agente actual en intento; False si no (el handler no debe seguir con bridge/MOH).
 
-        Libera el lock Redis acd:lock:agent:{id} sin revertir DIAL_CALL→READY; el handler
-        invocante debe pasar el agente a ONCALL vía AgentStatusService.
+        Libera el lock Redis acd:lock:agent:{id} y lease sin revertir DIALING→READY;
+        el handler invocante debe pasar el agente a ONCALL vía AgentStatusService.
         """
         answered_agent_id: Optional[int] = None
         with self._dialing_lock:
@@ -724,8 +738,10 @@ class DistributionService:
         if answered_agent_id is not None:
             self._release_agent_reservation(
                 answered_agent_id,
+                call_id,
                 RedisKeys.agent_lock(str(answered_agent_id)),
                 restore_ready=False,
+                use_status_reservation=True,
             )
             try:
                 context = self.state_store.get(call_id)
@@ -754,7 +770,7 @@ class DistributionService:
         el siguiente candidato (solo attempt_finished, no stop_event). Retorna True
         si era el agente actual; False si no.
 
-        Libera el lock Redis y revierte DIAL_CALL→READY para que el agente vuelva a ser candidato.
+        Libera lock/lease Redis y revierte DIALING→READY para que el agente vuelva a ser candidato.
         """
         failed_agent_id: Optional[int] = None
         with self._dialing_lock:
@@ -766,8 +782,10 @@ class DistributionService:
         if failed_agent_id is not None:
             self._release_agent_reservation(
                 failed_agent_id,
+                call_id,
                 RedisKeys.agent_lock(str(failed_agent_id)),
                 restore_ready=True,
+                use_status_reservation=True,
             )
 
         _, attempt_finished = self._get_or_create_call_events(call_id)
@@ -945,7 +963,11 @@ class DistributionService:
                                     self._active_attempts.pop(call_id, None)
                                     self._active_attempt_agents.pop(call_id, None)
                                 self._release_agent_reservation(
-                                    candidate.agent_id, lock_key, restore_ready=True
+                                    candidate.agent_id,
+                                    call_id,
+                                    lock_key,
+                                    restore_ready=True,
+                                    use_status_reservation=True,
                                 )
                                 continue
 
@@ -954,7 +976,11 @@ class DistributionService:
                                     self._active_attempts.pop(call_id, None)
                                     self._active_attempt_agents.pop(call_id, None)
                                 self._release_agent_reservation(
-                                    candidate.agent_id, lock_key, restore_ready=True
+                                    candidate.agent_id,
+                                    call_id,
+                                    lock_key,
+                                    restore_ready=True,
+                                    use_status_reservation=True,
                                 )
                                 continue
 
@@ -971,8 +997,10 @@ class DistributionService:
                                     still_attempting = call_id in self._active_attempt_agents
                                 self._release_agent_reservation(
                                     candidate.agent_id,
+                                    call_id,
                                     lock_key,
                                     restore_ready=still_attempting,
+                                    use_status_reservation=True,
                                 )
                                 return
 
@@ -990,7 +1018,11 @@ class DistributionService:
                                         ctx.agent_attempt_channel = None
                                         self.state_store.register_unsafe(call_id, ctx)
                                 self._release_agent_reservation(
-                                    candidate.agent_id, lock_key, restore_ready=True
+                                    candidate.agent_id,
+                                    call_id,
+                                    lock_key,
+                                    restore_ready=True,
+                                    use_status_reservation=True,
                                 )
                                 continue
 
@@ -1011,7 +1043,11 @@ class DistributionService:
                                     ctx.agent_attempt_channel = None
                                     self.state_store.register_unsafe(call_id, ctx)
                             self._release_agent_reservation(
-                                candidate.agent_id, lock_key, restore_ready=True
+                                candidate.agent_id,
+                                call_id,
+                                lock_key,
+                                restore_ready=True,
+                                use_status_reservation=True,
                             )
 
                         if stop_event.wait(1.0):
@@ -1041,8 +1077,10 @@ class DistributionService:
                 if attempt_agent_id is not None:
                     self._release_agent_reservation(
                         attempt_agent_id,
+                        call_id,
                         RedisKeys.agent_lock(str(attempt_agent_id)),
                         restore_ready=True,
+                        use_status_reservation=True,
                     )
         except Exception as e:
             logger.error(
@@ -1128,6 +1166,16 @@ class DistributionService:
 
         with self._dialing_lock:
             current_agent_channel = self._active_attempts.pop(call_id, None)
+            timeout_agent_id = self._active_attempt_agents.pop(call_id, None)
+
+        if timeout_agent_id is not None:
+            self._release_agent_reservation(
+                timeout_agent_id,
+                call_id,
+                RedisKeys.agent_lock(str(timeout_agent_id)),
+                restore_ready=True,
+                use_status_reservation=True,
+            )
 
         try:
             mark_result = self.state_store.mark_call_ended_atomic(call_id)

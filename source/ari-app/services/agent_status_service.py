@@ -12,7 +12,7 @@ from datetime import datetime
 import redis
 
 from config import settings
-from constants import AgentStatus
+from constants import AgentStatus, RedisKeys
 
 _TRANSITION_STATUS_SCRIPT = """
 local current = redis.call('HGET', KEYS[1], 'STATUS')
@@ -21,6 +21,80 @@ if current == ARGV[1] then
     return 1
 end
 return 0
+"""
+
+_RESERVE_FOR_DISTRIBUTION_SCRIPT = """
+local current = redis.call('HGET', KEYS[1], 'STATUS')
+if current ~= ARGV[1] then
+    return 0
+end
+if redis.call('EXISTS', KEYS[2]) == 1 then
+    return 0
+end
+if redis.call('EXISTS', KEYS[3]) == 1 then
+    return 0
+end
+local lock_ok = redis.call('SET', KEYS[2], ARGV[4], 'EX', ARGV[5], 'NX')
+if not lock_ok then
+    return 0
+end
+local lease_ok = redis.call('SET', KEYS[3], ARGV[4], 'EX', ARGV[5], 'NX')
+if not lease_ok then
+    redis.call('DEL', KEYS[2])
+    return 0
+end
+local current2 = redis.call('HGET', KEYS[1], 'STATUS')
+if current2 ~= ARGV[1] then
+    redis.call('DEL', KEYS[2])
+    redis.call('DEL', KEYS[3])
+    return 0
+end
+redis.call('HSET', KEYS[1], 'STATUS', ARGV[2], 'TIMESTAMP', ARGV[3], 'CALLID', ARGV[4])
+return 1
+"""
+
+_RELEASE_DISTRIBUTION_RESERVATION_SCRIPT = """
+local lock_val = redis.call('GET', KEYS[2])
+if lock_val and lock_val ~= ARGV[1] then
+    return 0
+end
+local lease_val = redis.call('GET', KEYS[3])
+if lease_val and lease_val ~= ARGV[1] then
+    return 0
+end
+if lock_val == ARGV[1] then
+    redis.call('DEL', KEYS[2])
+end
+if lease_val == ARGV[1] then
+    redis.call('DEL', KEYS[3])
+end
+if ARGV[5] == '1' then
+    local current = redis.call('HGET', KEYS[1], 'STATUS')
+    if current == ARGV[2] then
+        local callid = redis.call('HGET', KEYS[1], 'CALLID')
+        if not callid or callid == '' or callid == ARGV[1] then
+            redis.call('HSET', KEYS[1], 'STATUS', ARGV[3], 'TIMESTAMP', ARGV[4])
+            redis.call('HDEL', KEYS[1], 'CALLID')
+        end
+    end
+end
+return 1
+"""
+
+_REVERT_STALE_DIALING_SCRIPT = """
+local current = redis.call('HGET', KEYS[1], 'STATUS')
+if current ~= ARGV[1] then
+    return 0
+end
+if redis.call('EXISTS', KEYS[2]) == 1 then
+    return 0
+end
+if redis.call('EXISTS', KEYS[3]) == 1 then
+    return 0
+end
+redis.call('HSET', KEYS[1], 'STATUS', ARGV[2], 'TIMESTAMP', ARGV[3])
+redis.call('HDEL', KEYS[1], 'CALLID')
+return 1
 """
 
 
@@ -171,6 +245,153 @@ class AgentStatusService:
                 e,
                 exc_info=True,
             )
+            return False
+
+    def try_reserve_for_distribution(
+        self,
+        agent_id: Any,
+        call_id: str,
+        ttl_sec: int,
+    ) -> bool:
+        """
+        Reserva atómica para distribución en cola: READY→DIALING + lock + lease con TTL.
+
+        Returns:
+            True si la reserva se aplicó, False si el agente no está READY o ya reservado.
+        """
+        if not agent_id or not call_id:
+            self.logger.warning("try_reserve_for_distribution: agent_id o call_id vacío")
+            return False
+
+        if not self.redis_client:
+            self.logger.error(
+                "try_reserve_for_distribution: redis_client no disponible para agente %s",
+                agent_id,
+            )
+            return False
+
+        try:
+            agent_key = self._get_agent_key(agent_id)
+            lock_key = RedisKeys.agent_lock(str(agent_id))
+            lease_key = RedisKeys.agent_reservation_lease(str(agent_id))
+            current_timestamp = str(int(datetime.now().timestamp()))
+            result = self.redis_client.eval(
+                _RESERVE_FOR_DISTRIBUTION_SCRIPT,
+                3,
+                agent_key,
+                lock_key,
+                lease_key,
+                AgentStatus.READY.value,
+                AgentStatus.DIAL_CALL.value,
+                current_timestamp,
+                str(call_id),
+                str(int(ttl_sec)),
+            )
+            return bool(result)
+        except Exception as e:
+            self.logger.error(
+                "try_reserve_for_distribution: error reservando agente %s para call_id=%s: %s",
+                agent_id,
+                call_id,
+                e,
+                exc_info=True,
+            )
+            return False
+
+    def release_distribution_reservation(
+        self,
+        agent_id: Any,
+        call_id: str,
+        *,
+        restore_ready: bool = False,
+    ) -> bool:
+        """
+        Libera lock/lease de distribución si coinciden con call_id.
+        Opcionalmente revierte DIALING→READY cuando restore_ready=True.
+        """
+        if not agent_id or not call_id:
+            self.logger.warning("release_distribution_reservation: agent_id o call_id vacío")
+            return False
+
+        if not self.redis_client:
+            self.logger.error(
+                "release_distribution_reservation: redis_client no disponible para agente %s",
+                agent_id,
+            )
+            return False
+
+        try:
+            agent_key = self._get_agent_key(agent_id)
+            lock_key = RedisKeys.agent_lock(str(agent_id))
+            lease_key = RedisKeys.agent_reservation_lease(str(agent_id))
+            current_timestamp = str(int(datetime.now().timestamp()))
+            result = self.redis_client.eval(
+                _RELEASE_DISTRIBUTION_RESERVATION_SCRIPT,
+                3,
+                agent_key,
+                lock_key,
+                lease_key,
+                str(call_id),
+                AgentStatus.DIAL_CALL.value,
+                AgentStatus.READY.value,
+                current_timestamp,
+                "1" if restore_ready else "0",
+            )
+            return bool(result)
+        except Exception as e:
+            self.logger.error(
+                "release_distribution_reservation: error liberando agente %s call_id=%s: %s",
+                agent_id,
+                call_id,
+                e,
+                exc_info=True,
+            )
+            return False
+
+    def revert_stale_dialing(self, agent_id: Any) -> bool:
+        """
+        Revierte DIALING→READY si no hay lock ni lease activos (reserva expirada o huérfana).
+        """
+        if not agent_id:
+            return False
+
+        if not self.redis_client:
+            return False
+
+        try:
+            agent_key = self._get_agent_key(agent_id)
+            lock_key = RedisKeys.agent_lock(str(agent_id))
+            lease_key = RedisKeys.agent_reservation_lease(str(agent_id))
+            current_timestamp = str(int(datetime.now().timestamp()))
+            result = self.redis_client.eval(
+                _REVERT_STALE_DIALING_SCRIPT,
+                3,
+                agent_key,
+                lock_key,
+                lease_key,
+                AgentStatus.DIAL_CALL.value,
+                AgentStatus.READY.value,
+                current_timestamp,
+            )
+            return bool(result)
+        except Exception as e:
+            self.logger.debug(
+                "revert_stale_dialing: error revirtiendo agente %s: %s",
+                agent_id,
+                e,
+            )
+            return False
+
+    def has_active_distribution_reservation(self, agent_id: Any) -> bool:
+        """True si el agente tiene lock o lease de reserva activos."""
+        if not agent_id or not self.redis_client:
+            return False
+        try:
+            agent_id_str = str(agent_id)
+            lock_key = RedisKeys.agent_lock(agent_id_str)
+            lease_key = RedisKeys.agent_reservation_lease(agent_id_str)
+            return bool(self.redis_client.exists(lock_key) or self.redis_client.exists(lease_key))
+        except Exception:
             return False
     
     def set_dial_call(self, agent_id: Any) -> bool:

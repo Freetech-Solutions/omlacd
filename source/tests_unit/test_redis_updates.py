@@ -160,10 +160,12 @@ class TestRedisUpdates(unittest.TestCase):
         self.mock_state_store.redis = self.mock_redis
         self.mock_state_store.lock.return_value.__enter__.return_value = None
         
+        mock_agent_status = MagicMock()
         manager = TransferManager(
             state_store=self.mock_state_store,
             ari_client=self.mock_ari_client,
             reporter=self.mock_reporter,
+            agent_status_service=mock_agent_status,
         )
         
         # Test Data
@@ -211,6 +213,13 @@ class TestRedisUpdates(unittest.TestCase):
         self.assertIsNone(mock_ctx.consultation)
         self.assertEqual(mock_ctx.agent_id, target_agent_id)
         self.assertTrue(self.mock_state_store.register_unsafe.called)
+        mock_agent_status.set_oncall.assert_called_once_with(
+            agent_id=target_agent_id,
+            call_id=call_id,
+            bridge_id=main_bridge,
+            campaign_id=id_camp,
+            contact_number=phone_number,
+        )
 
     def test_consult_complete_rejects_when_consult_leg_not_up(self):
         """
@@ -219,10 +228,12 @@ class TestRedisUpdates(unittest.TestCase):
         """
         self.mock_state_store.lock.return_value.__enter__.return_value = None
 
+        mock_agent_status = MagicMock()
         manager = TransferManager(
             state_store=self.mock_state_store,
             ari_client=self.mock_ari_client,
             reporter=self.mock_reporter,
+            agent_status_service=mock_agent_status,
         )
 
         call_id = "call-123"
@@ -264,6 +275,7 @@ class TestRedisUpdates(unittest.TestCase):
         self.mock_ari_client.hangup_channel.assert_not_called()
         self.mock_ari_client.add_channel_to_bridge.assert_not_called()
         self.assertIsNotNone(mock_ctx.consultation)
+        mock_agent_status.set_oncall.assert_not_called()
 
     @patch('handlers.manual.datetime')
     def test_consultative_transfer_complete_ignores_old_agent_channel_destroyed(self, mock_datetime):

@@ -11,11 +11,16 @@ import logging
 import random
 import time
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 import redis
 from redis.exceptions import RedisError
 from pydantic import BaseModel
+
+from constants import RedisKeys
+
+if TYPE_CHECKING:
+    from services.agent_status_service import AgentStatusService
 
 
 logger = logging.getLogger(__name__)
@@ -57,12 +62,17 @@ class QueueStrategyEngine:
     cola configurada.
     """
 
-    def __init__(self, redis_client: redis.Redis):
+    def __init__(
+        self,
+        redis_client: redis.Redis,
+        agent_status_service: Optional["AgentStatusService"] = None,
+    ):
         """
         Inicializa el motor de estrategias de cola.
         
         Args:
             redis_client: Cliente Redis ya configurado (decode_responses recomendado).
+            agent_status_service: Servicio opcional para revertir DIALING huérfano.
         
         Raises:
             TypeError: Si redis_client es None.
@@ -71,6 +81,7 @@ class QueueStrategyEngine:
             raise TypeError("redis_client es requerido y no puede ser None")
 
         self.redis = redis_client
+        self.agent_status_service = agent_status_service
         self.logger = logger
 
     # ------------------------------------------------------------------
@@ -141,6 +152,17 @@ class QueueStrategyEngine:
             )
             return None
 
+        if status is AgentStatus.DIALING:
+            if self._has_active_reservation(agent_id):
+                return None
+            if self.agent_status_service:
+                if self.agent_status_service.revert_stale_dialing(agent_id):
+                    status = AgentStatus.READY
+                else:
+                    return None
+            else:
+                return None
+
         # Solo agentes en READY son candidatos
         if status is not AgentStatus.READY:
             return None
@@ -187,6 +209,18 @@ class QueueStrategyEngine:
             return None
 
         return profile
+
+    def _has_active_reservation(self, agent_id: int) -> bool:
+        """True si el agente tiene lock o lease de reserva activos."""
+        if self.agent_status_service:
+            return self.agent_status_service.has_active_distribution_reservation(agent_id)
+        try:
+            agent_id_str = str(agent_id)
+            lock_key = RedisKeys.agent_lock(agent_id_str)
+            lease_key = RedisKeys.agent_reservation_lease(agent_id_str)
+            return bool(self.redis.exists(lock_key) or self.redis.exists(lease_key))
+        except RedisError:
+            return True
 
     def _build_voicebot_profile(self, agent_id: int, raw: Dict[str, Any]) -> Optional[AgentProfile]:
         """

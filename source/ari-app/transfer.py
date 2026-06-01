@@ -1750,6 +1750,8 @@ class TransferManager:
                 target_agent_id = ctx.consultation.target_agent_id
                 endpoint = ctx.consultation.target_endpoint or ""
                 leg_unique_id = ctx.consultation.consult_leg_ch
+                phone_number = ctx.phone_number
+                main_bridge_id = ctx.bridge_id
                 
                 duration = finalize_current_agent_segment(ctx)
 
@@ -1764,6 +1766,16 @@ class TransferManager:
                 ctx.transfer_count += 1
                 ctx.transfer_phase = TRANSFER_PHASE_NONE
                 self.state_store.register_unsafe(unique_id, ctx)
+
+            # Actualizar estado ONCALL del agente destino (B) fuera del lock
+            if target_agent_id:
+                self._update_agent_to_oncall(
+                    agent_id=target_agent_id,
+                    call_id=call_id,
+                    bridge_id=main_bridge_id,
+                    campaign_id=id_camp,
+                    contact_number=phone_number,
+                )
 
             # 4. Registrar resultado de la transferencia
             # Todos los valores ya fueron obtenidos dentro del lock antes de liberarlo

@@ -156,7 +156,8 @@ class ACDContainer(containers.DeclarativeContainer):
     # Queue Strategy Engine
     queue_strategy_engine = providers.Singleton(
         QueueStrategyEngine,
-        redis_client=redis_client_base  # Usar cliente base para servicios internos
+        redis_client=redis_client_base,  # Usar cliente base para servicios internos
+        agent_status_service=agent_status_service,
     )
 
     # Queue Event Manager

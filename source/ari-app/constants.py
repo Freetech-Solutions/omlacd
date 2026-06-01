@@ -171,3 +171,8 @@ class RedisKeys:
     def agent_lock(agent_id: str) -> str:
         """Lock de reserva de agente durante distribución (TTL = ring_timeout + margen)."""
         return f"acd:lock:agent:{agent_id}"
+
+    @staticmethod
+    def agent_reservation_lease(agent_id: str) -> str:
+        """Lease de reserva de agente (mismo TTL que agent_lock; permite lazy cleanup de DIALING)."""
+        return f"acd:lease:agent:{agent_id}"
