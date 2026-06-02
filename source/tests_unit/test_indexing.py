@@ -124,6 +124,33 @@ class TestCallIndexing(unittest.TestCase):
         self.assertIn(k_consult, set_calls)
         self.assertEqual(set_calls[k_consult], call_id)
 
+    def test_index_initiator_agent_channel(self):
+        """Verify that initiator_agent_channel is indexed after consult transfer."""
+        call_id = "call-consult-done"
+        ctx = CallContext(
+            call_id=call_id,
+            type=CallType.MANUAL,
+            agent_connected_channel="agent-b",
+            uniqueid_agent="agent-b",
+            initiator_agent_channel="agent-a",
+        )
+
+        self.registry.get = MagicMock(return_value=None)
+        self.registry.register(call_id, ctx)
+
+        set_calls = {}
+        for call_args in self.mock_pipeline.set.call_args_list:
+            args, _ = call_args
+            set_calls[args[0]] = args[1]
+
+        k_initiator = RedisKeys.idx_channel(_NODE_ID, "agent-a")
+        k_active = RedisKeys.idx_channel(_NODE_ID, "agent-b")
+
+        self.assertIn(k_initiator, set_calls)
+        self.assertEqual(set_calls[k_initiator], call_id)
+        self.assertIn(k_active, set_calls)
+        self.assertEqual(set_calls[k_active], call_id)
+
     def test_index_snoop_channels(self):
         """Verify that snoop channels are indexed."""
         call_id = "call-2"

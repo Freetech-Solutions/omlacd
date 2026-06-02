@@ -1189,13 +1189,11 @@ class ManualCallHandler(BaseHandler):
                 # ejecutar la lógica genérica de fin de llamada.
                 #
                 # IMPORTANTE:
-                # - Usamos únicamente uniqueid_agent (leg original del agente A) para
-                #   identificar el canal protegido.
-                # - Después de consult_complete, agent_channel pasa a ser el canal del
-                #   agente B, pero uniqueid_agent sigue apuntando al iniciador.
+                # - Tras consult_complete, initiator_agent_channel conserva el canal del agente A.
+                # - uniqueid_agent y agent_connected_channel pasan al agente B (activo).
                 # - De esta forma:
-                #     * El hangup de A (uniqueid_agent) se ignora.
-                #     * El hangup de B (agent_channel) se procesa normalmente y puede
+                #     * El hangup de A (initiator_agent_channel) se ignora.
+                #     * El hangup de B (agent_connected_channel) se procesa normalmente y puede
                 #       gatillar el cierre de la llamada y del leg PSTN.
                 is_initiator_agent_channel = bool(channel_id) and is_consult_initiator_channel(
                     fresh_context, channel_id

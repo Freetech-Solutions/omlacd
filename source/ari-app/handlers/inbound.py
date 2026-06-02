@@ -862,7 +862,7 @@ class InboundCallHandler(BaseHandler):
                 return
 
             # Tras consult_complete: ignorar solo el hangup del agente iniciador (consultation o
-            # uniqueid_agent), no el del destino. Debe ir ANTES de exigir channel_id == active_agent:
+            # initiator_agent_channel), no el del destino. Debe ir ANTES de exigir channel_id == active_agent:
             # el estado ya puede apuntar al agente B mientras llega el ChannelHangupRequest de A;
             # si no consumimos el flag aquí, queda True y el cuelgue de B se ignoraba por error.
             try:

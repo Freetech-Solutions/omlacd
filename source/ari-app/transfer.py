@@ -20,6 +20,7 @@ from state_helpers import (
     active_agent_channel,
     finalize_current_agent_segment,
     is_channel_in_context,
+    resolve_consult_initiator_channel,
 )
 from utils import build_oml_sip_headers
 
@@ -1757,6 +1758,9 @@ class TransferManager:
 
                 # Actualizar estado después de obtener todos los valores necesarios
                 # El nuevo agente es el B (ya en main bridge)
+                initiator_ch = ctx.consultation.initiator_agent_ch
+                ctx.initiator_agent_channel = initiator_ch
+                ctx.uniqueid_agent = leg_unique_id
                 ctx.agent_connected_channel = leg_unique_id
                 ctx.agent_attempt_channel = None
                 ctx.agent_id = target_agent_id
@@ -1952,13 +1956,9 @@ class TransferManager:
                     )
                     return
 
-                # Agente activo (destino tras blind) vs iniciador en consulta (persistido en consultation).
+                # Agente activo (destino tras blind/consult) vs iniciador consultivo.
                 current_agent_ch = active_agent_channel(fresh_ctx)
-                cons = fresh_ctx.consultation
-                if cons and cons.active and cons.initiator_agent_ch:
-                    initiator_agent_ch = cons.initiator_agent_ch
-                else:
-                    initiator_agent_ch = getattr(fresh_ctx, "uniqueid_agent", None)
+                initiator_agent_ch = resolve_consult_initiator_channel(fresh_ctx)
 
                 # Flag para transferencias consultivas: ignorar el próximo hangup del agente iniciador.
                 ignore_next_agent_hangup = getattr(fresh_ctx, "ignore_next_agent_hangup", False)

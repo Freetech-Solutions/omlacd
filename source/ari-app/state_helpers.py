@@ -31,14 +31,20 @@ def queue_timeout_should_suppress_cleanup(ctx: CallContext) -> bool:
     return bool(getattr(ctx, "agent_answered_ts", None))
 
 
-def is_consult_initiator_channel(context: CallContext, channel_id: str) -> bool:
-    """True si channel_id es el iniciador en transferencia consultiva activa (initiator_agent_ch o uniqueid_agent)."""
-    if not channel_id:
-        return False
+def resolve_consult_initiator_channel(context: CallContext) -> Optional[str]:
+    """Canal del agente iniciador en transferencia consultiva (activa o ya completada)."""
     cons = getattr(context, "consultation", None)
     if cons and getattr(cons, "active", False) and getattr(cons, "initiator_agent_ch", None):
-        return channel_id == cons.initiator_agent_ch
-    return getattr(context, "uniqueid_agent", None) == channel_id
+        return cons.initiator_agent_ch
+    return getattr(context, "initiator_agent_channel", None)
+
+
+def is_consult_initiator_channel(context: CallContext, channel_id: str) -> bool:
+    """True si channel_id es el iniciador en transferencia consultiva."""
+    if not channel_id:
+        return False
+    initiator_ch = resolve_consult_initiator_channel(context)
+    return bool(initiator_ch and channel_id == initiator_ch)
 
 
 def is_agent_leg_channel(context: CallContext, channel_id: str) -> bool:
@@ -312,6 +318,8 @@ def is_channel_in_context(context: CallContext, channel_id: str) -> bool:
         channels.add(context.uniqueid_agent)
     if context.uniqueid_pstn:
         channels.add(context.uniqueid_pstn)
+    if getattr(context, "initiator_agent_channel", None):
+        channels.add(context.initiator_agent_channel)
 
     # 2. Canales de consulta
     if context.consultation:

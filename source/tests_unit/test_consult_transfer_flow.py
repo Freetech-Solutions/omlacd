@@ -66,7 +66,8 @@ class TestConsultativeTransferFlow(unittest.TestCase):
         1. A ↔ PSTN en bridge principal.
         2. Se completa una transferencia consultiva hacia B (estado post-consult_complete):
            - ctx.agent_connected_channel -> canal de B.
-           - ctx.uniqueid_agent -> canal de A (iniciador).
+           - ctx.uniqueid_agent -> canal de B (agente activo).
+           - ctx.initiator_agent_channel -> canal de A (iniciador).
            - ctx.is_transferred = True.
            - ctx.ignore_next_agent_hangup = True.
         3. Llega primero el hangup del agente A (iniciador):
@@ -93,7 +94,8 @@ class TestConsultativeTransferFlow(unittest.TestCase):
         fresh_ctx.type.value = CallType.MANUAL.value
         fresh_ctx.agent_connected_channel = current_agent_ch
         fresh_ctx.agent_attempt_channel = None
-        fresh_ctx.uniqueid_agent = initiator_ch
+        fresh_ctx.uniqueid_agent = current_agent_ch
+        fresh_ctx.initiator_agent_channel = initiator_ch
         fresh_ctx.pstn_channel = pstn_channel
         fresh_ctx.uniqueid_pstn = None
         fresh_ctx.bridge_id = bridge_id

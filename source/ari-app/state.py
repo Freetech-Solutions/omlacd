@@ -75,6 +75,8 @@ class CallContext(BaseModel):
     # Identificadores unicos de cada leg
     uniqueid_agent: Optional[str] = None
     uniqueid_pstn: Optional[str] = None
+    # Canal del agente iniciador tras consult_complete (A); persiste cuando consultation se limpia
+    initiator_agent_channel: Optional[str] = None
     
     # Campos opcionales para transferencia y reportes
     agent_id: Optional[int] = None
@@ -255,6 +257,8 @@ class CallRegistry:
             channels.add(ctx.pstn_channel)
         if ctx.uniqueid_agent: channels.add(ctx.uniqueid_agent)
         if ctx.uniqueid_pstn: channels.add(ctx.uniqueid_pstn)
+        if ctx.initiator_agent_channel:
+            channels.add(ctx.initiator_agent_channel)
         
         # 2. Canales de consulta
         if ctx.consultation:

@@ -210,6 +210,8 @@ class TestRedisUpdates(unittest.TestCase):
         self.mock_ari_client.add_channel_to_bridge.assert_called_with(main_bridge, agent_b_ch)
         self.mock_ari_client.hangup_channel.assert_called_with("agent-a")
         self.assertEqual(mock_ctx.agent_connected_channel, agent_b_ch)
+        self.assertEqual(mock_ctx.uniqueid_agent, agent_b_ch)
+        self.assertEqual(mock_ctx.initiator_agent_channel, 'agent-a')
         self.assertIsNone(mock_ctx.consultation)
         self.assertEqual(mock_ctx.agent_id, target_agent_id)
         self.assertTrue(self.mock_state_store.register_unsafe.called)
@@ -416,9 +418,10 @@ class TestRedisUpdates(unittest.TestCase):
         # Simular que context.type es un Enum con atributo 'value'
         context.type = MagicMock()
         context.type.value = CallType.MANUAL.value
-        # El nuevo agente es B, pero el uniqueid del agente iniciador puede ser distinto
+        # El nuevo agente es B, pero el iniciador queda en initiator_agent_channel
         context.agent_connected_channel = agent_b_channel
-        context.uniqueid_agent = agent_a_channel
+        context.uniqueid_agent = agent_b_channel
+        context.initiator_agent_channel = agent_a_channel
         context.pstn_channel = pstn_channel
         context.bridge_id = bridge_id
         context.transfer_in_progress = False  # Ya se completó la transferencia

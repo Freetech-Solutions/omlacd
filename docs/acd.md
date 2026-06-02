@@ -141,7 +141,9 @@ Campos clave y semantica real:
 - `pstn_channel` / `uniqueid_pstn`: referencia fisica y tecnica al leg cliente/PSTN.
 - `agent_attempt_channel`: pierna de agente originada pero aun no consolidada.
 - `agent_connected_channel`: pierna de agente actualmente consolidada en el bridge principal.
-- `agent_id`: agente actual logico. Puede apuntar al agente B despues de una transferencia aunque `uniqueid_agent` siga apuntando a A.
+- `uniqueid_agent`: identificador tecnico del leg de agente activo (grabaciones, reportes, indices). Tras `consult_complete`, apunta al agente B.
+- `initiator_agent_channel`: canal del agente iniciador (A) persistido al completar una transferencia consultiva; usado por `ignore_next_agent_hangup` y `resolve_consult_initiator_channel()`.
+- `agent_id`: agente actual logico. Tras `consult_complete`, apunta al agente B.
 - `target_agent_id`: destino deseado de una blind transfer antes de consolidarla.
 - `consultation`: bloque consultivo temporal.
 - `transfer_in_progress`: cerrojo logico para bloquear operaciones mientras una transferencia esta en ventana critica.
@@ -395,15 +397,25 @@ Inputs principales:
 
 ### E.3 Interaccion con `AgentStatusService`
 
-`DistributionService` no marca `RINGING` al agente candidato. Solo:
+Durante la distribución hacia agentes humanos, `DistributionService._reserve_agent(cas_ready=True)` delega en `AgentStatusService.try_reserve_for_distribution()`:
 
-- reserva temporalmente con `acd:lock:agent:{agent_id}` via Redis `SET NX EX 15`,
-- y cuando el agente realmente contesta, el handler correspondiente usa `AgentStatusService.set_oncall()`.
+- Transición atómica `READY → DIALING` (valor Redis `DIALING`) vía script Lua.
+- Lock `acd:lock:agent:{agent_id}` con `SET NX EX` (TTL = `ring_timeout + AGENT_RESERVATION_MARGIN_SEC`).
+- Lease `acd:lease:agent:{agent_id}` con el mismo TTL y `call_id`, para detectar reservas expiradas o huérfanas.
+
+Al contestar, `handle_agent_answer()` libera lock/lease sin revertir a READY; el handler (`inbound`, `campaign`, etc.) llama a `AgentStatusService.set_oncall()`.
+
+En fallo, timeout de ring o timeout de cola, `_release_agent_reservation(use_status_reservation=True, restore_ready=True)` revierte `DIALING → READY` solo si el `CALLID` coincide con la llamada activa.
+
+`QueueStrategyEngine.get_candidates()` sigue filtrando solo agentes `READY`. Si encuentra un agente en `DIALING` sin lock ni lease activos (reserva expirada o proceso caído), `revert_stale_dialing()` lo recupera como candidato.
+
+Voicebot (`cas_ready=False`) no cambia STATUS; solo usa el lock Redis.
 
 Implicancias:
 
-- El criterio de elegibilidad sigue siendo `STATUS=READY`.
-- La exclusion de concurrencia durante el ringing depende mas del lock temporal que del estado del agente.
+- La elegibilidad exige `STATUS=READY`; durante el ring el agente queda en `DIALING` y no es seleccionable por otra llamada.
+- Lock + lease + STATUS forman una triple barrera; el lease permite lazy cleanup sin keyspace notifications.
+- Si `agent_status_service` no está disponible, la reserva humano falla en cerrado (no se originan llamadas sin cambio de estado).
 
 ### E.4 Manejo de queue timeouts
 
@@ -1060,19 +1072,15 @@ Resultado posible:
 
 - B queda atendiendo la llamada pero Redis puede seguir mostrandolo `READY`.
 
-### H.4 Riesgo alto: `consult_complete()` no actualiza `uniqueid_agent`
+### H.4 ~~Riesgo alto: `consult_complete()` no actualiza `uniqueid_agent`~~ (corregido)
 
-Despues de completar la consultiva:
+Tras completar la consultiva, `consult_complete()` ahora:
 
-- `agent_connected_channel` pasa a B,
-- `agent_id` pasa a B,
-- pero `uniqueid_agent` queda apuntando a A.
+- actualiza `uniqueid_agent` y `agent_connected_channel` al canal del agente B,
+- persiste el canal del iniciador en `initiator_agent_channel`,
+- mantiene `ignore_next_agent_hangup` usando `resolve_consult_initiator_channel()` (consulta activa o `initiator_agent_channel`).
 
-Efectos potenciales:
-
-- reportes de leg AGENT con id tecnico incorrecto,
-- confusion entre "agente actual" y "agente iniciador",
-- cleanup o metricas apoyadas en `uniqueid_agent` pueden usar el canal equivocado.
+Esto alinea reportes, grabaciones e indices con el agente activo sin perder la proteccion del hangup tardio del agente A.
 
 ### H.5 Riesgo medio-alto: `three_way_add()` parece no estar cableado
 
@@ -1152,13 +1160,10 @@ El resultado esperable es idempotente, pero ARI puede recibir doble `hangup_chan
 ## I. Recomendaciones de mejora
 
 1. Convertir la reserva de agente en un lease renovable con TTL >= `ring_timeout + margen`, o mover el agente a `RINGING` en Redis antes del originate.
-2. Separar explicitamente identidad del agente actual y del agente iniciador:
-   - `current_agent_channel`
-   - `initiator_agent_channel`
-   - `current_agent_uniqueid`
-3. Hacer que `consult_complete()` actualice:
-   - `uniqueid_agent`
-   - estado `ONCALL` del agente B
+2. ~~Separar explicitamente identidad del agente actual y del agente iniciador~~ (parcialmente implementado para consultiva):
+   - `agent_connected_channel` / `uniqueid_agent` = agente activo
+   - `initiator_agent_channel` = agente iniciador tras `consult_complete`
+3. ~~Hacer que `consult_complete()` actualice `uniqueid_agent`~~ (implementado). Pendiente verificar `ONCALL` del agente B en todos los escenarios (H.3).
 4. Arreglar `three_way_add()` o removerlo hasta que exista una rama `three_way_leg:true` en el router.
 5. En `blind_to_endpoint()`, agregar rollback fisico minimo si el originate falla sin crear leg:
    - detener MOH,

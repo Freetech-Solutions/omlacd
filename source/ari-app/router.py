@@ -34,6 +34,7 @@ from state_helpers import (
     call_transfer_routing_active,
     locked_context_by_channel,
     is_channel_in_context,
+    resolve_consult_initiator_channel,
     should_block_operation_for_transfer,
 )
 from utils import parse_ari_args
@@ -1056,19 +1057,15 @@ class AcDRouter:
 
             # Protección adicional para transferencias (blind / consultativa en curso o ya finalizada):
             # Si call_transfer_routing_active (is_transferred, transfer_in_progress o blind requested) y el canal
-            # destruido corresponde al agente iniciador (uniqueid_agent), pero el canal de
-            # agente actual conectado es distinto, ignoramos este evento de destrucción.
+            # destruido corresponde al agente iniciador, pero el canal de agente actual conectado es distinto,
+            # ignoramos este evento de destrucción.
             #
             # De esta forma garantizamos que el cierre lógico de la llamada (_process_call_end)
             # se dispare únicamente por los legs activos (agente destino o PSTN), cuando ya
             # existe todo el contexto necesario para resolver correctamente EXIT_ANSWERED en
             # escenarios de transferencia.
             transfer_routing_active = call_transfer_routing_active(fresh_context)
-            cons = getattr(fresh_context, "consultation", None)
-            if cons and getattr(cons, "active", False) and getattr(cons, "initiator_agent_ch", None):
-                initiator_agent_ch = cons.initiator_agent_ch
-            else:
-                initiator_agent_ch = getattr(fresh_context, "uniqueid_agent", None)
+            initiator_agent_ch = resolve_consult_initiator_channel(fresh_context)
             current_agent_ch = active_agent_channel(fresh_context)
             if (
                 transfer_routing_active
