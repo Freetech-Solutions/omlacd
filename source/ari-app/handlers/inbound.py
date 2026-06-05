@@ -617,6 +617,7 @@ class InboundCallHandler(BaseHandler):
                 queue_uniqueid = fresh_ctx.uniqueid_pstn or fresh_ctx.call_id
                 id_camp = effective_queue_campaign_id(fresh_ctx)
                 agent_id_for_event = getattr(fresh_ctx, "agent_id", None)
+                is_voicebot_for_event = getattr(fresh_ctx, "is_voicebot", False)
                 phone_number = getattr(fresh_ctx, "phone_number", None)
 
             if not bridge_ok:
@@ -628,13 +629,22 @@ class InboundCallHandler(BaseHandler):
 
             if self.agent_status_service and agent_id_for_event and bridge_id:
                 try:
-                    self.agent_status_service.set_oncall(
-                        agent_id=agent_id_for_event,
-                        call_id=call_id,
-                        bridge_id=bridge_id,
-                        campaign_id=id_camp,
-                        contact_number=phone_number,
-                    )
+                    if is_voicebot_for_event:
+                        self.agent_status_service.register_voicebot_active_call(
+                            agent_id=agent_id_for_event,
+                            call_id=call_id,
+                            bridge_id=bridge_id,
+                            campaign_id=id_camp,
+                            contact_number=phone_number,
+                        )
+                    else:
+                        self.agent_status_service.set_oncall(
+                            agent_id=agent_id_for_event,
+                            call_id=call_id,
+                            bridge_id=bridge_id,
+                            campaign_id=id_camp,
+                            contact_number=phone_number,
+                        )
                 except Exception:
                     logger.exception(
                         "InboundCallHandler.on_agent_stasis_start: error actualizando estado ONCALL "
@@ -709,15 +719,28 @@ class InboundCallHandler(BaseHandler):
             ctx_agent = self.state_store.get_by_channel(channel_id)
             if ctx_agent and self.distribution_service.handle_channel_failure(ctx_agent.call_id, channel_id):
                 vb_camp = effective_queue_campaign_id(ctx_agent)
-                if getattr(ctx_agent, "is_voicebot", False) and vb_camp is not None and getattr(ctx_agent, "agent_id", None) is not None:
-                    try:
-                        self.redis_client.decr(RedisKeys.voicebot_calls(str(vb_camp), ctx_agent.agent_id))
-                    except Exception as e:
-                        logger.warning(
-                            "InboundCallHandler.on_failure: error DECR VOICEBOT-CALLS para campaña %s: %s",
-                            vb_camp,
-                            e,
-                        )
+                if getattr(ctx_agent, "is_voicebot", False) and getattr(ctx_agent, "agent_id", None) is not None:
+                    if self.agent_status_service:
+                        try:
+                            self.agent_status_service.release_voicebot_from_context(
+                                ctx_agent,
+                                campaign_id=vb_camp,
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                "InboundCallHandler.on_failure: error liberando voicebot campaña %s: %s",
+                                vb_camp,
+                                e,
+                            )
+                    elif self.redis_client and vb_camp is not None:
+                        try:
+                            self.redis_client.decr(RedisKeys.voicebot_calls(str(vb_camp), ctx_agent.agent_id))
+                        except Exception as e:
+                            logger.warning(
+                                "InboundCallHandler.on_failure: error DECR VOICEBOT-CALLS para campaña %s: %s",
+                                vb_camp,
+                                e,
+                            )
                 logger.info(
                     "InboundCallHandler.on_failure: destrucción del leg de agente actual %s, "
                     "desbloqueando intento de distribución",
@@ -740,15 +763,28 @@ class InboundCallHandler(BaseHandler):
             # Si el canal destruido es el leg de agente/voicebot (ya contestó), liberar cupo voicebot
             is_agent_leg = is_agent_leg_channel(context, channel_id)
             vb_camp_leg = effective_queue_campaign_id(context)
-            if is_agent_leg and getattr(context, "is_voicebot", False) and vb_camp_leg is not None and getattr(context, "agent_id", None) is not None:
-                try:
-                    self.redis_client.decr(RedisKeys.voicebot_calls(str(vb_camp_leg), context.agent_id))
-                except Exception as e:
-                    logger.warning(
-                        "InboundCallHandler.on_failure: error DECR VOICEBOT-CALLS (leg agente) campaña %s: %s",
-                        vb_camp_leg,
-                        e,
-                    )
+            if is_agent_leg and getattr(context, "is_voicebot", False) and getattr(context, "agent_id", None) is not None:
+                if self.agent_status_service:
+                    try:
+                        self.agent_status_service.release_voicebot_from_context(
+                            context,
+                            campaign_id=vb_camp_leg,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "InboundCallHandler.on_failure: error liberando voicebot (leg agente) campaña %s: %s",
+                            vb_camp_leg,
+                            e,
+                        )
+                elif self.redis_client and vb_camp_leg is not None:
+                    try:
+                        self.redis_client.decr(RedisKeys.voicebot_calls(str(vb_camp_leg), context.agent_id))
+                    except Exception as e:
+                        logger.warning(
+                            "InboundCallHandler.on_failure: error DECR VOICEBOT-CALLS (leg agente) campaña %s: %s",
+                            vb_camp_leg,
+                            e,
+                        )
 
             pstn_channel = getattr(context, "pstn_channel", None)
             uniqueid_pstn = getattr(context, "uniqueid_pstn", None)
@@ -808,6 +844,20 @@ class InboundCallHandler(BaseHandler):
                     "al procesar abandono PSTN",
                     call_id,
                 )
+
+            vb_camp_pstn = effective_queue_campaign_id(context)
+            if self.agent_status_service:
+                try:
+                    self.agent_status_service.release_voicebot_from_context(
+                        context,
+                        campaign_id=vb_camp_pstn,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "InboundCallHandler.on_failure: error liberando voicebot (PSTN) call_id=%s: %s",
+                        call_id,
+                        e,
+                    )
 
             # Limpieza obligatoria de Redis (evita memory leak cuando la llamada termina por ChannelDestroyed)
             try:
@@ -1354,6 +1404,20 @@ class InboundCallHandler(BaseHandler):
                                 )
             finally:
                 # Limpieza obligatoria de Redis (evita memory leak de claves huérfanas)
+                if self.agent_status_service:
+                    try:
+                        fresh_ctx_cleanup = self.state_store.get(call_id)
+                        if fresh_ctx_cleanup:
+                            self.agent_status_service.release_voicebot_from_context(
+                                fresh_ctx_cleanup,
+                                campaign_id=effective_queue_campaign_id(fresh_ctx_cleanup),
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            "InboundCallHandler.on_pstn_stasis_end: error liberando voicebot call_id=%s: %s",
+                            call_id,
+                            e,
+                        )
                 self.state_store.unregister(call_id)
                 logger.info("Redis cleanup done for %s", call_id)
 

@@ -649,8 +649,23 @@ class DistributionService:
                                 ctx.is_voicebot = False
                                 self.state_store.register_unsafe(call_id, ctx)
                         if agent_id_for_decr is not None:
-                            voicebot_calls_key = RedisKeys.voicebot_calls(id_camp, agent_id_for_decr)
-                            self.redis_client.decr(voicebot_calls_key)
+                            if self.agent_status_service:
+                                try:
+                                    self.agent_status_service.release_voicebot_call(
+                                        id_camp,
+                                        agent_id_for_decr,
+                                        call_id,
+                                    )
+                                except Exception:
+                                    if attempt_agent_id is not None:
+                                        try:
+                                            voicebot_calls_key = RedisKeys.voicebot_calls(id_camp, attempt_agent_id)
+                                            self.redis_client.decr(voicebot_calls_key)
+                                        except Exception:
+                                            pass
+                            else:
+                                voicebot_calls_key = RedisKeys.voicebot_calls(id_camp, agent_id_for_decr)
+                                self.redis_client.decr(voicebot_calls_key)
                     except Exception:
                         if attempt_agent_id is not None:
                             try:

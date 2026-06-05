@@ -123,6 +123,16 @@ class RedisKeys:
         return f"OML:CALLDATA:VOICEBOT-CALLS:{campaign_id}:{aid}"
 
     @staticmethod
+    def voicebot_active_calls(agent_id) -> str:
+        """
+        Hash de llamadas voicebot activas por agente (detalle por call_id).
+        Clave: OML:VOICEBOT-ACTIVE-CALLS:{agent_id}.
+        Campo: call_id → JSON con campaign_id, contact_number, status, timestamp, etc.
+        """
+        aid = agent_id if isinstance(agent_id, str) else str(agent_id)
+        return f"OML:VOICEBOT-ACTIVE-CALLS:{aid}"
+
+    @staticmethod
     def campaign_amd(campaign_id: str) -> str:
         """Clave opcional AMD por campaña (OML:CAMP:{id_camp}:AMD=True)."""
         return f"OML:CAMP:{campaign_id}:AMD"

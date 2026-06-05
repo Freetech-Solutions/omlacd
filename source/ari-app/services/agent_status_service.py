@@ -5,6 +5,7 @@ Este módulo centraliza toda la lógica de actualización y consulta del estado
 de agentes en Redis, eliminando código duplicado y mejorando la mantenibilidad.
 """
 
+import json
 import logging
 from typing import Optional, Dict, Any
 from datetime import datetime
@@ -452,6 +453,235 @@ class AgentStatusService:
             call_data["contact_number"] = contact_number
         
         return self.set_status(agent_id, AgentStatus.ONCALL, call_data)
+
+    def register_voicebot_active_call(
+        self,
+        agent_id: Any,
+        call_id: str,
+        bridge_id: str,
+        campaign_id: Optional[Any] = None,
+        contact_number: Optional[str] = None,
+        node_id: Optional[str] = None,
+    ) -> bool:
+        """
+        Registra una llamada voicebot activa en el hash por agente y mantiene STATUS=ONCALL.
+        """
+        if not agent_id or not call_id:
+            self.logger.warning("register_voicebot_active_call: agent_id o call_id vacío")
+            return False
+
+        if not self.redis_client:
+            self.logger.error(
+                "register_voicebot_active_call: redis_client no disponible para agente %s",
+                agent_id,
+            )
+            return False
+
+        if node_id is None:
+            node_id = getattr(settings, "NODE_ID", "acd-server01")
+
+        try:
+            current_timestamp = int(datetime.now().timestamp())
+            payload = {
+                "agent_id": str(agent_id),
+                "call_id": str(call_id),
+                "campaign_id": str(campaign_id) if campaign_id is not None else "",
+                "contact_number": str(contact_number or ""),
+                "status": AgentStatus.ONCALL.value,
+                "timestamp": current_timestamp,
+                "bridge_id": str(bridge_id or ""),
+                "node_id": str(node_id),
+            }
+            active_key = RedisKeys.voicebot_active_calls(agent_id)
+            self.redis_client.hset(active_key, str(call_id), json.dumps(payload))
+
+            try:
+                agent_key = RedisKeys.agent_hash(str(agent_id))
+                self.redis_client.hset(agent_key, "VOICEBOT", "1")
+            except Exception:
+                pass
+
+            call_data = {
+                "call_id": call_id,
+                "bridge_id": bridge_id,
+                "node_id": node_id,
+            }
+            if campaign_id is not None:
+                call_data["campaign_id"] = campaign_id
+            if contact_number:
+                call_data["contact_number"] = contact_number
+
+            self.set_status(agent_id, AgentStatus.ONCALL, call_data)
+            self.logger.info(
+                "register_voicebot_active_call: agente %s call_id=%s campaña=%s",
+                agent_id,
+                call_id,
+                campaign_id,
+            )
+            return True
+        except Exception as e:
+            self.logger.error(
+                "register_voicebot_active_call: error registrando llamada voicebot "
+                "agente %s call_id=%s: %s",
+                agent_id,
+                call_id,
+                e,
+                exc_info=True,
+            )
+            return False
+
+    def unregister_voicebot_active_call(self, agent_id: Any, call_id: str) -> bool:
+        """
+        Elimina una llamada voicebot del hash por agente.
+        Si no quedan llamadas activas, transiciona el agente a READY.
+        """
+        if not agent_id or not call_id:
+            self.logger.warning("unregister_voicebot_active_call: agent_id o call_id vacío")
+            return False
+
+        if not self.redis_client:
+            self.logger.error(
+                "unregister_voicebot_active_call: redis_client no disponible para agente %s",
+                agent_id,
+            )
+            return False
+
+        try:
+            active_key = RedisKeys.voicebot_active_calls(agent_id)
+            self.redis_client.hdel(active_key, str(call_id))
+            remaining = self.redis_client.hgetall(active_key) or {}
+
+            if not remaining:
+                agent_key = self._get_agent_key(agent_id)
+                current_timestamp = int(datetime.now().timestamp())
+                self.redis_client.hset(
+                    agent_key,
+                    mapping={
+                        "STATUS": AgentStatus.READY.value,
+                        "TIMESTAMP": str(current_timestamp),
+                    },
+                )
+                self.clear_call_fields(agent_id)
+            else:
+                self._sync_agent_legacy_from_active_calls(agent_id, remaining)
+
+            self.logger.info(
+                "unregister_voicebot_active_call: agente %s call_id=%s (restantes=%s)",
+                agent_id,
+                call_id,
+                len(remaining),
+            )
+            return True
+        except Exception as e:
+            self.logger.error(
+                "unregister_voicebot_active_call: error agente %s call_id=%s: %s",
+                agent_id,
+                call_id,
+                e,
+                exc_info=True,
+            )
+            return False
+
+    def release_voicebot_call(
+        self,
+        campaign_id: Any,
+        agent_id: Any,
+        call_id: str,
+    ) -> bool:
+        """
+        Libera cupo voicebot: DECR contador por campaña + unregister en hash de activas.
+        Idempotente: si call_id no está en el hash activo, no hace DECR ni HDEL.
+        """
+        if not agent_id or not call_id:
+            return False
+
+        if self.redis_client:
+            active_key = RedisKeys.voicebot_active_calls(agent_id)
+            if not self.redis_client.hexists(active_key, str(call_id)):
+                self.logger.debug(
+                    "release_voicebot_call: call_id=%s no está en hash activo agente %s, omitiendo",
+                    call_id,
+                    agent_id,
+                )
+                return False
+
+            if campaign_id is not None:
+                try:
+                    voicebot_calls_key = RedisKeys.voicebot_calls(str(campaign_id), agent_id)
+                    self.redis_client.decr(voicebot_calls_key)
+                except Exception as e:
+                    self.logger.warning(
+                        "release_voicebot_call: error DECR campaña %s agente %s: %s",
+                        campaign_id,
+                        agent_id,
+                        e,
+                    )
+
+        return self.unregister_voicebot_active_call(agent_id, call_id)
+
+    def release_voicebot_from_context(
+        self,
+        context: Any,
+        *,
+        campaign_id: Any = None,
+    ) -> bool:
+        """
+        Libera cupo voicebot a partir de un CallContext si is_voicebot está activo.
+        """
+        if context is None:
+            return False
+        if not getattr(context, "is_voicebot", False):
+            return False
+        agent_id = getattr(context, "agent_id", None)
+        call_id = getattr(context, "call_id", None)
+        if agent_id is None or not call_id:
+            return False
+        camp = campaign_id if campaign_id is not None else getattr(context, "id_camp", None)
+        if camp is None:
+            return False
+        return self.release_voicebot_call(camp, agent_id, call_id)
+
+    def _sync_agent_legacy_from_active_calls(
+        self,
+        agent_id: Any,
+        remaining: Optional[Dict[Any, Any]] = None,
+    ) -> None:
+        """Actualiza campos legacy de OML:AGENT con una llamada voicebot restante."""
+        if not self.redis_client:
+            return
+
+        try:
+            if remaining is None:
+                active_key = RedisKeys.voicebot_active_calls(agent_id)
+                remaining = self.redis_client.hgetall(active_key) or {}
+
+            if not remaining:
+                return
+
+            first_raw = next(iter(remaining.values()))
+            if isinstance(first_raw, bytes):
+                first_raw = first_raw.decode("utf-8")
+            data = json.loads(first_raw)
+
+            call_data = {
+                "call_id": data.get("call_id"),
+                "bridge_id": data.get("bridge_id"),
+                "node_id": data.get("node_id"),
+            }
+            campaign_id = data.get("campaign_id")
+            if campaign_id:
+                call_data["campaign_id"] = campaign_id
+            contact_number = data.get("contact_number")
+            if contact_number:
+                call_data["contact_number"] = contact_number
+
+            self.set_status(agent_id, AgentStatus.ONCALL, call_data)
+        except Exception as e:
+            self.logger.warning(
+                "_sync_agent_legacy_from_active_calls: error sincronizando agente %s: %s",
+                agent_id,
+                e,
+            )
     
     def set_postcall_and_clear_fields(self, agent_id: Any) -> bool:
         """

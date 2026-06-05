@@ -682,6 +682,7 @@ class ProgressiveCampaignHandler(BaseHandler):
                 self.state_store.register_unsafe(call_id, fresh)
                 id_camp = fresh.id_camp
                 agent_id_for_event = getattr(fresh, "agent_id", None)
+                is_voicebot_for_event = getattr(fresh, "is_voicebot", False)
                 queue_uniqueid = fresh.uniqueid_pstn or call_id
                 phone_number = getattr(fresh, "phone_number", None)
 
@@ -694,13 +695,22 @@ class ProgressiveCampaignHandler(BaseHandler):
 
             if self.agent_status_service and agent_id_for_event and bridge_id:
                 try:
-                    self.agent_status_service.set_oncall(
-                        agent_id=agent_id_for_event,
-                        call_id=call_id,
-                        bridge_id=bridge_id,
-                        campaign_id=id_camp,
-                        contact_number=phone_number,
-                    )
+                    if is_voicebot_for_event:
+                        self.agent_status_service.register_voicebot_active_call(
+                            agent_id=agent_id_for_event,
+                            call_id=call_id,
+                            bridge_id=bridge_id,
+                            campaign_id=id_camp,
+                            contact_number=phone_number,
+                        )
+                    else:
+                        self.agent_status_service.set_oncall(
+                            agent_id=agent_id_for_event,
+                            call_id=call_id,
+                            bridge_id=bridge_id,
+                            campaign_id=id_camp,
+                            contact_number=phone_number,
+                        )
                 except Exception:
                     logger.exception(
                         "ProgressiveCampaignHandler.on_agent_stasis_start: error actualizando estado ONCALL "
@@ -736,15 +746,25 @@ class ProgressiveCampaignHandler(BaseHandler):
             if ctx_agent and self.distribution_service.handle_channel_failure(
                 ctx_agent.call_id, channel_id
             ):
-                if self.redis_client and getattr(ctx_agent, "is_voicebot", False) and getattr(ctx_agent, "id_camp", None) and getattr(ctx_agent, "agent_id", None) is not None:
-                    try:
-                        self.redis_client.decr(RedisKeys.voicebot_calls(str(ctx_agent.id_camp), ctx_agent.agent_id))
-                    except Exception as e:
-                        logger.warning(
-                            "ProgressiveCampaignHandler.on_failure: error DECR VOICEBOT-CALLS para campaña %s: %s",
-                            ctx_agent.id_camp,
-                            e,
-                        )
+                if getattr(ctx_agent, "is_voicebot", False) and getattr(ctx_agent, "agent_id", None) is not None:
+                    if self.agent_status_service:
+                        try:
+                            self.agent_status_service.release_voicebot_from_context(ctx_agent)
+                        except Exception as e:
+                            logger.warning(
+                                "ProgressiveCampaignHandler.on_failure: error liberando voicebot campaña %s: %s",
+                                getattr(ctx_agent, "id_camp", None),
+                                e,
+                            )
+                    elif self.redis_client and getattr(ctx_agent, "id_camp", None):
+                        try:
+                            self.redis_client.decr(RedisKeys.voicebot_calls(str(ctx_agent.id_camp), ctx_agent.agent_id))
+                        except Exception as e:
+                            logger.warning(
+                                "ProgressiveCampaignHandler.on_failure: error DECR VOICEBOT-CALLS para campaña %s: %s",
+                                ctx_agent.id_camp,
+                                e,
+                            )
                 logger.info(
                     "ProgressiveCampaignHandler.on_failure: leg agente %s destruido, desbloqueando",
                     channel_id,
@@ -755,15 +775,25 @@ class ProgressiveCampaignHandler(BaseHandler):
                 return
             # Si el canal destruido es el leg de agente/voicebot (ya contestó), liberar cupo voicebot
             is_agent_leg = is_agent_leg_channel(context, channel_id)
-            if is_agent_leg and getattr(context, "is_voicebot", False) and getattr(context, "id_camp", None) and getattr(context, "agent_id", None) is not None and self.redis_client:
-                try:
-                    self.redis_client.decr(RedisKeys.voicebot_calls(str(context.id_camp), context.agent_id))
-                except Exception as e:
-                    logger.warning(
-                        "ProgressiveCampaignHandler.on_failure: error DECR VOICEBOT-CALLS (leg agente) campaña %s: %s",
-                        context.id_camp,
-                        e,
-                    )
+            if is_agent_leg and getattr(context, "is_voicebot", False) and getattr(context, "agent_id", None) is not None:
+                if self.agent_status_service:
+                    try:
+                        self.agent_status_service.release_voicebot_from_context(context)
+                    except Exception as e:
+                        logger.warning(
+                            "ProgressiveCampaignHandler.on_failure: error liberando voicebot (leg agente) campaña %s: %s",
+                            getattr(context, "id_camp", None),
+                            e,
+                        )
+                elif self.redis_client and getattr(context, "id_camp", None):
+                    try:
+                        self.redis_client.decr(RedisKeys.voicebot_calls(str(context.id_camp), context.agent_id))
+                    except Exception as e:
+                        logger.warning(
+                            "ProgressiveCampaignHandler.on_failure: error DECR VOICEBOT-CALLS (leg agente) campaña %s: %s",
+                            context.id_camp,
+                            e,
+                        )
             pstn_channel = getattr(context, "pstn_channel", None)
             uniqueid_pstn = getattr(context, "uniqueid_pstn", None)
             is_pstn_leg = (
@@ -789,6 +819,15 @@ class ProgressiveCampaignHandler(BaseHandler):
             except Exception:
                 logger.exception("Error mark_call_ended_atomic para %s", call_id)
                 return
+            if self.agent_status_service:
+                try:
+                    self.agent_status_service.release_voicebot_from_context(context)
+                except Exception as e:
+                    logger.warning(
+                        "ProgressiveCampaignHandler.on_failure: error liberando voicebot (PSTN) call_id=%s: %s",
+                        call_id,
+                        e,
+                    )
             try:
                 self.state_store.unregister(call_id)
             except Exception:
@@ -1106,6 +1145,16 @@ class ProgressiveCampaignHandler(BaseHandler):
                         )
                     except Exception:
                         logger.exception("Error log_segment_end EXIT_ANSWERED para %s", call_id)
+            ctx_for_release = refreshed if refreshed is not None else context
+            if not is_post_voicebot_handoff and self.agent_status_service:
+                try:
+                    self.agent_status_service.release_voicebot_from_context(ctx_for_release)
+                except Exception as e:
+                    logger.warning(
+                        "ProgressiveCampaignHandler.on_pstn_stasis_end: error liberando voicebot call_id=%s: %s",
+                        call_id,
+                        e,
+                    )
             # Marcar PSTN como ya reportado para que el router no envíe EXIT_SHORTCALL al procesar ChannelDestroyed
             if self.pstn_reported_store and channel_id:
                 self.pstn_reported_store.add(channel_id)

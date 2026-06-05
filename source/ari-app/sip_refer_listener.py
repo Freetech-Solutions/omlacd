@@ -322,19 +322,35 @@ class VerloopReferHandler:
         except Exception as e:
             self.logger.warning("[Verloop] hangup_channel falló para %s: %s", agent_channel, e)
 
-        # 3. DECR VOICEBOT-CALLS para la campaña y agente voicebot (origen)
+        # 3. Liberar cupo voicebot (contador + registro por llamada)
         redis_client = getattr(refer_ctx, "redis_client", None)
-        if redis_client and id_camp_origin is not None and str(id_camp_origin).strip() and agent_id_voicebot is not None:
-            try:
-                voicebot_calls_key = RedisKeys.voicebot_calls(str(id_camp_origin), agent_id_voicebot)
-                redis_client.decr(voicebot_calls_key)
-            except Exception as e:
-                self.logger.debug(
-                    "[Verloop] DECR VOICEBOT-CALLS para campaña %s agente %s: %s",
-                    id_camp_origin,
-                    agent_id_voicebot,
-                    e,
-                )
+        agent_status_service = getattr(dist_svc, "agent_status_service", None)
+        if id_camp_origin is not None and str(id_camp_origin).strip() and agent_id_voicebot is not None:
+            if agent_status_service:
+                try:
+                    agent_status_service.release_voicebot_call(
+                        id_camp_origin,
+                        agent_id_voicebot,
+                        call_id,
+                    )
+                except Exception as e:
+                    self.logger.debug(
+                        "[Verloop] release_voicebot_call campaña %s agente %s: %s",
+                        id_camp_origin,
+                        agent_id_voicebot,
+                        e,
+                    )
+            elif redis_client:
+                try:
+                    voicebot_calls_key = RedisKeys.voicebot_calls(str(id_camp_origin), agent_id_voicebot)
+                    redis_client.decr(voicebot_calls_key)
+                except Exception as e:
+                    self.logger.debug(
+                        "[Verloop] DECR VOICEBOT-CALLS para campaña %s agente %s: %s",
+                        id_camp_origin,
+                        agent_id_voicebot,
+                        e,
+                    )
 
         # 4. MOH sobre el bridge (leg PSTN)
         tm._start_moh(bridge_id)
