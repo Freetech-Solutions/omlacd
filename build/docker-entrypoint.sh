@@ -191,7 +191,7 @@ main() {
     # Configuración completa antes de levantar Asterisk
     configure_timezone
     configure_ami_ari
-    configure_homer
+    # configure_homer
     configure_scale
     configure_rtp_ports
     configure_outbound_proxy
