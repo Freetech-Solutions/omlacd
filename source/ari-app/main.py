@@ -798,6 +798,18 @@ class ARIApp:
             
         # Cerrar recursos del contenedor (Redis pools, HTTP sessions, etc.)
         if hasattr(self, 'container') and self.container:
+            try:
+                legacy_forwarder = self.container.legacy_forwarder()
+                flushed = legacy_forwarder.flush_pending_dialer_decrements_on_shutdown()
+                if flushed:
+                    logger.warning(
+                        "Shutdown: enviados %s eventos ORIGINATE_FAILED por pending_dial pendiente",
+                        flushed,
+                    )
+            except Exception as e:
+                logger.warning("Shutdown: no se pudo vaciar pending_dial metadata: %s", e)
+
+        if hasattr(self, 'container') and self.container:
             logger.info("🧹 Liberando recursos del contenedor...")
             self.container.shutdown_resources()
         

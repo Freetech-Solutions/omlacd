@@ -12,6 +12,9 @@ from utils import parse_ari_args
 if TYPE_CHECKING:
     from services.pending_dial_metadata import PendingDialMetadataStore
 
+_PROCESS_EVENT_RETRIES = 3
+_PROCESS_EVENT_RETRY_DELAY_SEC = 0.25
+
 
 class LegacyEventForwarder:
     """
@@ -36,6 +39,43 @@ class LegacyEventForwarder:
         except Exception as e:
             self.logger.error(f"LegacyEventForwarder: Failed to connect to Gearman: {e}")
             self.client = None
+
+    def _submit_process_event(
+        self,
+        payload_bytes: bytes,
+        *,
+        context: str,
+        summary: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Envía payload a process-event con reintentos ante fallo de Gearman."""
+        if not self.client:
+            self._connect()
+        if not self.client:
+            self.logger.error(
+                "LegacyEventForwarder.%s: Gearman client unavailable summary=%s",
+                context,
+                summary,
+            )
+            return False
+        last_error = None
+        for attempt in range(1, _PROCESS_EVENT_RETRIES + 1):
+            try:
+                self.client.submit_job("process-event", payload_bytes, background=True)
+                return True
+            except Exception as e:
+                last_error = e
+                self.client = None
+                if attempt < _PROCESS_EVENT_RETRIES:
+                    time.sleep(_PROCESS_EVENT_RETRY_DELAY_SEC * attempt)
+                    self._connect()
+        self.logger.error(
+            "LegacyEventForwarder.%s: failed after %s attempts summary=%s error=%s",
+            context,
+            _PROCESS_EVENT_RETRIES,
+            summary,
+            last_error,
+        )
+        return False
 
     @staticmethod
     def _get_first_non_empty(source: Dict[str, Any], keys: List[str]) -> Optional[Any]:
@@ -149,10 +189,19 @@ class LegacyEventForwarder:
             event_json = json.dumps(event_with_call_type)
             payload = bytes(event_json, encoding="utf8")
 
-            self.client.submit_job(
-                "process-event",
+            peer = event.get("peer") or {}
+            peer_id = peer.get("id") if isinstance(peer, dict) else getattr(peer, "id", None)
+            if peer_id and self.pending_dial_store:
+                self.pending_dial_store.refresh(str(peer_id))
+
+            self._submit_process_event(
                 payload,
-                background=True,
+                context="handle_dial_event",
+                summary={
+                    "dialstring": event.get("dialstring"),
+                    "call_type": call_type_value,
+                    "id_campaign": business_fields.get("id_campaign"),
+                },
             )
             self.logger.debug(
                 "Forwarded Dial event to Gearman: dialstring=%s call_type=%s",
@@ -234,6 +283,8 @@ class LegacyEventForwarder:
                     self.logger.debug(
                         "LegacyEventForwarder: usando metadata pendiente para peer_id=%s", peer_id
                     )
+                    if self.pending_dial_store:
+                        self.pending_dial_store.refresh(str(peer_id))
                     # Normalizar a dict str->str para compatibilidad con _should_send_dial_event_to_gearman
                     return {k: str(v) for k, v in stored.items()}
 
@@ -271,6 +322,11 @@ class LegacyEventForwarder:
 
         metadata = self.pending_dial_store.pop(channel_id)
         if not metadata:
+            self.logger.warning(
+                "LegacyEventForwarder.handle_channel_destroyed: no pending metadata "
+                "for channel_id=%s (expired, consumed, or multi-node miss)",
+                channel_id,
+            )
             return
 
         channel_type = metadata.get("channel_type") or metadata.get("channel_type")
@@ -296,22 +352,21 @@ class LegacyEventForwarder:
         if not payload_dict:
             return
 
-        if not self.client:
-            self._connect()
-        if not self.client:
-            return
-
-        try:
-            event_json = json.dumps(payload_dict)
-            payload_bytes = bytes(event_json, encoding="utf8")
-            self.client.submit_job("process-event", payload_bytes, background=True)
-            self.logger.debug(
-                "Forwarded ChannelDestroyed to Gearman: channel_id=%s call_type=to_pstn",
-                channel_id,
-            )
-        except Exception as e:
-            self.logger.error("Error forwarding ChannelDestroyed: %s", e)
-            self.client = None
+        event_json = json.dumps(payload_dict)
+        payload_bytes = bytes(event_json, encoding="utf8")
+        self._submit_process_event(
+            payload_bytes,
+            context="handle_channel_destroyed",
+            summary={
+                "channel_id": channel_id,
+                "id_campaign": id_camp,
+                "contact_id": id_customer,
+            },
+        )
+        self.logger.debug(
+            "Forwarded ChannelDestroyed to Gearman: channel_id=%s call_type=to_pstn",
+            channel_id,
+        )
 
     def submit_route_validation_failed(
         self, campaign_id: Any, contact_id: Any, number: str
@@ -346,7 +401,11 @@ class LegacyEventForwarder:
                 return
             event_json = json.dumps(payload_dict)
             payload_bytes = bytes(event_json, encoding="utf8")
-            self.client.submit_job("process-event", payload_bytes, background=True)
+            self._submit_process_event(
+                payload_bytes,
+                context="submit_route_validation_failed",
+                summary={"campaign_id": campaign_id, "contact_id": contact_id},
+            )
             self.logger.debug(
                 "Forwarded RouteValidationFailed to Gearman: campaign_id=%s contact_id=%s",
                 campaign_id,
@@ -369,7 +428,11 @@ class LegacyEventForwarder:
             if not dial_payload:
                 return
             dial_bytes = bytes(json.dumps(dial_payload), encoding="utf8")
-            self.client.submit_job("process-event", dial_bytes, background=True)
+            self._submit_process_event(
+                dial_bytes,
+                context="submit_route_validation_failed_dial",
+                summary={"campaign_id": campaign_id, "contact_id": contact_id},
+            )
             self.logger.debug(
                 "Forwarded Dial INVALID_NUMBER to Gearman: campaign_id=%s contact_id=%s",
                 campaign_id,
@@ -406,18 +469,55 @@ class LegacyEventForwarder:
             self._connect()
         if not self.client:
             return
-        try:
-            event_json = json.dumps(payload_dict)
-            payload_bytes = bytes(event_json, encoding="utf8")
-            self.client.submit_job("process-event", payload_bytes, background=True)
-            self.logger.debug(
-                "Forwarded Dial CANCEL to Gearman: campaign_id=%s contact_id=%s",
-                campaign_id,
-                contact_id,
-            )
-        except Exception as e:
-            self.logger.error("Error forwarding Dial CANCEL: %s", e)
-            self.client = None
+        event_json = json.dumps(payload_dict)
+        payload_bytes = bytes(event_json, encoding="utf8")
+        self._submit_process_event(
+            payload_bytes,
+            context="submit_dial_cancel",
+            summary={"campaign_id": campaign_id, "contact_id": contact_id},
+        )
+        self.logger.debug(
+            "Forwarded Dial CANCEL to Gearman: campaign_id=%s contact_id=%s",
+            campaign_id,
+            contact_id,
+        )
+
+    def submit_dial_originate_failed(
+        self, campaign_id: Any, contact_id: Any, number: str, callid: Optional[str] = None
+    ) -> None:
+        """
+        Envía a process-event un Dial ORIGINATE_FAILED para decrementar OML:CALLS
+        cuando originate hacia PSTN falló (sin canal en Asterisk).
+        """
+        payload_dict = self._attach_business_fields(
+            {
+                "type": "Dial",
+                "call_type": "to_pstn",
+                "dialstatus": "ORIGINATE_FAILED",
+                "callid": callid or f"{int(time.time())}.{contact_id}",
+            },
+            campaign_id=campaign_id,
+            contact_id=contact_id,
+            phone_number=number,
+            context="submit_dial_originate_failed",
+        )
+        if not payload_dict:
+            return
+        if not self.client:
+            self._connect()
+        if not self.client:
+            return
+        payload_bytes = bytes(json.dumps(payload_dict), encoding="utf8")
+        self._submit_process_event(
+            payload_bytes,
+            context="submit_dial_originate_failed",
+            summary={"campaign_id": campaign_id, "contact_id": contact_id},
+        )
+        self.logger.debug(
+            "Forwarded Dial ORIGINATE_FAILED to Gearman: campaign_id=%s contact_id=%s",
+            campaign_id,
+            contact_id,
+        )
 
     def submit_dial_amd(
         self, campaign_id: Any, contact_id: Any, number: str, callid: Optional[str] = None
@@ -446,18 +546,17 @@ class LegacyEventForwarder:
             self._connect()
         if not self.client:
             return
-        try:
-            event_json = json.dumps(payload_dict)
-            payload_bytes = bytes(event_json, encoding="utf8")
-            self.client.submit_job("process-event", payload_bytes, background=True)
-            self.logger.debug(
-                "Forwarded Dial AMD to Gearman: campaign_id=%s contact_id=%s",
-                campaign_id,
-                contact_id,
-            )
-        except Exception as e:
-            self.logger.error("Error forwarding Dial AMD: %s", e)
-            self.client = None
+        payload_bytes = bytes(json.dumps(payload_dict), encoding="utf8")
+        self._submit_process_event(
+            payload_bytes,
+            context="submit_dial_amd",
+            summary={"campaign_id": campaign_id, "contact_id": contact_id},
+        )
+        self.logger.debug(
+            "Forwarded Dial AMD to Gearman: campaign_id=%s contact_id=%s",
+            campaign_id,
+            contact_id,
+        )
 
     def submit_dial_exit_shortcall(
         self, campaign_id: Any, contact_id: Any, number: str, callid: Optional[str] = None
@@ -486,18 +585,45 @@ class LegacyEventForwarder:
             self._connect()
         if not self.client:
             return
-        try:
-            event_json = json.dumps(payload_dict)
-            payload_bytes = bytes(event_json, encoding="utf8")
-            self.client.submit_job("process-event", payload_bytes, background=True)
-            self.logger.debug(
-                "Forwarded Dial EXIT_SHORTCALL to Gearman: campaign_id=%s contact_id=%s",
-                campaign_id,
-                contact_id,
+        payload_bytes = bytes(json.dumps(payload_dict), encoding="utf8")
+        self._submit_process_event(
+            payload_bytes,
+            context="submit_dial_exit_shortcall",
+            summary={"campaign_id": campaign_id, "contact_id": contact_id},
+        )
+        self.logger.debug(
+            "Forwarded Dial EXIT_SHORTCALL to Gearman: campaign_id=%s contact_id=%s",
+            campaign_id,
+            contact_id,
+        )
+
+    def flush_pending_dialer_decrements_on_shutdown(self) -> int:
+        """
+        En shutdown graceful: envía ORIGINATE_FAILED para metadata PSTN dialer pendiente.
+        Retorna cantidad de eventos encolados.
+        """
+        if not self.pending_dial_store:
+            return 0
+        sent = 0
+        for channel_id, metadata in list(self.pending_dial_store.iter_pending_entries()):
+            channel_type = metadata.get("channel_type")
+            if channel_type not in ("to_pstn", ChannelType.TO_PSTN.value):
+                continue
+            call_type_raw = metadata.get("call_type")
+            if call_type_raw not in (2, "2", CallType.DIALER_ID):
+                continue
+            id_camp = metadata.get("id_camp", metadata.get("campaign_id", ""))
+            id_customer = metadata.get("id_customer", metadata.get("contact_id", ""))
+            tel = metadata.get("tel_customer", metadata.get("phone_number", ""))
+            callid = self._get_callid(metadata) or channel_id
+            self.submit_dial_originate_failed(id_camp, id_customer, tel, callid=callid)
+            self.pending_dial_store.pop(channel_id)
+            sent += 1
+            self.logger.warning(
+                "Shutdown flush: ORIGINATE_FAILED for pending channel_id=%s camp=%s contact=%s",
+                channel_id, id_camp, id_customer,
             )
-        except Exception as e:
-            self.logger.error("Error forwarding Dial EXIT_SHORTCALL: %s", e)
-            self.client = None
+        return sent
 
     def cleanup_pending_dial(self, channel_id: str) -> None:
         """
