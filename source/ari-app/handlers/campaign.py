@@ -854,6 +854,18 @@ class ProgressiveCampaignHandler(BaseHandler):
             is_agent_leg = is_agent_leg_channel(context, channel_id)
             if not is_agent_leg:
                 return
+
+            # Hangup sobre pierna de solo-intento (rechazo de ring, busy, cancel): la distribución
+            # y ChannelDestroyed siguen el flujo; no es "el agente colgó una llamada ya contestada".
+            if channel_id != active_agent_channel(context):
+                logger.debug(
+                    "ProgressiveCampaignHandler.on_hangup_request: canal %s no es la pierna consolidada "
+                    "(active_agent=%s); omitiendo colgar PSTN/bridge",
+                    channel_id,
+                    active_agent_channel(context),
+                )
+                return
+
             if getattr(context, "transfer_in_progress", False):
                 return
             if getattr(context, "voicebot_transfer_waiting", False):

@@ -136,6 +136,11 @@ class QueueStrategyEngine:
                 continue
             normalized[key_str] = v
 
+        # Excluir agentes voicebot de la distribución a humanos
+        voicebot_raw = normalized.get("voicebot") or normalized.get("VOICEBOT")
+        if self._to_str(voicebot_raw) == "1":
+            return None
+
         # STATUS
         status_raw = normalized.get("status") or normalized.get("STATUS")
         status_str = self._to_str(status_raw)
