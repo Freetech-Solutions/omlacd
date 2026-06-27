@@ -127,7 +127,7 @@ configure_rtp_ports() {
 
 configure_outbound_proxy() {
   echo "**[omlacd] Configuring outbound proxy"
-  echo "outbound_proxy=sip:${VOIP_PROXY_HOST}:${VOIP_PROXY_PORT};lr" >> /etc/asterisk/oml_pjsip_wizard.conf
+  echo "outbound_proxy=sip:${VOIP_PROXY_HOST}:${VOIP_PROXY_PORT}\;lr" >> /etc/asterisk/oml_pjsip_wizard.conf
   echo "identify/match=${VOIP_PROXY_HOST}" >> /etc/asterisk/oml_pjsip_wizard.conf
 }
 
