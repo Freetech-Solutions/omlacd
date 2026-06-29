@@ -45,41 +45,81 @@ class TestRouteValidatorGetTrunkCallerid(unittest.TestCase):
         self.RouteValidator._ROUTE_INDEX_CACHE = []
         self.RouteValidator._ROUTE_INDEX_CACHE_EXPIRES_AT = 0.0
 
-    def test_returns_value_when_callerid_key_exists(self):
-        """Cuando OML:TRUNK:{trunk_id}:CALLERID existe, retorna su valor."""
-        self.redis.hget.side_effect = lambda k, f: "1" if f == "OUTR" else "10" if f == "TRUNK-1" else None
-        self.redis.get.return_value = "+15551234567"
+    @staticmethod
+    def _hget_model(outcid=None, outr=None, trunk_for_route=None, trunk_callerid=None):
+        """Construye un side_effect de hget que emula el modelo de datos real.
+
+        - OML:CAMP:{id} campo OUTCID         -> outcid
+        - OML:CAMP:{id} campo OUTR           -> outr
+        - OML:OUTR:{route} campo TRUNK-1     -> trunk_for_route[route]
+        - OML:TRUNK:{trunk} campo CALLERID   -> trunk_callerid[trunk]
+        """
+        trunk_for_route = trunk_for_route or {}
+        trunk_callerid = trunk_callerid or {}
+
+        def hget(k, f):
+            if k.startswith("OML:CAMP:") and f == "OUTCID":
+                return outcid
+            if k.startswith("OML:CAMP:") and f == "OUTR":
+                return outr
+            if k.startswith("OML:OUTR:") and f == "TRUNK-1":
+                route = k.split(":")[-1]
+                return trunk_for_route.get(route)
+            if k.startswith("OML:TRUNK:") and f == "CALLERID":
+                trunk = k.split(":")[-1]
+                return trunk_callerid.get(trunk)
+            return None
+
+        return hget
+
+    def test_returns_campaign_outcid_when_set(self):
+        """OUTCID de la campaña es la fuente primaria del CallerID saliente."""
+        self.redis.hget.side_effect = self._hget_model(
+            outcid="541168428824",
+            outr="1",
+            trunk_for_route={"1": "10"},
+            trunk_callerid={"10": "+1TRUNK"},
+        )
+        result = self.validator.get_trunk_callerid("3")
+        # Debe ganar OUTCID por sobre el CALLERID de la troncal.
+        self.assertEqual(result, "541168428824")
+
+    def test_falls_back_to_trunk_callerid_when_no_outcid(self):
+        """Sin OUTCID, usa el campo CALLERID del hash OML:TRUNK:{id}."""
+        self.redis.hget.side_effect = self._hget_model(
+            outcid=None,
+            outr="1",
+            trunk_for_route={"1": "10"},
+            trunk_callerid={"10": "+15551234567"},
+        )
         result = self.validator.get_trunk_callerid("42")
         self.assertEqual(result, "+15551234567")
-        self.redis.get.assert_called_once()
-        call_args = self.redis.get.call_args[0][0]
-        self.assertIn("OML:TRUNK:10:CALLERID", call_args)
 
     def test_returns_none_when_campaign_is_zero(self):
         """Para campaign_id=0 retorna None (llamadas especiales)."""
         result = self.validator.get_trunk_callerid(0)
         self.assertIsNone(result)
         self.redis.hget.assert_not_called()
-        self.redis.get.assert_not_called()
 
-    def test_returns_none_when_no_outr(self):
-        """Cuando la campaña no tiene OUTR, retorna None."""
-        self.redis.hget.side_effect = lambda k, f: None if f == "OUTR" else None
+    def test_returns_none_when_no_outcid_and_no_outr(self):
+        """Sin OUTCID y sin OUTR, retorna None."""
+        self.redis.hget.side_effect = self._hget_model(outcid=None, outr=None)
         result = self.validator.get_trunk_callerid("42")
         self.assertIsNone(result)
-        self.redis.get.assert_not_called()
 
     def test_returns_none_when_no_trunk_one(self):
-        """Cuando la ruta no tiene TRUNK-1, retorna None."""
-        self.redis.hget.side_effect = lambda k, f: "1" if f == "OUTR" else None
+        """Sin OUTCID y con ruta sin TRUNK-1, retorna None."""
+        self.redis.hget.side_effect = self._hget_model(
+            outcid=None, outr="1", trunk_for_route={}
+        )
         result = self.validator.get_trunk_callerid("42")
         self.assertIsNone(result)
-        self.redis.get.assert_not_called()
 
-    def test_returns_none_when_callerid_key_missing(self):
-        """Cuando OML:TRUNK:{trunk_id}:CALLERID no existe, retorna None."""
-        self.redis.hget.side_effect = lambda k, f: "1" if f == "OUTR" else "10" if f == "TRUNK-1" else None
-        self.redis.get.return_value = None
+    def test_returns_none_when_trunk_callerid_empty(self):
+        """Sin OUTCID y con CALLERID de troncal vacío, retorna None (no '')."""
+        self.redis.hget.side_effect = self._hget_model(
+            outcid="", outr="1", trunk_for_route={"1": "10"}, trunk_callerid={"10": ""}
+        )
         result = self.validator.get_trunk_callerid("42")
         self.assertIsNone(result)
 
@@ -98,32 +138,28 @@ class TestRouteValidatorGetTrunkCallerid(unittest.TestCase):
         self.assertIsNone(result)
 
     def test_uses_cache_after_first_call(self):
-        """El resultado se cachea; segunda llamada no vuelve a Redis get."""
-        self.redis.hget.side_effect = lambda k, f: "1" if f == "OUTR" else "10" if f == "TRUNK-1" else None
-        self.redis.get.return_value = "+15559999999"
-        r1 = self.validator.get_trunk_callerid("42")
-        r2 = self.validator.get_trunk_callerid("42")
-        self.assertEqual(r1, "+15559999999")
-        self.assertEqual(r2, "+15559999999")
-        self.assertEqual(self.redis.get.call_count, 1)
+        """El resultado se cachea; segunda llamada no vuelve a Redis."""
+        self.redis.hget.side_effect = self._hget_model(outcid="541168428824")
+        r1 = self.validator.get_trunk_callerid("3")
+        call_count_after_first = self.redis.hget.call_count
+        r2 = self.validator.get_trunk_callerid("3")
+        self.assertEqual(r1, "541168428824")
+        self.assertEqual(r2, "541168428824")
+        # La segunda llamada se sirve del caché: no hay nuevas lecturas a Redis.
+        self.assertEqual(self.redis.hget.call_count, call_count_after_first)
 
     def test_override_route_does_not_poison_campaign_cache(self):
-        """Una resolución con override_route_id no debe contaminar el caché por
-        campaña: una llamada posterior sin override resuelve la ruta default."""
-        # Ruta default de la campaña -> TRUNK 10 -> CALLERID default.
+        """Sin OUTCID, una resolución con override_route_id no debe contaminar el
+        caché por campaña: una llamada posterior sin override resuelve la ruta
+        default y su troncal."""
+        # Ruta default "1" -> TRUNK 10 -> CALLERID default.
         # Ruta override "55" -> TRUNK 20 -> CALLERID override.
-        def hget(k, f):
-            if f == "OUTR":
-                return "1"  # OUTR default de la campaña
-            if f == "TRUNK-1":
-                return "20" if k == "OML:OUTR:55" else "10"
-            return None
-
-        def get(k):
-            return "+1OVERRIDE" if k == "OML:TRUNK:20:CALLERID" else "+1DEFAULT"
-
-        self.redis.hget.side_effect = hget
-        self.redis.get.side_effect = get
+        self.redis.hget.side_effect = self._hget_model(
+            outcid=None,
+            outr="1",
+            trunk_for_route={"1": "10", "55": "20"},
+            trunk_callerid={"10": "+1DEFAULT", "20": "+1OVERRIDE"},
+        )
 
         override = self.validator.get_trunk_callerid("42", override_route_id="55")
         default = self.validator.get_trunk_callerid("42")
@@ -132,20 +168,14 @@ class TestRouteValidatorGetTrunkCallerid(unittest.TestCase):
         self.assertEqual(default, "+1DEFAULT")
 
     def test_override_route_uses_route_cache_not_campaign_cache(self):
-        """Con override_route_id presente, un valor cacheado por campaña no debe
-        devolverse: la resolución es exclusivamente por ruta."""
-        def hget(k, f):
-            if f == "OUTR":
-                return "1"
-            if f == "TRUNK-1":
-                return "20" if k == "OML:OUTR:55" else "10"
-            return None
-
-        def get(k):
-            return "+1OVERRIDE" if k == "OML:TRUNK:20:CALLERID" else "+1DEFAULT"
-
-        self.redis.hget.side_effect = hget
-        self.redis.get.side_effect = get
+        """Sin OUTCID y con override_route_id presente, un valor cacheado por
+        campaña no debe devolverse: el fallback de troncal es por ruta."""
+        self.redis.hget.side_effect = self._hget_model(
+            outcid=None,
+            outr="1",
+            trunk_for_route={"1": "10", "55": "20"},
+            trunk_callerid={"10": "+1DEFAULT", "20": "+1OVERRIDE"},
+        )
 
         # Primero poblamos el caché por campaña (sin override).
         self.assertEqual(self.validator.get_trunk_callerid("42"), "+1DEFAULT")

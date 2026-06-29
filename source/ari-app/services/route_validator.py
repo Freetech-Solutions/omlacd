@@ -452,15 +452,24 @@ class RouteValidator:
 
     def get_trunk_callerid(self, id_campaign, override_route_id: Optional[str] = None):
         """
-        Obtiene el CallerID de la troncal para una campaña desde Redis.
-        Sigue la cadena: OML:CAMP -> OUTR -> OML:OUTR -> TRUNK-1 -> GET OML:TRUNK:{trunk_id}:CALLERID.
-        Usado como numero_origen en reportes a acd-log-processor para llamadas tipo 1 y 2.
+        Obtiene el CallerID saliente para una campaña desde Redis.
+
+        Precedencia:
+          1. OUTCID del hash OML:CAMP:{id_campaign} (CID de la Ruta Saliente
+             configurado por campaña). Fuente primaria.
+          2. Fallback: campo CALLERID del hash OML:TRUNK:{trunk_id} resolviendo
+             la cadena OML:CAMP -> OUTR -> OML:OUTR:{id} -> TRUNK-1.
+
+        Se usa como callerId del leg PSTN y como numero_origen en reportes a
+        acd-log-processor para llamadas tipo 1 (manual) y 2 (dialer).
 
         Args:
             id_campaign: ID de la campaña
+            override_route_id: si se indica, fuerza la ruta saliente para el
+                fallback de troncal (el OUTCID sigue siendo el de la campaña).
 
         Returns:
-            str: Valor de OML:TRUNK:{trunk_id}:CALLERID o None si no existe o hay error.
+            str: CallerID resuelto, o None si no existe o hay error.
         """
         override_route_id = self._normalize_redis_value(override_route_id)
         try:
@@ -486,20 +495,28 @@ class RouteValidator:
 
         try:
             camp_key = RedisKeys.campaign_config(id_campaign)
-            if override_route_id:
-                outr_id = override_route_id
-            else:
-                outr_id = self._resolve_route_id_from_campaign(id_campaign)
-            if not outr_id:
-                return None
-            outr_key = f'OML:OUTR:{outr_id}'
-            trunk_id = self.redis_client.hget(outr_key, 'TRUNK-1')
-            trunk_id = self._normalize_redis_value(trunk_id)
-            if not trunk_id:
-                return None
-            callerid_key = f'OML:TRUNK:{trunk_id}:CALLERID'
-            callerid_val = self.redis_client.get(callerid_key)
-            callerid_val = self._normalize_redis_value(callerid_val)
+            # 1. OUTCID de la campaña (CID de la Ruta Saliente). Fuente primaria.
+            callerid_val = self._normalize_redis_value(
+                self.redis_client.hget(camp_key, 'OUTCID')
+            )
+            if not callerid_val:
+                # 2. Fallback: CALLERID de la troncal (campo del hash OML:TRUNK:{id}).
+                if override_route_id:
+                    outr_id = override_route_id
+                else:
+                    outr_id = self._resolve_route_id_from_campaign(id_campaign)
+                if outr_id:
+                    outr_key = f'OML:OUTR:{outr_id}'
+                    trunk_id = self._normalize_redis_value(
+                        self.redis_client.hget(outr_key, 'TRUNK-1')
+                    )
+                    if trunk_id:
+                        callerid_val = self._normalize_redis_value(
+                            self.redis_client.hget(f'OML:TRUNK:{trunk_id}', 'CALLERID')
+                        )
+            # Normalizar cadena vacía a None para no cachear/propagar "".
+            if callerid_val == '':
+                callerid_val = None
             with RouteValidator._CALLERID_CACHE_LOCK:
                 if override_route_id:
                     RouteValidator._CALLERID_CACHE_BY_ROUTE[override_route_id] = (
