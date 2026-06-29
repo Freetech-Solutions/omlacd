@@ -63,6 +63,7 @@ class ProgressiveCampaignHandler(BaseHandler):
         route_validator: Optional[Any] = None,
         legacy_forwarder: Optional["LegacyEventForwarder"] = None,
         pstn_reported_store: Optional["PstnReportedStore"] = None,
+        recording_service: Optional[Any] = None,
     ):
         super().__init__(ari_client, state_store, reporter)
         self.call_service = call_service
@@ -73,6 +74,7 @@ class ProgressiveCampaignHandler(BaseHandler):
         self.route_validator = route_validator
         self.legacy_forwarder = legacy_forwarder
         self.pstn_reported_store = pstn_reported_store
+        self.recording_service = recording_service
         self.pstn_channel_id: Optional[str] = None
         self._pstn_hangup_initiated_by_app: Set[str] = set()
         self._pstn_hangup_lock = threading.Lock()
@@ -80,6 +82,365 @@ class ProgressiveCampaignHandler(BaseHandler):
     def _mark_pstn_hangup_by_app(self, channel_id: str) -> None:
         with self._pstn_hangup_lock:
             self._pstn_hangup_initiated_by_app.add(channel_id)
+
+    def _is_pstn_leg_channel(self, channel_id: str, context: CallContext) -> bool:
+        pstn_channel = getattr(context, "pstn_channel", None)
+        uniqueid_pstn = getattr(context, "uniqueid_pstn", None)
+        return (
+            channel_id == pstn_channel
+            or channel_id == uniqueid_pstn
+            or (self.pstn_channel_id is not None and channel_id == self.pstn_channel_id)
+        )
+
+    def _pstn_safety_net_cleanup(self, context: CallContext, call_id: str) -> None:
+        """Purga recursos ARI cuando el PSTN se va (bridge, agentes, distribución)."""
+        bridge_id = getattr(context, "bridge_id", None)
+        if bridge_id and str(bridge_id).strip():
+            self._stop_active_recording(context, bridge_id)
+            try:
+                self.ari_client.destroy_bridge(bridge_id)
+            except Exception:
+                pass
+        for agent_leg in distinct_agent_leg_ids(context):
+            try:
+                self.ari_client.hangup_channel(agent_leg)
+            except Exception:
+                pass
+        self.distribution_service.stop_distribution(call_id)
+
+    def _report_progressive_pstn_end(
+        self,
+        call_id: str,
+        channel_id: str,
+        context: CallContext,
+        refreshed: Optional[CallContext],
+        uniqueid_pstn: Optional[str],
+        end_iso: str,
+        bridge_wait_time: float,
+        duracion_llamada: float,
+        treat_as_timeout: bool,
+        is_post_voicebot_handoff: bool,
+        vb_end_ts: Optional[str],
+    ) -> None:
+        uniqueid = uniqueid_pstn or call_id
+        if not active_agent_channel(context):
+            if treat_as_timeout:
+                if self.queue_event_manager:
+                    try:
+                        self.queue_event_manager.on_timeout(
+                            callid=call_id,
+                            uniqueid=uniqueid,
+                            campana_id=str(context.id_camp or ""),
+                        )
+                    except Exception:
+                        pass
+            else:
+                if self.queue_event_manager:
+                    try:
+                        self.queue_event_manager.on_abandon(
+                            callid=call_id,
+                            uniqueid=uniqueid,
+                            campana_id=str(context.id_camp or ""),
+                        )
+                    except Exception:
+                        pass
+            if self.reporter:
+                try:
+                    call_type = context.call_type or CallType.DIALER_ID
+                    if is_post_voicebot_handoff and vb_end_ts:
+                        try:
+                            vb_end_dt = datetime.fromisoformat(vb_end_ts.replace("Z", "+00:00"))
+                            end_dt = datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
+                            bridge_wait_time = max(0.0, (end_dt - vb_end_dt).total_seconds())
+                        except Exception:
+                            pass
+                    if treat_as_timeout:
+                        event_final = (
+                            HangupCause.EXIT_HANDOFF_TIMEOUT.value
+                            if is_post_voicebot_handoff
+                            else HangupCause.EXIT_TIMEOUT.value
+                        )
+                    else:
+                        event_final = (
+                            HangupCause.EXIT_HANDOFF_ABANDON.value
+                            if is_post_voicebot_handoff
+                            else HangupCause.EXIT_ABANDON.value
+                        )
+                    duration_ctx = context
+                    if is_post_voicebot_handoff:
+                        vb_start_merged = (
+                            getattr(refreshed, "voicebot_leg_start_ts", None)
+                            if refreshed is not None
+                            else None
+                        ) or getattr(context, "voicebot_leg_start_ts", None)
+                        duration_ctx = context.model_copy(
+                            update={
+                                "is_voicebot_transfer": True,
+                                "voicebot_leg_end_ts": vb_end_ts
+                                or getattr(context, "voicebot_leg_end_ts", None),
+                                "voicebot_leg_start_ts": vb_start_merged,
+                            }
+                        )
+                    bot_duration, agent_duration = compute_bot_agent_durations(
+                        duration_ctx, end_iso, duracion_llamada
+                    )
+                    call_data = {
+                        "callid": call_id,
+                        "id_camp": context.id_camp,
+                        "id_customer": context.id_customer,
+                        "phone_number": context.phone_number,
+                        "tel_customer": context.phone_number,
+                        "call_type": call_type,
+                        "ts_start_iso": context.bridge_created_ts,
+                        "ts_answer_iso": context.pstn_answered_ts or context.agent_answered_ts,
+                        "is_voicebot": bool(is_post_voicebot_handoff),
+                        "is_voicebot_transfer": bool(is_post_voicebot_handoff),
+                    }
+                    if call_type == CallType.DIALER_ID and context.id_camp and self.route_validator:
+                        trunk_callerid = self.route_validator.get_trunk_callerid(
+                            context.id_camp,
+                            override_route_id=getattr(context, "effective_route_id", None),
+                        )
+                        if trunk_callerid is not None:
+                            call_data["numero_origen"] = trunk_callerid
+                    self.reporter.log_segment_end(
+                        call_data=call_data,
+                        event_final=event_final,
+                        is_transfer=False,
+                        quien_corto=0 if treat_as_timeout else 2,
+                        uniqueid=uniqueid,
+                        callid=call_id,
+                        end_iso=end_iso,
+                        bridge_wait_time=bridge_wait_time,
+                        duracion_llamada=duracion_llamada,
+                        bot_duration=bot_duration,
+                        agent_duration=agent_duration,
+                        channel_leg="PSTN",
+                        channel_leg_id=uniqueid_pstn or channel_id,
+                        channel_leg_name=context.pstn_channel or channel_id,
+                        channel_leg_start_ts=context.bridge_created_ts,
+                        channel_leg_answer_ts=context.pstn_answered_ts,
+                        channel_leg_end_ts=end_iso,
+                    )
+                except Exception:
+                    logger.exception("Error log_segment_end para %s", call_id)
+        else:
+            if self.reporter:
+                try:
+                    if context.agent_answered_ts and context.bridge_created_ts:
+                        try:
+                            start_dt = datetime.fromisoformat(context.bridge_created_ts)
+                            agent_answered_dt = datetime.fromisoformat(
+                                context.agent_answered_ts.replace("Z", "+00:00")
+                            )
+                            bridge_wait_time = max(
+                                0.0, (agent_answered_dt - start_dt).total_seconds()
+                            )
+                        except Exception:
+                            pass
+                    call_type = context.call_type or CallType.DIALER_ID
+                    call_data = {
+                        "callid": call_id,
+                        "id_camp": context.id_camp,
+                        "id_customer": context.id_customer,
+                        "phone_number": context.phone_number,
+                        "tel_customer": context.phone_number,
+                        "call_type": call_type,
+                        "ts_start_iso": context.bridge_created_ts,
+                        "ts_answer_iso": context.pstn_answered_ts or context.agent_answered_ts,
+                        "agente_id": getattr(context, "agent_id", None),
+                        "is_voicebot": getattr(context, "is_voicebot", False),
+                        "is_voicebot_transfer": getattr(context, "is_voicebot_transfer", False),
+                    }
+                    if call_type == CallType.DIALER_ID and context.id_camp and self.route_validator:
+                        trunk_callerid = self.route_validator.get_trunk_callerid(
+                            context.id_camp,
+                            override_route_id=getattr(context, "effective_route_id", None),
+                        )
+                        if trunk_callerid is not None:
+                            call_data["numero_origen"] = trunk_callerid
+                    quien_corto = 1 if getattr(context, "inbound_agent_hung_up_first", False) else 2
+                    bot_duration, agent_duration = compute_bot_agent_durations(
+                        context, end_iso, duracion_llamada
+                    )
+                    self.reporter.log_segment_end(
+                        call_data=call_data,
+                        event_final="EXIT_ANSWERED",
+                        is_transfer=False,
+                        quien_corto=quien_corto,
+                        uniqueid=uniqueid,
+                        callid=call_id,
+                        end_iso=end_iso,
+                        bridge_wait_time=bridge_wait_time,
+                        duracion_llamada=duracion_llamada,
+                        bot_duration=bot_duration,
+                        agent_duration=agent_duration,
+                        channel_leg="PSTN",
+                        channel_leg_id=uniqueid_pstn or channel_id,
+                        channel_leg_name=context.pstn_channel or channel_id,
+                        channel_leg_start_ts=context.bridge_created_ts,
+                        channel_leg_answer_ts=context.pstn_answered_ts,
+                        channel_leg_end_ts=end_iso,
+                    )
+                except Exception:
+                    logger.exception("Error log_segment_end EXIT_ANSWERED para %s", call_id)
+
+    def finalize_progressive_pstn_end(
+        self,
+        context: CallContext,
+        channel_id: str,
+        source: str = "",
+    ) -> bool:
+        """
+        Cierre unificado del leg PSTN progressive: safety net, mark atómico, reporte y unregister.
+        """
+        call_id = context.call_id
+        if not call_id:
+            return False
+
+        self._pstn_safety_net_cleanup(context, call_id)
+
+        refreshed: Optional[CallContext] = None
+        try:
+            with self.state_store.lock(call_id):
+                refreshed = self.state_store.get(call_id)
+        except Exception:
+            logger.debug(
+                "ProgressiveCampaignHandler.finalize_progressive_pstn_end: refresh falló call_id=%s",
+                call_id,
+                exc_info=True,
+            )
+
+        vb_end_ts = (
+            getattr(refreshed, "voicebot_leg_end_ts", None) if refreshed is not None else None
+        ) or getattr(context, "voicebot_leg_end_ts", None)
+        is_xfer_flag = bool(
+            (getattr(refreshed, "is_voicebot_transfer", False) if refreshed is not None else False)
+            or getattr(context, "is_voicebot_transfer", False)
+        )
+        is_post_voicebot_handoff = is_xfer_flag or bool(vb_end_ts)
+
+        try:
+            mark_result = self.state_store.mark_call_ended_atomic(call_id)
+        except Exception:
+            logger.exception(
+                "ProgressiveCampaignHandler.finalize_progressive_pstn_end: error mark "
+                "(call_id=%s, source=%s)",
+                call_id,
+                source or "unknown",
+            )
+            return False
+
+        if mark_result is False:
+            logger.info(
+                "ProgressiveCampaignHandler.finalize_progressive_pstn_end: llamada %s ya finalizada "
+                "(source=%s)",
+                call_id,
+                source or "unknown",
+            )
+            with self._pstn_hangup_lock:
+                self._pstn_hangup_initiated_by_app.discard(channel_id)
+            return False
+
+        if mark_result is None:
+            logger.warning(
+                "ProgressiveCampaignHandler.finalize_progressive_pstn_end: contexto %s inexistente "
+                "(source=%s)",
+                call_id,
+                source or "unknown",
+            )
+            return False
+
+        uniqueid_pstn = getattr(context, "uniqueid_pstn", None)
+        end_iso = datetime.now().isoformat()
+        bridge_wait_time = 0.0
+        duracion_llamada = 0.0
+        if context.bridge_created_ts:
+            try:
+                start_dt = datetime.fromisoformat(context.bridge_created_ts)
+                end_dt = datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
+                duracion_llamada = max(0.0, (end_dt - start_dt).total_seconds())
+                bridge_wait_time = duracion_llamada
+            except Exception:
+                pass
+
+        with self._pstn_hangup_lock:
+            treat_as_timeout = channel_id in self._pstn_hangup_initiated_by_app
+            if treat_as_timeout:
+                self._pstn_hangup_initiated_by_app.discard(channel_id)
+
+        if not treat_as_timeout and context.queue_timeout_seconds is not None:
+            if is_post_voicebot_handoff:
+                if vb_end_ts:
+                    try:
+                        vb_end_dt = datetime.fromisoformat(vb_end_ts.replace("Z", "+00:00"))
+                        end_dt = datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
+                        wait_after_handoff = max(0.0, (end_dt - vb_end_dt).total_seconds())
+                        if wait_after_handoff >= max(0, context.queue_timeout_seconds - 1):
+                            treat_as_timeout = True
+                    except Exception:
+                        pass
+            elif bridge_wait_time >= max(0, context.queue_timeout_seconds - 1):
+                treat_as_timeout = True
+
+        self._report_progressive_pstn_end(
+            call_id=call_id,
+            channel_id=channel_id,
+            context=context,
+            refreshed=refreshed,
+            uniqueid_pstn=uniqueid_pstn,
+            end_iso=end_iso,
+            bridge_wait_time=bridge_wait_time,
+            duracion_llamada=duracion_llamada,
+            treat_as_timeout=treat_as_timeout,
+            is_post_voicebot_handoff=is_post_voicebot_handoff,
+            vb_end_ts=vb_end_ts,
+        )
+
+        ctx_for_release = refreshed if refreshed is not None else context
+        if not is_post_voicebot_handoff and self.agent_status_service:
+            try:
+                self.agent_status_service.release_voicebot_from_context(ctx_for_release)
+            except Exception as e:
+                logger.warning(
+                    "ProgressiveCampaignHandler.finalize_progressive_pstn_end: error liberando "
+                    "voicebot call_id=%s: %s",
+                    call_id,
+                    e,
+                )
+
+        if self.pstn_reported_store and channel_id:
+            self.pstn_reported_store.add(channel_id)
+
+        try:
+            self.state_store.unregister(call_id)
+            logger.info(
+                "Redis cleanup done for %s (finalize_progressive_pstn_end, source=%s)",
+                call_id,
+                source or "unknown",
+            )
+        except Exception:
+            logger.exception(
+                "ProgressiveCampaignHandler.finalize_progressive_pstn_end: error unregister %s",
+                call_id,
+            )
+
+        return True
+
+    def _stop_active_recording(self, context, bridge_id: str) -> None:
+        recording_id = getattr(context, 'recording_id', None)
+        if not recording_id and self.recording_service:
+            recording_id = self.recording_service.get_active_recording(bridge_id)
+        if not recording_id:
+            return
+        try:
+            result = self.ari_client.stop_recording(recording_id)
+            if result:
+                logger.info("✅ Grabación %s detenida antes de destruir bridge %s", recording_id, bridge_id)
+            else:
+                logger.debug("⚠️ stop_recording retornó False para %s (puede que ya haya terminado)", recording_id)
+        except Exception as e:
+            logger.warning("⚠️ Error al detener grabación %s: %s", recording_id, e)
 
     def _parse_args_list(self, event: Union[StasisStartEvent, Dict[str, Any]]) -> List[str]:
         if isinstance(event, StasisStartEvent):
@@ -811,27 +1172,7 @@ class ProgressiveCampaignHandler(BaseHandler):
                 call_id,
                 channel_id,
             )
-            self.distribution_service.stop_distribution(call_id)
-            try:
-                mark_result = self.state_store.mark_call_ended_atomic(call_id)
-                if mark_result is False or mark_result is None:
-                    return
-            except Exception:
-                logger.exception("Error mark_call_ended_atomic para %s", call_id)
-                return
-            if self.agent_status_service:
-                try:
-                    self.agent_status_service.release_voicebot_from_context(context)
-                except Exception as e:
-                    logger.warning(
-                        "ProgressiveCampaignHandler.on_failure: error liberando voicebot (PSTN) call_id=%s: %s",
-                        call_id,
-                        e,
-                    )
-            try:
-                self.state_store.unregister(call_id)
-            except Exception:
-                logger.exception("Error unregister para %s", call_id)
+            self.finalize_progressive_pstn_end(context, channel_id, source="channel_destroyed")
         except Exception as e:
             logger.error("ProgressiveCampaignHandler.on_failure: %s", e, exc_info=True)
 
@@ -897,6 +1238,7 @@ class ProgressiveCampaignHandler(BaseHandler):
                 except Exception:
                     logger.exception("Error colgando PSTN %s", pstn_channel)
             if bridge_id.strip():
+                self._stop_active_recording(context, bridge_id)
                 try:
                     self.ari_client.destroy_bridge(bridge_id)
                 except Exception:
@@ -911,268 +1253,8 @@ class ProgressiveCampaignHandler(BaseHandler):
             context = self.state_store.get_by_channel(channel_id)
             if not context:
                 return
-            pstn_channel = getattr(context, "pstn_channel", None)
-            uniqueid_pstn = getattr(context, "uniqueid_pstn", None)
-            is_pstn_leg = (
-                channel_id == pstn_channel
-                or channel_id == uniqueid_pstn
-                or (self.pstn_channel_id is not None and channel_id == self.pstn_channel_id)
-            )
-            if not is_pstn_leg:
+            if not self._is_pstn_leg_channel(channel_id, context):
                 return
-            call_id = context.call_id
-            bridge_id = getattr(context, "bridge_id", None)
-            if bridge_id and str(bridge_id).strip():
-                try:
-                    self.ari_client.destroy_bridge(bridge_id)
-                except Exception:
-                    pass
-            for agent_leg in distinct_agent_leg_ids(context):
-                try:
-                    self.ari_client.hangup_channel(agent_leg)
-                except Exception:
-                    pass
-            self.distribution_service.stop_distribution(call_id)
-            # Releer Redis tras parar distribución: evita snapshot obsoleto y recupera
-            # is_voicebot_transfer / voicebot_leg_end_ts si otra escritura los pisó.
-            refreshed: Optional[CallContext] = None
-            try:
-                with self.state_store.lock(call_id):
-                    refreshed = self.state_store.get(call_id)
-            except Exception:
-                logger.debug(
-                    "ProgressiveCampaignHandler.on_pstn_stasis_end: refresh contexto falló call_id=%s",
-                    call_id,
-                    exc_info=True,
-                )
-            vb_end_ts = (
-                getattr(refreshed, "voicebot_leg_end_ts", None) if refreshed is not None else None
-            ) or getattr(context, "voicebot_leg_end_ts", None)
-            is_xfer_flag = bool(
-                (getattr(refreshed, "is_voicebot_transfer", False) if refreshed is not None else False)
-                or getattr(context, "is_voicebot_transfer", False)
-            )
-            is_post_voicebot_handoff = is_xfer_flag or bool(vb_end_ts)
-            try:
-                mark_result = self.state_store.mark_call_ended_atomic(call_id)
-                if mark_result is False:
-                    with self._pstn_hangup_lock:
-                        self._pstn_hangup_initiated_by_app.discard(channel_id)
-                    return
-                if mark_result is None:
-                    return
-            except Exception:
-                logger.exception("Error mark_call_ended_atomic en on_pstn_stasis_end para %s", call_id)
-                return
-
-            uniqueid = uniqueid_pstn or call_id
-            end_iso = datetime.now().isoformat()
-            bridge_wait_time = 0.0
-            duracion_llamada = 0.0
-            if context.bridge_created_ts:
-                try:
-                    start_dt = datetime.fromisoformat(context.bridge_created_ts)
-                    end_dt = datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
-                    duracion_llamada = max(0.0, (end_dt - start_dt).total_seconds())
-                    bridge_wait_time = duracion_llamada
-                except Exception:
-                    pass
-            with self._pstn_hangup_lock:
-                treat_as_timeout = channel_id in self._pstn_hangup_initiated_by_app
-                if treat_as_timeout:
-                    self._pstn_hangup_initiated_by_app.discard(channel_id)
-            if not treat_as_timeout and context.queue_timeout_seconds is not None:
-                if is_post_voicebot_handoff:
-                    if vb_end_ts:
-                        try:
-                            vb_end_dt = datetime.fromisoformat(vb_end_ts.replace("Z", "+00:00"))
-                            end_dt = datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
-                            wait_after_handoff = max(0.0, (end_dt - vb_end_dt).total_seconds())
-                            if wait_after_handoff >= max(0, context.queue_timeout_seconds - 1):
-                                treat_as_timeout = True
-                        except Exception:
-                            pass
-                elif bridge_wait_time >= max(0, context.queue_timeout_seconds - 1):
-                    treat_as_timeout = True
-
-            if not active_agent_channel(context):
-                if treat_as_timeout:
-                    if self.queue_event_manager:
-                        try:
-                            self.queue_event_manager.on_timeout(
-                                callid=call_id,
-                                uniqueid=uniqueid,
-                                campana_id=str(context.id_camp or ""),
-                            )
-                        except Exception:
-                            pass
-                else:
-                    if self.queue_event_manager:
-                        try:
-                            self.queue_event_manager.on_abandon(
-                                callid=call_id,
-                                uniqueid=uniqueid,
-                                campana_id=str(context.id_camp or ""),
-                            )
-                        except Exception:
-                            pass
-                if self.reporter:
-                    try:
-                        call_type = context.call_type or CallType.DIALER_ID
-                        if is_post_voicebot_handoff and vb_end_ts:
-                            try:
-                                vb_end_dt = datetime.fromisoformat(vb_end_ts.replace("Z", "+00:00"))
-                                end_dt = datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
-                                bridge_wait_time = max(0.0, (end_dt - vb_end_dt).total_seconds())
-                            except Exception:
-                                pass
-                        if treat_as_timeout:
-                            event_final = (
-                                HangupCause.EXIT_HANDOFF_TIMEOUT.value
-                                if is_post_voicebot_handoff
-                                else HangupCause.EXIT_TIMEOUT.value
-                            )
-                        else:
-                            event_final = (
-                                HangupCause.EXIT_HANDOFF_ABANDON.value
-                                if is_post_voicebot_handoff
-                                else HangupCause.EXIT_ABANDON.value
-                            )
-                        duration_ctx = context
-                        if is_post_voicebot_handoff:
-                            vb_start_merged = (
-                                getattr(refreshed, "voicebot_leg_start_ts", None)
-                                if refreshed is not None
-                                else None
-                            ) or getattr(context, "voicebot_leg_start_ts", None)
-                            duration_ctx = context.model_copy(
-                                update={
-                                    "is_voicebot_transfer": True,
-                                    "voicebot_leg_end_ts": vb_end_ts
-                                    or getattr(context, "voicebot_leg_end_ts", None),
-                                    "voicebot_leg_start_ts": vb_start_merged,
-                                }
-                            )
-                        bot_duration, agent_duration = compute_bot_agent_durations(
-                            duration_ctx, end_iso, duracion_llamada
-                        )
-                        call_data = {
-                            "callid": call_id,
-                            "id_camp": context.id_camp,
-                            "id_customer": context.id_customer,
-                            "phone_number": context.phone_number,
-                            "tel_customer": context.phone_number,
-                            "call_type": call_type,
-                            "ts_start_iso": context.bridge_created_ts,
-                            "ts_answer_iso": context.pstn_answered_ts or context.agent_answered_ts,
-                            "is_voicebot": bool(is_post_voicebot_handoff),
-                            "is_voicebot_transfer": bool(is_post_voicebot_handoff),
-                        }
-                        if call_type == CallType.DIALER_ID and context.id_camp and self.route_validator:
-                            trunk_callerid = self.route_validator.get_trunk_callerid(
-                                context.id_camp,
-                                override_route_id=getattr(context, "effective_route_id", None),
-                            )
-                            if trunk_callerid is not None:
-                                call_data["numero_origen"] = trunk_callerid
-                        self.reporter.log_segment_end(
-                            call_data=call_data,
-                            event_final=event_final,
-                            is_transfer=False,
-                            quien_corto=0 if treat_as_timeout else 2,
-                            uniqueid=uniqueid,
-                            callid=call_id,
-                            end_iso=end_iso,
-                            bridge_wait_time=bridge_wait_time,
-                            duracion_llamada=duracion_llamada,
-                            bot_duration=bot_duration,
-                            agent_duration=agent_duration,
-                            channel_leg="PSTN",
-                            channel_leg_id=uniqueid_pstn or channel_id,
-                            channel_leg_name=context.pstn_channel or channel_id,
-                            channel_leg_start_ts=context.bridge_created_ts,
-                            channel_leg_answer_ts=context.pstn_answered_ts,
-                            channel_leg_end_ts=end_iso,
-                        )
-                    except Exception:
-                        logger.exception("Error log_segment_end para %s", call_id)
-            else:
-                if self.reporter:
-                    try:
-                        # Para EXIT_ANSWERED, bridge_wait_time = tiempo en cola hasta que el agente contestó
-                        if context.agent_answered_ts and context.bridge_created_ts:
-                            try:
-                                start_dt = datetime.fromisoformat(context.bridge_created_ts)
-                                agent_answered_dt = datetime.fromisoformat(
-                                    context.agent_answered_ts.replace("Z", "+00:00")
-                                )
-                                bridge_wait_time = max(
-                                    0.0, (agent_answered_dt - start_dt).total_seconds()
-                                )
-                            except Exception:
-                                pass
-                        call_type = context.call_type or CallType.DIALER_ID
-                        call_data = {
-                            "callid": call_id,
-                            "id_camp": context.id_camp,
-                            "id_customer": context.id_customer,
-                            "phone_number": context.phone_number,
-                            "tel_customer": context.phone_number,
-                            "call_type": call_type,
-                            "ts_start_iso": context.bridge_created_ts,
-                            "ts_answer_iso": context.pstn_answered_ts or context.agent_answered_ts,
-                            "agente_id": getattr(context, "agent_id", None),
-                            "is_voicebot": getattr(context, "is_voicebot", False),
-                            "is_voicebot_transfer": getattr(context, "is_voicebot_transfer", False),
-                        }
-                        if call_type == CallType.DIALER_ID and context.id_camp and self.route_validator:
-                            trunk_callerid = self.route_validator.get_trunk_callerid(
-                                context.id_camp,
-                                override_route_id=getattr(context, "effective_route_id", None),
-                            )
-                            if trunk_callerid is not None:
-                                call_data["numero_origen"] = trunk_callerid
-                        quien_corto = 1 if getattr(context, "inbound_agent_hung_up_first", False) else 2
-                        bot_duration, agent_duration = compute_bot_agent_durations(
-                            context, end_iso, duracion_llamada
-                        )
-                        self.reporter.log_segment_end(
-                            call_data=call_data,
-                            event_final="EXIT_ANSWERED",
-                            is_transfer=False,
-                            quien_corto=quien_corto,
-                            uniqueid=uniqueid,
-                            callid=call_id,
-                            end_iso=end_iso,
-                            bridge_wait_time=bridge_wait_time,
-                            duracion_llamada=duracion_llamada,
-                            bot_duration=bot_duration,
-                            agent_duration=agent_duration,
-                            channel_leg="PSTN",
-                            channel_leg_id=uniqueid_pstn or channel_id,
-                            channel_leg_name=context.pstn_channel or channel_id,
-                            channel_leg_start_ts=context.bridge_created_ts,
-                            channel_leg_answer_ts=context.pstn_answered_ts,
-                            channel_leg_end_ts=end_iso,
-                        )
-                    except Exception:
-                        logger.exception("Error log_segment_end EXIT_ANSWERED para %s", call_id)
-            ctx_for_release = refreshed if refreshed is not None else context
-            if not is_post_voicebot_handoff and self.agent_status_service:
-                try:
-                    self.agent_status_service.release_voicebot_from_context(ctx_for_release)
-                except Exception as e:
-                    logger.warning(
-                        "ProgressiveCampaignHandler.on_pstn_stasis_end: error liberando voicebot call_id=%s: %s",
-                        call_id,
-                        e,
-                    )
-            # Marcar PSTN como ya reportado para que el router no envíe EXIT_SHORTCALL al procesar ChannelDestroyed
-            if self.pstn_reported_store and channel_id:
-                self.pstn_reported_store.add(channel_id)
-            try:
-                self.state_store.unregister(call_id)
-            except Exception:
-                logger.exception("Error unregister en on_pstn_stasis_end para %s", call_id)
+            self.finalize_progressive_pstn_end(context, channel_id, source="stasis_end")
         except Exception as e:
             logger.error("ProgressiveCampaignHandler.on_pstn_stasis_end: %s", e, exc_info=True)

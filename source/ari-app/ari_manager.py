@@ -674,6 +674,30 @@ class ARI:
             code=result.get('code'),
         )
 
+    def stop_recording(self, recording_name: str) -> bool:
+        """
+        Detiene una grabación activa y la guarda.
+
+        Usa POST /recordings/live/{name}/stop (no DELETE, que descartaría el archivo).
+        404 se trata como éxito (la grabación ya terminó).
+        """
+        route = f'recordings/live/{recording_name}/stop'
+        result = self.post(route)
+        if result.get('ok'):
+            return True
+        if result.get('code') == 404:
+            logger.debug(
+                "stop_recording(%s): 404 (grabación ya no existe o ya terminó).",
+                recording_name,
+            )
+            return True
+        logger.warning(
+            "stop_recording(%s) falló: %s",
+            recording_name,
+            result.get('error', 'Unknown error'),
+        )
+        return False
+
     # --- Métodos del Sistema y Medios Externos ---
 
     def external_media(self, external_host, external_port, app, format='slin16', direction='both',

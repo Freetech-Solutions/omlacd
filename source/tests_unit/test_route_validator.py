@@ -107,6 +107,54 @@ class TestRouteValidatorGetTrunkCallerid(unittest.TestCase):
         self.assertEqual(r2, "+15559999999")
         self.assertEqual(self.redis.get.call_count, 1)
 
+    def test_override_route_does_not_poison_campaign_cache(self):
+        """Una resolución con override_route_id no debe contaminar el caché por
+        campaña: una llamada posterior sin override resuelve la ruta default."""
+        # Ruta default de la campaña -> TRUNK 10 -> CALLERID default.
+        # Ruta override "55" -> TRUNK 20 -> CALLERID override.
+        def hget(k, f):
+            if f == "OUTR":
+                return "1"  # OUTR default de la campaña
+            if f == "TRUNK-1":
+                return "20" if k == "OML:OUTR:55" else "10"
+            return None
+
+        def get(k):
+            return "+1OVERRIDE" if k == "OML:TRUNK:20:CALLERID" else "+1DEFAULT"
+
+        self.redis.hget.side_effect = hget
+        self.redis.get.side_effect = get
+
+        override = self.validator.get_trunk_callerid("42", override_route_id="55")
+        default = self.validator.get_trunk_callerid("42")
+
+        self.assertEqual(override, "+1OVERRIDE")
+        self.assertEqual(default, "+1DEFAULT")
+
+    def test_override_route_uses_route_cache_not_campaign_cache(self):
+        """Con override_route_id presente, un valor cacheado por campaña no debe
+        devolverse: la resolución es exclusivamente por ruta."""
+        def hget(k, f):
+            if f == "OUTR":
+                return "1"
+            if f == "TRUNK-1":
+                return "20" if k == "OML:OUTR:55" else "10"
+            return None
+
+        def get(k):
+            return "+1OVERRIDE" if k == "OML:TRUNK:20:CALLERID" else "+1DEFAULT"
+
+        self.redis.hget.side_effect = hget
+        self.redis.get.side_effect = get
+
+        # Primero poblamos el caché por campaña (sin override).
+        self.assertEqual(self.validator.get_trunk_callerid("42"), "+1DEFAULT")
+        # El override debe ir por su propia ruta, ignorando el caché por campaña.
+        self.assertEqual(
+            self.validator.get_trunk_callerid("42", override_route_id="55"),
+            "+1OVERRIDE",
+        )
+
 
 class TestRouteValidatorRouteResolution(unittest.TestCase):
     """Tests para fallback de rutas por pattern matching y overrides."""

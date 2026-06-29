@@ -224,6 +224,7 @@ class ACDContainer(containers.DeclarativeContainer):
         redis_client=redis_client_base,  # Usar cliente base para handlers
         agent_status_service=agent_status_service,
         route_validator=route_validator,
+        recording_service=recording_service,
     )
 
     def _make_get_campaign_config(redis_client):
@@ -272,6 +273,7 @@ class ACDContainer(containers.DeclarativeContainer):
         route_validator=route_validator,
         legacy_forwarder=legacy_forwarder,
         pstn_reported_store=pstn_reported_store,
+        recording_service=recording_service,
     )
 
     recording_handler = providers.Singleton(
