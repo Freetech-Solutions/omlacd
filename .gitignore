@@ -8,6 +8,10 @@ __pycache__
 .coverage
 htmlcov/
 .pytest_cache/
+.sonar/
+
+# TLS dev certs (generados localmente; ver certs/README.md)
+certs/*.pem
 
 source/astconf/oml_pjsip_trunks.conf
 source/astconf/oml_queues.conf

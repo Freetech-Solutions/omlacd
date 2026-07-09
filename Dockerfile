@@ -1,4 +1,4 @@
-FROM --platform=linux/arm64 docker.io/freetechsolutions/asterisk:20260316-614e4d2c AS run
+FROM --platform=linux/arm64 docker.io/freetechsolutions/asterisk:20260707-91edd45e AS run
 
 ENV LANG=en_US.utf8
 ENV NOTVISIBLE="in users profile"
@@ -21,8 +21,13 @@ COPY source/workers/ /opt/asterisk/workers/
 COPY .flake8 /opt/asterisk/.flake8
 COPY pytest.ini /opt/asterisk/pytest.ini
 COPY build/docker-entrypoint.sh /docker-entrypoint.sh
-COPY ./certs/ /etc/asterisk/certs/
+COPY certs/README.md /etc/asterisk/certs/README.md
 
-RUN chmod 750 -R /var/spool/asterisk && \
+RUN mkdir -p /etc/asterisk/certs && \
+    openssl req -x509 -newkey rsa:4096 \
+      -keyout /etc/asterisk/certs/key.pem \
+      -out /etc/asterisk/certs/cert.pem \
+      -days 3650 -nodes -subj "/CN=acd-dev.local" && \
+    chmod 750 -R /var/spool/asterisk && \
     useradd -M omnileads && \
     chown -R omnileads:omnileads /var/lib/asterisk /etc/asterisk /opt/asterisk /usr/lib/asterisk /docker-entrypoint.sh /var/spool/asterisk /var/log/asterisk /opt/asterisk/workers
