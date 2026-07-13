@@ -2,7 +2,7 @@
 # Formato: {commit}:{file}:{rule}:{line}
 #
 # Hallazgos en historial git remediados en HEAD (651c82d+):
-# - certs/key.pem: removido; TLS generado en Dockerfile
+# - certs/key.pem: removido; TLS se genera en entrypoint o se monta en runtime
 # - docs/voicebot_transfer*.sh/md: credenciales reemplazadas por placeholders
 # - README.md / ansible/inventory / build/package/.env: legacy removido
 

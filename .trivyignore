@@ -1,0 +1,11 @@
+# CVE-2026-42496: Path traversal en Archive::Tar (Perl). No explotable en ACD:
+# no usamos Archive::Tar; git (que arrastraba Perl) ya no se instala en la imagen.
+CVE-2026-42496
+
+# CVE-2026-8376: Heap buffer overflow en Perl regex en builds 32-bit. No explotable:
+# las imágenes se construyen solo para amd64/arm64.
+CVE-2026-8376
+
+# CVE-2026-43185: bug en ksmbd (kernel). linux-libc-dev son solo headers en la
+# imagen; el contenedor no ejecuta ese código del kernel.
+CVE-2026-43185

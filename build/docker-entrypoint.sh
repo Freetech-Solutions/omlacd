@@ -93,6 +93,28 @@ configure_ami_ari() {
   sed -i "s/aripassword/${AMI_PASSWORD}/g" /etc/asterisk/oml_ari.conf
 }
 
+ensure_tls_certs() {
+  local cert_dir="/etc/asterisk/certs"
+  local cert="${cert_dir}/cert.pem"
+  local key="${cert_dir}/key.pem"
+
+  mkdir -p "${cert_dir}"
+
+  if [[ -f "${cert}" && -f "${key}" ]]; then
+    echo "**[omlacd] Using existing TLS certs in ${cert_dir}"
+    return
+  fi
+
+  echo "**[omlacd] Generating ephemeral self-signed TLS certs (dev fallback; mount real certs in prod)"
+  openssl req -x509 -newkey rsa:4096 \
+    -keyout "${key}" \
+    -out "${cert}" \
+    -days 3650 -nodes -subj "/CN=acd-dev.local"
+  chown omnileads:omnileads "${cert}" "${key}"
+  chmod 640 "${key}"
+  chmod 644 "${cert}"
+}
+
 configure_homer() {
   if ! is_true "${HOMER_ENABLE}"; then
     return
@@ -209,6 +231,7 @@ main() {
     # Configuración completa antes de levantar Asterisk
     configure_timezone
     configure_ami_ari
+    ensure_tls_certs
     # configure_homer
     configure_scale
     configure_rtp_ports

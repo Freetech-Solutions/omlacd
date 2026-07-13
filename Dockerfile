@@ -5,10 +5,12 @@ ENV NOTVISIBLE="in users profile"
 
 COPY build/requirements.txt /
 
-# RUN echo "deb http://ftp.de.debian.org/debian trixie main non-free" >> /etc/apt/sources.list
+# sngrep: debug SIP. No instalar git (arrastra Perl y CVEs sin fix en Debian).
 RUN apt update && apt install -y --no-install-recommends \
-    sngrep git \
-    && pip install --no-cache-dir --upgrade pip && pip install --no-cache-dir -r /requirements.txt \
+    sngrep \
+    && pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir -r /requirements.txt \
+    && pip install --no-cache-dir --upgrade 'wheel>=0.46.2' 'jaraco.context>=6.1.0' \
     && apt autoremove -y && apt clean -y && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
 ENV PYTHONPATH=/opt/asterisk/ari-app
@@ -23,11 +25,9 @@ COPY pytest.ini /opt/asterisk/pytest.ini
 COPY build/docker-entrypoint.sh /docker-entrypoint.sh
 COPY certs/README.md /etc/asterisk/certs/README.md
 
+# Certs TLS: no bakear key.pem en la imagen (Trivy secret). Se generan en entrypoint
+# si faltan, o se montan en runtime (prod).
 RUN mkdir -p /etc/asterisk/certs && \
-    openssl req -x509 -newkey rsa:4096 \
-      -keyout /etc/asterisk/certs/key.pem \
-      -out /etc/asterisk/certs/cert.pem \
-      -days 3650 -nodes -subj "/CN=acd-dev.local" && \
     chmod 750 -R /var/spool/asterisk && \
     useradd -M omnileads && \
     chown -R omnileads:omnileads /var/lib/asterisk /etc/asterisk /opt/asterisk /usr/lib/asterisk /docker-entrypoint.sh /var/spool/asterisk /var/log/asterisk /opt/asterisk/workers
