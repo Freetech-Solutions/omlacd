@@ -1,0 +1,81 @@
+# Excepciones documentadas - Revisado por SGI/Seguridad
+# Formato: {commit}:{file}:{rule}:{line}
+#
+# Hallazgos en historial git remediados en HEAD (651c82d+):
+# - certs/key.pem: removido; TLS se genera en entrypoint o se monta en runtime
+# - docs/voicebot_transfer*.sh/md: credenciales reemplazadas por placeholders
+# - README.md / ansible/inventory / build/package/.env: legacy removido
+
+# SonarCloud CI - variable SONAR_TOKEN, no token en texto plano
+bb54b860e48055a932b57429f5da5027438023eb:.gitlab-ci.yml:curl-auth-user:105
+bb54b860e48055a932b57429f5da5027438023eb:.gitlab-ci.yml:curl-auth-user:121
+
+# certs/key.pem - certificado TLS dev (historial)
+114653ff960d96dab4c47cacc41a450346f603d8:certs/key.pem:private-key:1
+59a75c691a9dd6c2293df629a4361d789a73638e:certs/key.pem:private-key:1
+da83ebc1a3ed50fd9dea3a7c28f28ed49bb423fe:certs/key.pem:private-key:1
+f099343023eccd109a663efe9bc2f5f31cb57f8d:certs/key.pem:private-key:1
+
+# docs/voicebot_transfer.sh - ejemplos sanitizados (historial)
+114653ff960d96dab4c47cacc41a450346f603d8:docs/voicebot_transfer.sh:curl-auth-header:105
+114653ff960d96dab4c47cacc41a450346f603d8:docs/voicebot_transfer.sh:curl-auth-header:110
+114653ff960d96dab4c47cacc41a450346f603d8:docs/voicebot_transfer.sh:curl-auth-header:117
+114653ff960d96dab4c47cacc41a450346f603d8:docs/voicebot_transfer.sh:curl-auth-header:25
+114653ff960d96dab4c47cacc41a450346f603d8:docs/voicebot_transfer.sh:curl-auth-header:36
+114653ff960d96dab4c47cacc41a450346f603d8:docs/voicebot_transfer.sh:curl-auth-header:48
+114653ff960d96dab4c47cacc41a450346f603d8:docs/voicebot_transfer.sh:curl-auth-header:59
+11ab022af07fe0c02e199fa050ba7626bfdb5bc5:docs/voicebot_transfer.sh:curl-auth-header:105
+11ab022af07fe0c02e199fa050ba7626bfdb5bc5:docs/voicebot_transfer.sh:curl-auth-header:110
+11ab022af07fe0c02e199fa050ba7626bfdb5bc5:docs/voicebot_transfer.sh:curl-auth-header:117
+11ab022af07fe0c02e199fa050ba7626bfdb5bc5:docs/voicebot_transfer.sh:curl-auth-header:25
+11ab022af07fe0c02e199fa050ba7626bfdb5bc5:docs/voicebot_transfer.sh:curl-auth-header:36
+11ab022af07fe0c02e199fa050ba7626bfdb5bc5:docs/voicebot_transfer.sh:curl-auth-header:48
+11ab022af07fe0c02e199fa050ba7626bfdb5bc5:docs/voicebot_transfer.sh:curl-auth-header:59
+1b955f7b6d2a9771581717b7056c68528578edb7:docs/voicebot_transfer.sh:curl-auth-header:30
+1b955f7b6d2a9771581717b7056c68528578edb7:docs/voicebot_transfer.sh:curl-auth-header:59
+59a75c691a9dd6c2293df629a4361d789a73638e:docs/voicebot_transfer.sh:curl-auth-header:105
+59a75c691a9dd6c2293df629a4361d789a73638e:docs/voicebot_transfer.sh:curl-auth-header:110
+59a75c691a9dd6c2293df629a4361d789a73638e:docs/voicebot_transfer.sh:curl-auth-header:117
+59a75c691a9dd6c2293df629a4361d789a73638e:docs/voicebot_transfer.sh:curl-auth-header:25
+59a75c691a9dd6c2293df629a4361d789a73638e:docs/voicebot_transfer.sh:curl-auth-header:36
+59a75c691a9dd6c2293df629a4361d789a73638e:docs/voicebot_transfer.sh:curl-auth-header:48
+59a75c691a9dd6c2293df629a4361d789a73638e:docs/voicebot_transfer.sh:curl-auth-header:59
+64343acd026cb0a426513c3aa5b00aa31ec4f550:docs/voicebot_transfer.sh:curl-auth-header:30
+91e0e0bbcd8bb98c5752e25c0287db027c9d951b:docs/voicebot_transfer.sh:curl-auth-header:25
+91e0e0bbcd8bb98c5752e25c0287db027c9d951b:docs/voicebot_transfer.sh:curl-auth-header:36
+91e0e0bbcd8bb98c5752e25c0287db027c9d951b:docs/voicebot_transfer.sh:curl-auth-header:48
+91e0e0bbcd8bb98c5752e25c0287db027c9d951b:docs/voicebot_transfer.sh:curl-auth-header:61
+91e0e0bbcd8bb98c5752e25c0287db027c9d951b:docs/voicebot_transfer.sh:curl-auth-header:66
+91e0e0bbcd8bb98c5752e25c0287db027c9d951b:docs/voicebot_transfer.sh:curl-auth-header:73
+da83ebc1a3ed50fd9dea3a7c28f28ed49bb423fe:docs/voicebot_transfer.sh:curl-auth-header:105
+da83ebc1a3ed50fd9dea3a7c28f28ed49bb423fe:docs/voicebot_transfer.sh:curl-auth-header:110
+da83ebc1a3ed50fd9dea3a7c28f28ed49bb423fe:docs/voicebot_transfer.sh:curl-auth-header:117
+da83ebc1a3ed50fd9dea3a7c28f28ed49bb423fe:docs/voicebot_transfer.sh:curl-auth-header:25
+da83ebc1a3ed50fd9dea3a7c28f28ed49bb423fe:docs/voicebot_transfer.sh:curl-auth-header:36
+da83ebc1a3ed50fd9dea3a7c28f28ed49bb423fe:docs/voicebot_transfer.sh:curl-auth-header:48
+da83ebc1a3ed50fd9dea3a7c28f28ed49bb423fe:docs/voicebot_transfer.sh:curl-auth-header:59
+f099343023eccd109a663efe9bc2f5f31cb57f8d:docs/voicebot_transfer.sh:curl-auth-header:105
+f099343023eccd109a663efe9bc2f5f31cb57f8d:docs/voicebot_transfer.sh:curl-auth-header:110
+f099343023eccd109a663efe9bc2f5f31cb57f8d:docs/voicebot_transfer.sh:curl-auth-header:117
+f099343023eccd109a663efe9bc2f5f31cb57f8d:docs/voicebot_transfer.sh:curl-auth-header:25
+f099343023eccd109a663efe9bc2f5f31cb57f8d:docs/voicebot_transfer.sh:curl-auth-header:36
+f099343023eccd109a663efe9bc2f5f31cb57f8d:docs/voicebot_transfer.sh:curl-auth-header:48
+f099343023eccd109a663efe9bc2f5f31cb57f8d:docs/voicebot_transfer.sh:curl-auth-header:59
+
+# docs/voicebot_transfer_process.md - doc legacy removida (historial)
+11ab022af07fe0c02e199fa050ba7626bfdb5bc5:docs/voicebot_transfer_process.md:curl-auth-header:145
+11ab022af07fe0c02e199fa050ba7626bfdb5bc5:docs/voicebot_transfer_process.md:curl-auth-header:193
+11ab022af07fe0c02e199fa050ba7626bfdb5bc5:docs/voicebot_transfer_process.md:curl-auth-header:97
+11ab022af07fe0c02e199fa050ba7626bfdb5bc5:docs/voicebot_transfer_process.md:generic-api-key:66
+11ab022af07fe0c02e199fa050ba7626bfdb5bc5:docs/voicebot_transfer_process.md:generic-api-key:84
+91e0e0bbcd8bb98c5752e25c0287db027c9d951b:docs/voicebot_transfer_process.md:curl-auth-header:145
+91e0e0bbcd8bb98c5752e25c0287db027c9d951b:docs/voicebot_transfer_process.md:curl-auth-header:193
+91e0e0bbcd8bb98c5752e25c0287db027c9d951b:docs/voicebot_transfer_process.md:curl-auth-header:97
+91e0e0bbcd8bb98c5752e25c0287db027c9d951b:docs/voicebot_transfer_process.md:generic-api-key:66
+91e0e0bbcd8bb98c5752e25c0287db027c9d951b:docs/voicebot_transfer_process.md:generic-api-key:84
+
+# Legacy README / ansible / build env (historial)
+0625733462e1516466d2c63d80b65d54f3b5eec3:build/package/.env:aws-access-token:7
+0625733462e1516466d2c63d80b65d54f3b5eec3:build/package/.env:generic-api-key:6
+897a169076fd9cbe121bc77e54c2a6701055d3fc:README.md:generic-api-key:106
+897a169076fd9cbe121bc77e54c2a6701055d3fc:ansible/inventory:generic-api-key:23

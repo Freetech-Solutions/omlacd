@@ -11,6 +11,7 @@ from state_helpers import (
     distinct_agent_leg_ids,
     is_agent_leg_channel,
     is_consult_initiator_channel,
+    is_pstn_hangup_during_blind_transfer_ringing,
     should_block_operation_for_transfer,
 )
 from utils import compute_bot_agent_durations, parse_ari_args, determine_who_hung_up
@@ -58,13 +59,14 @@ class ManualCallHandler(BaseHandler):
         111: HangupCause.ERROR.value,        # Protocol error, unspecified
     }
 
-    def __init__(self, ari_client, state_store, reporter, asterisk_app: Optional[str] = None, call_service: Optional[CallActionService] = None, redis_client=None, agent_status_service: Optional[AgentStatusService] = None, route_validator=None):
+    def __init__(self, ari_client, state_store, reporter, asterisk_app: Optional[str] = None, call_service: Optional[CallActionService] = None, redis_client=None, agent_status_service: Optional[AgentStatusService] = None, route_validator=None, recording_service=None):
         super().__init__(ari_client, state_store, reporter)
         self.asterisk_app = asterisk_app or settings.ARI_APP
         self.call_service = call_service
         self.redis_client = redis_client
         self.agent_status_service = agent_status_service
         self.route_validator = route_validator
+        self.recording_service = recording_service
 
     def _parse_args_list(self, event: Union[StasisStartEvent, Dict[str, Any]]) -> list:
         if isinstance(event, StasisStartEvent):
@@ -927,6 +929,27 @@ class ManualCallHandler(BaseHandler):
             except Exception as e:
                 logging.error(f"Error actualizando estado del agente: {e}", exc_info=True)
 
+    def _stop_active_recording(self, context: CallContext, bridge_id: str) -> None:
+        """
+        Detiene la grabación activa del bridge antes de destruirlo.
+
+        Evita que los canales Recorder/* queden huérfanos cuando se destruye
+        un bridge con grabación activa.
+        """
+        recording_id = getattr(context, 'recording_id', None)
+        if not recording_id and self.recording_service:
+            recording_id = self.recording_service.get_active_recording(bridge_id)
+        if not recording_id:
+            return
+        try:
+            result = self.ari_client.stop_recording(recording_id)
+            if result:
+                logging.info(f"✅ Grabación {recording_id} detenida antes de destruir bridge {bridge_id}")
+            else:
+                logging.debug(f"⚠️ stop_recording retornó False para {recording_id} (puede que ya haya terminado)")
+        except Exception as e:
+            logging.warning(f"⚠️ Error al detener grabación {recording_id}: {e}", exc_info=False)
+
     def _cleanup_bridge_and_channels(
         self,
         context: CallContext,
@@ -981,6 +1004,7 @@ class ManualCallHandler(BaseHandler):
                 except Exception as e:
                     logging.error(f"❌ Error al colgar PSTN leg {pstn_channel}: {e}", exc_info=True)
             if bridge_id and bridge_id.strip():
+                self._stop_active_recording(context, bridge_id)
                 try:
                     destroy_result = self.ari_client.destroy_bridge(bridge_id)
                     if destroy_result:
@@ -1029,6 +1053,7 @@ class ManualCallHandler(BaseHandler):
                     except Exception as e:
                         logging.error(f"❌ Error al colgar canal agente {agent_leg}: {e}", exc_info=True)
             if bridge_id and bridge_id.strip():
+                self._stop_active_recording(context, bridge_id)
                 try:
                     destroy_result = self.ari_client.destroy_bridge(bridge_id)
                     if destroy_result:
@@ -1106,16 +1131,7 @@ class ManualCallHandler(BaseHandler):
             # ignorado por las protecciones de transferencia; debe autorizar
             # el cierre lógico de la llamada y el posterior aborto de la
             # transferencia (incluyendo colgar el leg de B en pasos siguientes).
-            if channel_id:
-                quien_corto_preview = determine_who_hung_up(channel_id, preview_ctx)
-            else:
-                quien_corto_preview = 0
-
-            is_pstn_hangup_during_blind_transfer_ringing = bool(
-                getattr(preview_ctx, "transfer_in_progress", False)
-                and not getattr(preview_ctx, "is_transferred", False)
-                and quien_corto_preview == 2  # Cliente/PSTN
-            )
+            pstn_blind_abort = is_pstn_hangup_during_blind_transfer_ringing(preview_ctx, channel_id)
 
             # 1) Proteger hangup del agente iniciador en transferencias consultativas
             is_initiator_agent_channel_preview = bool(channel_id) and is_consult_initiator_channel(
@@ -1140,7 +1156,7 @@ class ManualCallHandler(BaseHandler):
             #     hacia mark_call_ended_atomic() para que esta llamada se cierre
             #     lógicamente y la transferencia pueda abortarse de forma segura.
             if getattr(preview_ctx, "transfer_in_progress", False):
-                if not is_pstn_hangup_during_blind_transfer_ringing:
+                if not pstn_blind_abort:
                     logging.debug(
                         "_process_call_end: Transferencia en progreso para %s (preview), "
                         "omitiendo procesamiento de final de llamada",
@@ -1172,10 +1188,9 @@ class ManualCallHandler(BaseHandler):
                 logging.debug(f"_process_call_end: Llamada {call_id} ya fue procesada por otro thread")
                 return
 
-            # mark_result is True: este thread fue el que marcó exitosamente
-            # Garantizar limpieza en Redis en finally (unregister) pase lo que pase
-            call_id_to_cleanup = call_id
-            # Ahora obtener el contexto fresco para continuar con el procesamiento
+            # mark_result is True: este thread fue el que marcó exitosamente.
+            # NO setear call_id_to_cleanup todavía: si alguna guarda post-lock aborta
+            # el flujo, no queremos que finally haga unregister (llamada aún activa).
             is_cancellation_before_pstn = False
             with self.state_store.lock(call_id):
                 fresh_context = self.state_store.get(call_id)
@@ -1217,7 +1232,7 @@ class ManualCallHandler(BaseHandler):
                     #     durante una transferencia ciega en Ringing, ya hemos marcado
                     #     la transferencia como abortada más arriba y queremos
                     #     continuar el flujo para cerrar la llamada de forma limpia.
-                    if not is_pstn_hangup_during_blind_transfer_ringing:
+                    if not pstn_blind_abort:
                         logging.debug(
                             f"_process_call_end: Transferencia en progreso para {call_id}, "
                             f"omitiendo procesamiento de final de llamada"
@@ -1230,6 +1245,15 @@ class ManualCallHandler(BaseHandler):
                             "PSTN hangup durante transferencia ciega en Ringing "
                             f"(call_id={call_id})"
                         )
+
+            # Todas las guardas pasadas: este thread es responsable de reportar y limpiar.
+            # Recién aquí es seguro habilitar el unregister en finally.
+            call_id_to_cleanup = call_id
+            with self.state_store.lock(call_id):
+                fresh_context = self.state_store.get(call_id)
+                if not fresh_context:
+                    logging.warning(f"_process_call_end: Contexto desapareció entre guardas y procesamiento para call_id={call_id}")
+                    return
 
                 # 🔍 Detección centralizada de CANCEL antes de conectar PSTN
                 # Condiciones:
@@ -1251,7 +1275,7 @@ class ManualCallHandler(BaseHandler):
             is_answered = self._is_call_answered(fresh_context)
 
             self._abort_blind_transfer_if_needed(
-                context, channel_id, is_pstn_hangup_during_blind_transfer_ringing
+                context, channel_id, pstn_blind_abort
             )
 
             # Log de depuración antes de mapear causa
@@ -1516,6 +1540,7 @@ class ManualCallHandler(BaseHandler):
                 # 2. Destruir el bridge inmediatamente (CRÍTICO: debe ejecutarse siempre)
                 # El bridge debe destruirse incluso si falló el hangup del PSTN leg
                 if bridge_id and bridge_id.strip():
+                    self._stop_active_recording(fresh_context, bridge_id)
                     try:
                         destroy_result = self.ari_client.destroy_bridge(bridge_id)
                         if destroy_result:
@@ -1582,6 +1607,7 @@ class ManualCallHandler(BaseHandler):
                                 exc_info=True
                             )
                     if bridge_id_to_cleanup.strip():
+                        self._stop_active_recording(fresh_context, bridge_id_to_cleanup)
                         try:
                             destroy_result = self.ari_client.destroy_bridge(bridge_id_to_cleanup)
                             if destroy_result:

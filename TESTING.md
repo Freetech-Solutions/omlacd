@@ -168,16 +168,63 @@ docker run --rm \
 
 ## Pipeline CI/CD
 
-El pipeline de GitLab CI ejecuta automáticamente:
+El pipeline de GitLab CI sigue el mismo patrón que el repositorio django. Por defecto solo construye la imagen Docker en ramas `develop` y `master-2.0`. Los stages de calidad y SonarQube se activan con variables de pipeline:
 
-1. **Stage: lint** - Ejecuta flake8 en todos los archivos Python
-2. **Stage: test** - Ejecuta pytest con cobertura
-3. **Stage: build** - Construye la imagen Docker (si corresponde)
+| Variable | Efecto |
+|---|---|
+| *(ninguna)* | Solo build de imagen (`container-image-dev`) |
+| `SAST=true` | Análisis SonarQube + template SAST de GitLab |
+| `FULL=true` | Flake8, pytest, SonarQube, SAST y build |
 
-Los stages de lint y test se ejecutan en:
-- Merge requests
-- Commits a cualquier rama
-- Pipelines manuales
+Stages cuando `FULL=true`:
+
+1. **test** — `test:flake8` y `test:pytest` (genera `coverage.xml` para SonarQube)
+2. **sonarqube** — `sonarqube-check` (importa cobertura desde `coverage.xml`)
+3. **build** — `container-image-dev`
+
+Para ejecutar el pipeline completo en un merge request hacia `develop` o `master-2.0`, lanzar el pipeline manualmente con `FULL=true` desde la UI de GitLab.
+
+### SonarQube
+
+Configuración en [`sonar-project.properties`](sonar-project.properties) (`projectKey=omnileads-acd`).
+
+Requisitos en GitLab CI/CD (grupo omnileads, compartidos con django):
+
+- `SONAR_HOST_URL` — URL del servidor SonarQube self-hosted (ej. `https://sonar.tudominio.com`)
+- `SONAR_TOKEN` — token de usuario con permiso **Execute Analysis** sobre el proyecto
+
+#### Crear el proyecto en SonarQube (administrador)
+
+1. SonarQube → **Create Project** → **Manually**
+2. **Project key:** `omnileads-acd` (debe coincidir exactamente con `sonar-project.properties`)
+3. **Display name:** `OMniLeads ACD`
+4. **Main branch:** `develop` (o la rama principal del repo)
+
+#### Token para CI
+
+1. SonarQube → avatar (arriba derecha) → **My Account → Security → Generate Tokens**
+2. Nombre: `gitlab-ci-acd` (o reutilizar el token global que usa django)
+3. Tipo: **Global Analysis Token** (recomendado) o **User Token** con permiso de análisis
+4. Si el token es por proyecto: en **Project Settings → Permissions**, asegurar que el usuario del token tenga **Execute Analysis** en `omnileads-acd`
+
+#### Variables en GitLab
+
+Grupo `omnileads` → **Settings → CI/CD → Variables**:
+
+| Variable | Valor |
+|---|---|
+| `SONAR_HOST_URL` | URL de tu SonarQube (no SonarCloud) |
+| `SONAR_TOKEN` | Token generado arriba |
+
+Si la variable está marcada **Protected**, solo estará disponible en ramas protegidas.
+
+#### Troubleshooting
+
+| Síntoma | Causa probable | Solución |
+|---|---|---|
+| `SONAR_TOKEN no está definido` | Variable Protected en rama no protegida | Desmarcar *Protected* o proteger la rama |
+| `Project not found` | Proyecto no creado en SonarQube | Crear `omnileads-acd` manualmente (pasos arriba) |
+| `Not authorized` | Token sin permiso en el proyecto | Global Analysis Token o permisos en Project Settings |
 
 ## Agregar Nuevos Tests
 

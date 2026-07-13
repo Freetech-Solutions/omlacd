@@ -32,6 +32,7 @@ from config import settings
 from state_helpers import (
     active_agent_channel,
     call_transfer_routing_active,
+    is_pstn_hangup_during_blind_transfer_ringing,
     locked_context_by_channel,
     is_channel_in_context,
     resolve_consult_initiator_channel,
@@ -1116,12 +1117,13 @@ class AcDRouter:
                     )
 
             if recover_blind_fail_call_id is None:
-                # Política estándar para transfer_in_progress
+                # Excepción: PSTN cuelga durante transferencia ciega en Ringing →
+                # el handler DEBE procesar este evento para abortar la pierna B y reportar el cierre.
                 if should_block_operation_for_transfer(
                     fresh_context,
                     log=self.logger,
                     operation="ChannelDestroyed",
-                ):
+                ) and not is_pstn_hangup_during_blind_transfer_ringing(fresh_context, channel_id):
                     return
 
                 # Leer tipo de llamada dentro del mismo contexto bloqueado
@@ -1200,12 +1202,14 @@ class AcDRouter:
                 )
                 call_type = None
             else:
-                # Política estándar para transfer_in_progress
+                # Excepción: PSTN cuelga durante transferencia ciega en Ringing →
+                # el handler DEBE procesar este evento para abortar la pierna B y reportar el cierre.
+                # En todos los demás casos aplica la política estándar de bloqueo.
                 if should_block_operation_for_transfer(
                     fresh_context,
                     log=self.logger,
                     operation="ChannelHangupRequest",
-                ):
+                ) and not is_pstn_hangup_during_blind_transfer_ringing(fresh_context, channel_id):
                     return
 
                 call_type = (

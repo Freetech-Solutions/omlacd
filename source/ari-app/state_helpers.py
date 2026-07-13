@@ -344,6 +344,30 @@ def is_channel_in_context(context: CallContext, channel_id: str) -> bool:
     return channel_id in channels
 
 
+def is_pstn_hangup_during_blind_transfer_ringing(context: CallContext, channel_id: Optional[str]) -> bool:
+    """
+    Detecta el escenario especial donde el PSTN cuelga mientras una transferencia ciega
+    aún está en Ringing (transfer_in_progress=True, is_transferred=False).
+
+    En ese caso el cierre lógico de la llamada DEBE procesarse aunque transfer_in_progress
+    esté activo: hay que abortar la pierna B y reportar el fin de llamada.
+
+    Retorna True solo cuando TODAS las condiciones se cumplen:
+    - transfer_in_progress == True  (transferencia iniciada)
+    - is_transferred == False       (transferencia aún no completada)
+    - el canal es la pierna PSTN del contexto
+    """
+    if not channel_id:
+        return False
+    if not getattr(context, "transfer_in_progress", False):
+        return False
+    if getattr(context, "is_transferred", False):
+        return False
+    pstn = getattr(context, "pstn_channel", None)
+    uniqueid_pstn = getattr(context, "uniqueid_pstn", None)
+    return channel_id == pstn or (bool(uniqueid_pstn) and channel_id == uniqueid_pstn)
+
+
 def should_block_operation_for_transfer(
     context: CallContext,
     log: Optional[logging.Logger] = None,

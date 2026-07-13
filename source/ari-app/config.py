@@ -143,6 +143,16 @@ class Settings(BaseSettings):
     # Redis del dialer (DB donde está OML:CALLS:{id_camp}:DIALER). El decremento lo realiza naive.py; ari-app no modifica esta clave. Si no se setea REDIS_DIALER_URL, se deriva de REDIS_URL con este DB.
     REDIS_DIALER_DB: int = Field(default=3, ge=0, le=15, description="Número de DB Redis del dialer (OML:CALLS:*:DIALER)")
     REDIS_DIALER_URL: Optional[str] = Field(default=None, description="URL Redis del dialer (opcional; si no se setea se usa REDIS_URL con REDIS_DIALER_DB)")
+    PENDING_DIAL_TTL_SEC: int = Field(
+        default=7200,
+        ge=60,
+        description="TTL en segundos de metadata pending_dial en Redis (llamadas dialer largas)",
+    )
+    DIALER_CHANNEL_AUDIT_INTERVAL_SEC: int = Field(
+        default=60,
+        ge=10,
+        description="Intervalo sugerido para auditoría de canales dialer (referencia operativa)",
+    )
 
     # Caché de agentes de campaña (loop de distribución)
     AGENTS_CACHE_TTL_SEC: int = Field(default=5, ge=1, description="TTL en segundos del caché de lista de agentes de campaña")

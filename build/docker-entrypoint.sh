@@ -45,6 +45,12 @@ VOIP_PROXY_PORT=${VOIP_PROXY_PORT:-5060}
 WEBRTC_PROXY_HOST=${WEBRTC_PROXY_HOSTNAME:-"kamailio-webrtc"}
 WEBRTC_PROXY_PORT=${WEBRTC_PROXY_PORT:-10060}
 
+# PJSIP listen binds (defaults: all interfaces; Ansible sets omni_ip_lan)
+ACD_SIP_AGENT_BIND_ADDR=${ACD_SIP_AGENT_BIND_ADDR:-0.0.0.0}
+ACD_SIP_AGENT_BIND_PORT=${ACD_SIP_AGENT_BIND_PORT:-5160}
+ACD_SIP_PUBLIC_BIND_ADDR=${ACD_SIP_PUBLIC_BIND_ADDR:-0.0.0.0}
+ACD_SIP_PUBLIC_BIND_PORT=${ACD_SIP_PUBLIC_BIND_PORT:-5070}
+
 # Scale tuning defaults
 STASIS_INITIAL_SIZE=${STASIS_INITIAL_SIZE:-10}
 STASIS_IDLE_TIMEOUT_SEC=${STASIS_IDLE_TIMEOUT_SEC:-120}
@@ -87,6 +93,28 @@ configure_ami_ari() {
   sed -i "s/aripassword/${AMI_PASSWORD}/g" /etc/asterisk/oml_ari.conf
 }
 
+ensure_tls_certs() {
+  local cert_dir="/etc/asterisk/certs"
+  local cert="${cert_dir}/cert.pem"
+  local key="${cert_dir}/key.pem"
+
+  mkdir -p "${cert_dir}"
+
+  if [[ -f "${cert}" && -f "${key}" ]]; then
+    echo "**[omlacd] Using existing TLS certs in ${cert_dir}"
+    return
+  fi
+
+  echo "**[omlacd] Generating ephemeral self-signed TLS certs (dev fallback; mount real certs in prod)"
+  openssl req -x509 -newkey rsa:4096 \
+    -keyout "${key}" \
+    -out "${cert}" \
+    -days 3650 -nodes -subj "/CN=acd-dev.local"
+  chown omnileads:omnileads "${cert}" "${key}"
+  chmod 640 "${key}"
+  chmod 644 "${cert}"
+}
+
 configure_homer() {
   if ! is_true "${HOMER_ENABLE}"; then
     return
@@ -125,9 +153,21 @@ configure_rtp_ports() {
   sed -i -E "s/^(rtpend=).*/\1${RTP_PORT_MAX}/" /etc/asterisk/rtp.conf
 }
 
+configure_pjsip_bind_addresses() {
+  local public_tls_port=$((ACD_SIP_PUBLIC_BIND_PORT + 1))
+
+  echo "**[omlacd] Configuring PJSIP agent bind ${ACD_SIP_AGENT_BIND_ADDR}:${ACD_SIP_AGENT_BIND_PORT}"
+  echo "**[omlacd] Configuring PJSIP public/trunk bind ${ACD_SIP_PUBLIC_BIND_ADDR}:${ACD_SIP_PUBLIC_BIND_PORT} (TLS ${public_tls_port})"
+
+  sed -i -E "/^\[agent-transport\]/,/^\[/ s/^(bind=)[^:]+:[0-9]+/\1${ACD_SIP_AGENT_BIND_ADDR}:${ACD_SIP_AGENT_BIND_PORT}/" /etc/asterisk/oml_pjsip.conf
+  sed -i -E "/^\[trunk-transport\]/,/^\[/ s/^(bind=)[^:]+:[0-9]+/\1${ACD_SIP_PUBLIC_BIND_ADDR}:${ACD_SIP_PUBLIC_BIND_PORT}/" /etc/asterisk/oml_pjsip.conf
+  sed -i -E "/^\[trunk-transport-tcp\]/,/^\[/ s/^(bind=)[^:]+:[0-9]+/\1${ACD_SIP_PUBLIC_BIND_ADDR}:${ACD_SIP_PUBLIC_BIND_PORT}/" /etc/asterisk/oml_pjsip.conf
+  sed -i -E "/^\[trunk-transport-tls\]/,/^\[/ s/^(bind=)[^:]+:[0-9]+/\1${ACD_SIP_PUBLIC_BIND_ADDR}:${public_tls_port}/" /etc/asterisk/oml_pjsip.conf
+}
+
 configure_outbound_proxy() {
   echo "**[omlacd] Configuring outbound proxy"
-  echo "outbound_proxy=sip:${VOIP_PROXY_HOST}:${VOIP_PROXY_PORT};lr" >> /etc/asterisk/oml_pjsip_wizard.conf
+  echo "outbound_proxy=sip:${VOIP_PROXY_HOST}:${VOIP_PROXY_PORT}\;lr" >> /etc/asterisk/oml_pjsip_wizard.conf
   echo "identify/match=${VOIP_PROXY_HOST}" >> /etc/asterisk/oml_pjsip_wizard.conf
 }
 
@@ -191,9 +231,11 @@ main() {
     # Configuración completa antes de levantar Asterisk
     configure_timezone
     configure_ami_ari
+    ensure_tls_certs
     # configure_homer
     configure_scale
     configure_rtp_ports
+    configure_pjsip_bind_addresses
     configure_outbound_proxy
     configure_webrtc_proxy
 

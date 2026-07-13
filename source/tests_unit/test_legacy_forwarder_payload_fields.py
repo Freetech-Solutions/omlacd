@@ -112,6 +112,25 @@ def test_handle_channel_destroyed_includes_callid_from_metadata():
     assert payload["callid"] == "1739372776.2"
 
 
+def test_submit_dial_originate_failed_includes_business_fields():
+    forwarder = LegacyEventForwarder()
+    forwarder.client = MagicMock()
+
+    forwarder.submit_dial_originate_failed(
+        campaign_id=74, contact_id=10, number="1155667788", callid="1739372776.10",
+    )
+
+    assert forwarder.client.submit_job.call_count == 1
+    payload = _decode_payload(forwarder.client.submit_job.call_args_list[0])
+    assert payload["type"] == "Dial"
+    assert payload["call_type"] == "to_pstn"
+    assert payload["dialstatus"] == "ORIGINATE_FAILED"
+    assert payload["id_campaign"] == "74"
+    assert payload["contact_id"] == "10"
+    assert payload["phone_number"] == "1155667788"
+    assert payload["callid"] == "1739372776.10"
+
+
 def test_handle_dial_event_uses_pending_metadata_for_business_fields():
     pending_store = PendingDialMetadataStore()
     pending_store.register(

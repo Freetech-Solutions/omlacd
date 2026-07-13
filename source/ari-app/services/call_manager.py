@@ -442,7 +442,8 @@ class CallActionService:
         # Construir endpoint PSTN
         endpoint = f'{ProtocolPrefix.PJSIP.value}{number}@{pstn_gateway}'
         
-        # CallerId para PSTN: OML:TRUNK:{id_trunk}:CALLERID vía campaña; fallback a tel_customer/number.
+        # CallerId para PSTN: OUTCID de la campaña (fallback CALLERID de la troncal);
+        # si no hay ninguno, fallback a tel_customer/number.
         id_camp = metadata.get('id_camp', '')
         tel_customer = metadata.get('tel_customer', number)
         if self.route_validator and id_camp:

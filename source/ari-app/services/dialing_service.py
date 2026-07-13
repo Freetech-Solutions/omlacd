@@ -62,6 +62,34 @@ class DialingService:
         self.reporter = reporter
         self.logger = logging.getLogger(__name__)
 
+    def _notify_originate_failed(
+        self,
+        campaign_id: Any,
+        contact_id: Any,
+        number: str,
+        *,
+        callid: Optional[str] = None,
+        reason: str = "",
+    ) -> None:
+        """Compensa reserva dialer cuando originate PSTN falló sin crear canal."""
+        if not number or campaign_id is None or contact_id is None:
+            self.logger.warning(
+                "Originate failed without compensation fields: camp=%s contact=%s reason=%s",
+                campaign_id, contact_id, reason,
+            )
+            return
+        if int(campaign_id or 0) == 0:
+            return
+        if self.legacy_forwarder:
+            self.legacy_forwarder.submit_dial_originate_failed(
+                campaign_id, contact_id, number, callid=callid,
+            )
+        else:
+            self.logger.warning(
+                "Originate failed without legacy_forwarder: camp=%s contact=%s number=%s reason=%s",
+                campaign_id, contact_id, number, reason,
+            )
+
     def dial_to_agent(self, data: Dict[str, Any]) -> Optional[str]:
         """
         Marca manual hacia un agente (click-to-call).
@@ -281,6 +309,9 @@ class DialingService:
         if campaign_id and int(campaign_id) > 0:
             if not self.route_validator:
                 self.logger.error("RouteValidator not available for route validation")
+                self._notify_originate_failed(
+                    campaign_id, contact_id, number, reason="route_validator_unavailable",
+                )
                 return None
             valid, prepend, effective_route_id = self.route_validator.validate_route(number, campaign_id)
             if not valid:
@@ -384,12 +415,20 @@ class DialingService:
                     "Progressive dial: failed to originate to PSTN %s",
                     number_to_dial,
                 )
+                self._notify_originate_failed(
+                    campaign_id, contact_id, number,
+                    callid=uniqueid, reason="originate_failed",
+                )
             return pstn_channel_id
         except Exception as e:
             self.logger.error(
                 "Error originating to PSTN (progressive): %s",
                 e,
                 exc_info=True,
+            )
+            self._notify_originate_failed(
+                campaign_id, contact_id, number,
+                callid=uniqueid, reason="originate_exception",
             )
             return None
 

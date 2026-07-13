@@ -29,6 +29,7 @@ from services.pstn_reported_store import PstnReportedStore
 from handlers.recording import RecordingEventHandler
 from services.route_validator import RouteValidator
 from services.dialing_service import DialingService
+from services.audit_dialer_channels import DialerChannelAuditService
 from services.campaign_config import get_campaign_config_with_defaults
 from queue_events import QueueEventManager
 from sip_refer_listener import VerloopReferHandler
@@ -116,8 +117,11 @@ class ACDContainer(containers.DeclarativeContainer):
         redis_client=redis_client_base  # Usar cliente base para servicios internos
     )
 
-    # Pending Dial Metadata (para LegacyEventForwarder: eventos Dial por originate)
-    pending_dial_store = providers.Singleton(PendingDialMetadataStore)
+    # Pending Dial Metadata (Redis compartido multi-nodo; eventos Dial por originate)
+    pending_dial_store = providers.Singleton(
+        PendingDialMetadataStore,
+        redis_client=redis_client_base,
+    )
 
     # PSTN reported store (canales PSTN cuyo evento final ya fue enviado por on_pstn_stasis_end)
     pstn_reported_store = providers.Singleton(PstnReportedStore)
@@ -220,6 +224,7 @@ class ACDContainer(containers.DeclarativeContainer):
         redis_client=redis_client_base,  # Usar cliente base para handlers
         agent_status_service=agent_status_service,
         route_validator=route_validator,
+        recording_service=recording_service,
     )
 
     def _make_get_campaign_config(redis_client):
@@ -268,6 +273,7 @@ class ACDContainer(containers.DeclarativeContainer):
         route_validator=route_validator,
         legacy_forwarder=legacy_forwarder,
         pstn_reported_store=pstn_reported_store,
+        recording_service=recording_service,
     )
 
     recording_handler = providers.Singleton(
@@ -329,9 +335,16 @@ class ACDContainer(containers.DeclarativeContainer):
         redis_url=config.REDIS_URL,
     )
 
+    channel_audit_service = providers.Singleton(
+        DialerChannelAuditService,
+        ari_client=ari_client_base,
+        acd_app=config.ARI_APP,
+    )
+
     gearman_listener = providers.Factory(
         GearmanListener,
         dialing_service=dialing_service,
+        channel_audit_service=channel_audit_service,
     )
 
     def shutdown_resources(self):

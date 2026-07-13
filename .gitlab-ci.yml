@@ -1,83 +1,175 @@
-stages:
-  - lint
-  - test
-  - build
+include:
+  - template: Security/SAST.gitlab-ci.yml
+    rules:
+      - if: '$FULL == "true"'
+  - project: 'omnileads/devsecops'
+    ref: 'main'
+    file:
+      - 'templates/security-scans.yml'
+      - 'templates/gitleaks.yml'
+      - 'templates/owasp-dependency-check.yml'
 
 variables:
-  PYTHON_VERSION: "3.11"
+  IMAGE_NAME: "acd"
+  # Valores válidos: omnileads | freetechsolutions. Vacío = según rama (master-2.0 → omnileads).
+  DOCKER_ORG: ""
+  FULL: ""
+  BUILD: ""
+  DOCKER_HOST: tcp://docker:2375
+  DOCKER_TLS_CERTDIR: ""
+  DOCKER_DRIVER: overlay2
+  TRIVY_SEVERITY: "CRITICAL"
+  # DefectDojo: nombre del Product (Asset) en DefectDojo.
+  # Para la estrategia "1 Repo = 1 Producto", mantén vacía la variable DEFECTDOJO_ENGAGEMENT_ID en GitLab
+  # y este script creará/resolverá el producto y el engagement "Continuous Security" automáticamente.
+  DEFECTDOJO_PRODUCT_NAME: "OMniACD"
+  OWASP_PROJECT_NAME: "OMniACD"
+  # DefectDojo con certificado interno/auto-firmado (override en CI/CD si usan CA pública).
+  DEFECTDOJO_INSECURE: "true"
+  # Sin variables → sonarqube, build, security_scan y security_report.
+  # BUILD=true → solo build (container-image-dev).
+  # FULL=true → pipeline completo: SAST, gitleaks, sonarqube, build y escaneos de seguridad.
 
-.quality-rules: &quality-rules
+stages:
+  - security
+  - test
+  - sonarqube
+  - build
+  - security_scan
+  - security_report
+
+.sonar-rules: &sonar-rules
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "develop"'
+    - if: '$FULL == "true" && $CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "develop" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "master-2.0")'
+    - if: '$FULL == "true" && $CI_PIPELINE_SOURCE == "web"'
+    - if: '$FULL != "true" && $BUILD != "true" && $CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "develop" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "master-2.0")'
+    - if: '$FULL != "true" && $BUILD != "true" && $CI_PIPELINE_SOURCE == "web"'
+    - if: '$FULL != "true" && $BUILD != "true" && ($CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "master-2.0")'
 
-lint:flake8:
-  image: python:${PYTHON_VERSION}-slim
-  stage: lint
-  before_script:
-    - pip install --no-cache-dir --upgrade pip
-    - pip install --no-cache-dir flake8
-  script:
-    - echo "Ejecutando flake8 en el código Python..."
-    - flake8 source/ari-app/ --config=.flake8 --statistics --count
-  <<: *quality-rules
-  allow_failure: false
+.build-rules: &build-rules
+  rules:
+    - if: '$BUILD == "true" && $FULL != "true"'
+    - if: '$FULL == "true" && $CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "develop" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "master-2.0")'
+    - if: '$FULL == "true" && $CI_PIPELINE_SOURCE == "web"'
+    - if: '$FULL == "true" && ($CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "master-2.0")'
+    - if: '$FULL != "true" && $BUILD != "true" && $CI_PIPELINE_SOURCE == "web"'
+    - if: '$FULL != "true" && $BUILD != "true" && $CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$FULL != "true" && $BUILD != "true" && ($CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "master-2.0")'
 
-test:pytest:
-  image: python:${PYTHON_VERSION}-slim
-  stage: test
-  before_script:
-    - apt-get update
-    - apt-get install -y --no-install-recommends git
-    - rm -rf /var/lib/apt/lists/*
-    - pip install --no-cache-dir --upgrade pip
-    - pip install --no-cache-dir -r build/requirements.txt
-  script:
-    - echo "Ejecutando tests unitarios..."
-    - export PYTHONPATH="${CI_PROJECT_DIR}/source/ari-app:${PYTHONPATH}"
-    - pytest --junitxml=report.xml
-  coverage: '/TOTAL.*\s+(\d+%)$/'
-  artifacts:
-    when: always
-    reports:
-      junit: report.xml
-      coverage_report:
-        coverage_format: cobertura
-        path: coverage.xml
+# Las reglas de Trivy se heredan por defecto de la plantilla central
+
+.gitleaks-rules: &gitleaks-rules
+  rules:
+    - if: '$BUILD == "true" && $FULL != "true"'
+      when: never
+    - if: '$FULL == "true" && $CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "develop" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "master-2.0")'
+    - if: '$FULL == "true" && $CI_PIPELINE_SOURCE == "web"'
+    - if: '$FULL == "true" && ($CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "master-2.0")'
+    - if: '$FULL != "true" && $BUILD != "true" && $CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "develop" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "master-2.0" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^master-.*$/)'
+    - if: '$FULL != "true" && $BUILD != "true" && ($CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "master-2.0" || $CI_COMMIT_BRANCH =~ /^master-.*$/)'
+
+.owasp-rules: &owasp-rules
+  rules:
+    - if: '$BUILD == "true" && $FULL != "true"'
+      when: never
+    - if: '$FULL == "true" && $CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "develop" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "master-2.0")'
+    - if: '$FULL == "true" && $CI_PIPELINE_SOURCE == "web"'
+    - if: '$FULL == "true" && ($CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "master-2.0")'
+    - if: '$FULL != "true" && $BUILD != "true" && $CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "develop" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "master-2.0" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^master-.*$/)'
+    - if: '$FULL != "true" && $BUILD != "true" && ($CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "master-2.0" || $CI_COMMIT_BRANCH =~ /^master-.*$/)'
+
+sonarqube-check:
+  stage: sonarqube
+  image:
+    name: sonarsource/sonar-scanner-cli:latest
+    entrypoint: [""]
+  variables:
+    SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"
+    GIT_DEPTH: "0"
+  cache:
+    key: "${CI_COMMIT_REF_SLUG}"
     paths:
-      - coverage.xml
-      - report.xml
-    expire_in: 1 week
-  <<: *quality-rules
-  allow_failure: false
+      - .sonar/cache
+  script:
+    - sonar-scanner
+  allow_failure: true
+  <<: *sonar-rules
 
-container-image-dev:
+.build_template:
+  image: docker:20.10.15-alpine3.15
   services:
     - docker:20.10.15-dind-alpine3.15
-  image: docker:20.10.15-alpine3.15
-  stage: build
   before_script:
     - apk add --no-cache docker-cli-buildx
   script:
-    - >-
-      docker buildx build
-      --file=Dockerfile
-      --tag=run
-      --target=run
-      .
+    - echo "Building ${IMAGE_NAME}..."
+    - ls -l ${DOCKERFILE_PATH}
+    - docker buildx build --file=${DOCKERFILE_PATH} --tag=${IMAGE_NAME} --target=run --load ${BUILD_CONTEXT}
+    - docker save ${IMAGE_NAME} -o ${CI_PROJECT_DIR}/${IMAGE_NAME}.tar
     - |-
-      if [ "${CI_COMMIT_BRANCH}" == "master-2.0" ]; then
-        echo "${DOCKER_SECRET}" | docker login --username "${DOCKER_USERNAME}" --password-stdin
-        IMAGE_VERSION="$(date +%Y%m%d)-${CI_COMMIT_SHORT_SHA}"
-        docker tag run omnileads/acd:$IMAGE_VERSION
-        docker push docker.io/omnileads/acd:$IMAGE_VERSION
+      if [ "$CI_PIPELINE_SOURCE" = "merge_request_event" ]; then
+        echo "Pipeline de Merge Request: omitiendo login y push a Docker Hub."
+      elif [ -z "${DOCKER_PASSWORD:-}" ] && [ -z "${DOCKER_SECRET:-}" ]; then
+        echo "Credenciales de Docker no configuradas: omitiendo login y push."
       else
-        echo "${DOCKER_PASSWORD}" | docker login --username "${DOCKER_USER}" --password-stdin
-        IMAGE_VERSION="$(date +%Y%m%d)-${CI_COMMIT_SHORT_SHA}"
-        docker tag run freetechsolutions/acd:$IMAGE_VERSION
-        docker push docker.io/freetechsolutions/acd:$IMAGE_VERSION
-      fi  
-  rules:
-    - if: '$CI_COMMIT_REF_NAME =~ /build/'
-    - if: '$CI_PIPELINE_SOURCE == "web"'
-    - if: '$CI_PIPELINE_BUILD == "true"'
-    - if: '$CI_PIPELINE_BUILD_ACD == "true"'
+        if [ -z "${IMAGE_VERSION}" ]; then
+          IMAGE_VERSION="$(date +%Y%m%d)-${CI_COMMIT_SHORT_SHA}"
+        fi
+
+        echo "Pushing image ${IMAGE_NAME}..."
+
+        if [ -n "${DOCKER_ORG}" ]; then
+          if [[ "${DOCKER_ORG}" != "omnileads" && "${DOCKER_ORG}" != "freetechsolutions" ]]; then
+            echo "Error: DOCKER_ORG debe ser 'omnileads' o 'freetechsolutions'."
+            exit 1
+          fi
+          PUSH_ORG="${DOCKER_ORG}"
+        elif [[ "${CI_COMMIT_BRANCH}" == "master-2.0" ]]; then
+          PUSH_ORG="omnileads"
+        else
+          PUSH_ORG="freetechsolutions"
+        fi
+
+        if [[ "${PUSH_ORG}" == "omnileads" ]]; then
+          if [ -z "${DOCKER_SECRET:-}" ] || [ -z "${DOCKER_USERNAME:-}" ]; then
+            echo "Faltan credenciales para org omnileads: omitiendo push."
+          else
+            echo "${DOCKER_SECRET}" | docker login --username "${DOCKER_USERNAME}" --password-stdin
+            docker tag ${IMAGE_NAME} docker.io/${PUSH_ORG}/${IMAGE_NAME}:$IMAGE_VERSION
+            docker push docker.io/${PUSH_ORG}/${IMAGE_NAME}:$IMAGE_VERSION
+          fi
+        else
+          if [ -z "${DOCKER_PASSWORD:-}" ] || [ -z "${DOCKER_USER:-}" ]; then
+            echo "Faltan credenciales para org freetechsolutions: omitiendo push."
+          else
+            echo "${DOCKER_PASSWORD}" | docker login --username "${DOCKER_USER}" --password-stdin
+            docker tag ${IMAGE_NAME} docker.io/${PUSH_ORG}/${IMAGE_NAME}:$IMAGE_VERSION
+            docker push docker.io/${PUSH_ORG}/${IMAGE_NAME}:$IMAGE_VERSION
+          fi
+        fi
+      fi
+  <<: *build-rules
+
+container-image-dev:
+  extends: .build_template
+  stage: build
+  variables:
+    IMAGE_NAME: acd
+    DOCKERFILE_PATH: Dockerfile
+    BUILD_CONTEXT: .
+  artifacts:
+    paths:
+      - acd.tar
+    expire_in: 90 days
+
+# Los jobs trivy_scan, defectdojo_upload y owasp_defectdojo_upload se heredan de devsecops.
+
+# GitLab no expande ${GITLEAKS_STAGE} del template incluido en el campo stage.
+gitleaks_scan:
+  stage: security
+  <<: *gitleaks-rules
+
+# GitLab no expande ${OWASP_SCAN_STAGE} del template incluido en el campo stage.
+owasp_dependency_scan:
+  stage: security
+  <<: *owasp-rules

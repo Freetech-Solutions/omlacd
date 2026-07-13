@@ -15,6 +15,7 @@ from typing import Optional
 from config import settings
 from log_config import set_log_call_id, reset_log_call_id
 from services.dialing_service import DialingService
+from services.audit_dialer_channels import DialerChannelAuditService
 
 logger = logging.getLogger(__name__)
 
@@ -32,15 +33,17 @@ class GearmanListener(threading.Thread):
     y delega a DialingService (dial_to_pstn, dial_to_agent, dial_predictive).
     """
     
-    def __init__(self, dialing_service: DialingService):
+    def __init__(self, dialing_service: DialingService, channel_audit_service: Optional[DialerChannelAuditService] = None):
         """
         Inicializa el listener de Gearman.
         
         Args:
             dialing_service: Servicio de orquestación de marcado para originar llamadas
+            channel_audit_service: Servicio de auditoría de canales dialer (ARI)
         """
         super().__init__(name="GearmanListener", daemon=True)
         self.dialing_service = dialing_service
+        self.channel_audit_service = channel_audit_service
         self.running = True
         self.gm_worker: Optional[gearman.GearmanWorker] = None
         self.retry_delay = INITIAL_RETRY_DELAY
@@ -52,6 +55,10 @@ class GearmanListener(threading.Thread):
             self.gm_worker.register_task(
                 settings.GEARMAN_TASK_NAME.encode('utf-8'),
                 self._execute_task
+            )
+            self.gm_worker.register_task(
+                b'audit-dialer-channels',
+                self._execute_audit_task,
             )
             logger.info(
                 f"✅ GearmanListener inicializado con servidores: {settings.GEARMAN_SERVERS}, "
@@ -116,6 +123,10 @@ class GearmanListener(threading.Thread):
                         self.gm_worker.register_task(
                             settings.GEARMAN_TASK_NAME.encode('utf-8'),
                             self._execute_task
+                        )
+                        self.gm_worker.register_task(
+                            b'audit-dialer-channels',
+                            self._execute_audit_task,
                         )
                         # Resetear delay después de reconexión exitosa
                         self.retry_delay = INITIAL_RETRY_DELAY
@@ -207,6 +218,17 @@ class GearmanListener(threading.Thread):
         except Exception as e:
             logger.error(f"❌ Error procesando tarea Gearman: {e}", exc_info=True)
             return b"ERROR"
+    
+    def _execute_audit_task(self, worker, job):
+        """Retorna JSON {camp_id: count} de canales dialer PSTN activos en Asterisk."""
+        try:
+            if not self.channel_audit_service:
+                logger.warning("audit-dialer-channels: channel_audit_service not configured")
+                return b'{}'
+            return self.channel_audit_service.audit_json_bytes()
+        except Exception as e:
+            logger.error("Error in audit-dialer-channels: %s", e, exc_info=True)
+            return b'{}'
     
     def stop(self):
         """
