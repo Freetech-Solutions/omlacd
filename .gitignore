@@ -20,3 +20,5 @@ source/astconf/oml_moh.conf
 source/astconf/oml_sip_registrations.conf
 source/astconf/oml_sip_trunks.conf
 source/astconf/websockets.log
+
+CLAUDE.md
