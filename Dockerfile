@@ -5,12 +5,15 @@ ENV NOTVISIBLE="in users profile"
 
 COPY build/requirements.txt /
 
-# sngrep: debug SIP. No instalar git (arrastra Perl y CVEs sin fix en Debian).
+# sngrep: debug SIP. git solo para pip VCS (gearman3); se purga al final
+# para no dejar Perl/CVEs de git en la imagen runtime.
 RUN apt update && apt install -y --no-install-recommends \
     sngrep \
+    git \
     && pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r /requirements.txt \
     && pip install --no-cache-dir --upgrade 'wheel>=0.46.2' 'jaraco.context>=6.1.0' \
+    && apt-get purge -y --auto-remove git \
     && apt autoremove -y && apt clean -y && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
 ENV PYTHONPATH=/opt/asterisk/ari-app
