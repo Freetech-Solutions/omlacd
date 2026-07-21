@@ -8,6 +8,7 @@ include:
       - 'templates/security-scans.yml'
       - 'templates/gitleaks.yml'
       - 'templates/owasp-dependency-check.yml'
+      - 'templates/sonarqube.yml'
 
 variables:
   IMAGE_NAME: "acd"
@@ -15,6 +16,8 @@ variables:
   DOCKER_ORG: ""
   FULL: ""
   BUILD: ""
+  # SKIP_OWASP=true → omite owasp_dependency_scan y owasp_defectdojo_upload (útil con FULL=true).
+  SKIP_OWASP: ""
   DOCKER_HOST: tcp://docker:2375
   DOCKER_TLS_CERTDIR: ""
   DOCKER_DRIVER: overlay2
@@ -26,9 +29,10 @@ variables:
   OWASP_PROJECT_NAME: "OMniACD"
   # DefectDojo con certificado interno/auto-firmado (override en CI/CD si usan CA pública).
   DEFECTDOJO_INSECURE: "true"
-  # Sin variables → sonarqube, build, security_scan y security_report.
+  # Sin variables → sonarqube, build, security_scan y security_report (+ gitleaks/owasp en security).
   # BUILD=true → solo build (container-image-dev).
-  # FULL=true → pipeline completo: SAST, gitleaks, sonarqube, build y escaneos de seguridad.
+  # FULL=true → pipeline completo: SAST, gitleaks, owasp, sonarqube, build y escaneos de seguridad.
+  # FULL=true + SKIP_OWASP=true → igual que FULL, sin OWASP.
 
 stages:
   - security
@@ -70,6 +74,8 @@ stages:
 
 .owasp-rules: &owasp-rules
   rules:
+    - if: '$SKIP_OWASP == "true"'
+      when: never
     - if: '$BUILD == "true" && $FULL != "true"'
       when: never
     - if: '$FULL == "true" && $CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "develop" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "master-2.0")'
@@ -78,21 +84,12 @@ stages:
     - if: '$FULL != "true" && $BUILD != "true" && $CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "develop" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "master-2.0" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^master-.*$/)'
     - if: '$FULL != "true" && $BUILD != "true" && ($CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "master-2.0" || $CI_COMMIT_BRANCH =~ /^master-.*$/)'
 
-sonarqube-check:
+# Job SonarQube centralizado en omnileads/devsecops (templates/sonarqube.yml).
+sonarqube_scan:
   stage: sonarqube
-  image:
-    name: sonarsource/sonar-scanner-cli:latest
-    entrypoint: [""]
-  variables:
-    SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"
-    GIT_DEPTH: "0"
-  cache:
-    key: "${CI_COMMIT_REF_SLUG}"
-    paths:
-      - .sonar/cache
-  script:
-    - sonar-scanner
-  allow_failure: true
+  <<: *sonar-rules
+
+sonarqube_defectdojo_upload:
   <<: *sonar-rules
 
 .build_template:
@@ -162,7 +159,7 @@ container-image-dev:
       - acd.tar
     expire_in: 90 days
 
-# Los jobs trivy_scan, defectdojo_upload y owasp_defectdojo_upload se heredan de devsecops.
+# Los jobs trivy_scan, defectdojo_upload, owasp_defectdojo_upload y sonarqube_defectdojo_upload se heredan de devsecops.
 
 # GitLab no expande ${GITLEAKS_STAGE} del template incluido en el campo stage.
 gitleaks_scan:
@@ -172,4 +169,7 @@ gitleaks_scan:
 # GitLab no expande ${OWASP_SCAN_STAGE} del template incluido en el campo stage.
 owasp_dependency_scan:
   stage: security
+  <<: *owasp-rules
+
+owasp_defectdojo_upload:
   <<: *owasp-rules
