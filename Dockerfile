@@ -1,4 +1,4 @@
-FROM --platform=linux/arm64 docker.io/freetechsolutions/asterisk:20260707-91edd45e AS run
+FROM --platform=linux/arm64 docker.io/freetechsolutions/asterisk:20260803-49ced01b AS run
 
 ENV LANG=en_US.utf8
 ENV NOTVISIBLE="in users profile"

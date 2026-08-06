@@ -6,7 +6,7 @@ from datetime import datetime
 from typing import Dict, Any, List, Optional, TYPE_CHECKING
 
 from config import settings
-from constants import CallType, ChannelType
+from constants import CallType, ChannelType, HangupCause
 from utils import parse_ari_args
 
 if TYPE_CHECKING:
@@ -26,10 +26,15 @@ class LegacyEventForwarder:
       y campos explícitos de negocio (id_campaign/contact_id/phone_number).
     """
 
-    def __init__(self, pending_dial_store: Optional["PendingDialMetadataStore"] = None):
+    def __init__(
+        self,
+        pending_dial_store: Optional["PendingDialMetadataStore"] = None,
+        reporter: Optional[Any] = None,
+    ):
         self.logger = logging.getLogger(__name__)
         self.client = None
         self.pending_dial_store = pending_dial_store
+        self.reporter = reporter
         self._connect()
 
     def _connect(self):
@@ -145,6 +150,9 @@ class LegacyEventForwarder:
         """
         Envía a process-event (Gearman) eventos DIAL con call_type=2 (DIALER)
         y channel_type to_pstn o to_agent, añadiendo al payload el campo call_type.
+
+        Dial NOANSWER/CANCEL en pierna to_pstn no se reenvían: el conteo COUNTER
+        lo define el HangupCause final en ChannelDestroyed (evita doble hincrby).
         """
         if event.get("type") != "Dial":
             return
@@ -161,6 +169,21 @@ class LegacyEventForwarder:
 
         channel_type = args.get("channel_type")
         if channel_type not in (ChannelType.TO_PSTN.value, ChannelType.TO_AGENT.value, "to_pstn", "to_agent"):
+            return
+
+        # Mantener metadata viva aunque se omita el forward (ChannelDestroyed la usa).
+        peer = event.get("peer") or {}
+        peer_id = peer.get("id") if isinstance(peer, dict) else getattr(peer, "id", None)
+        if peer_id and self.pending_dial_store:
+            self.pending_dial_store.refresh(str(peer_id))
+
+        dialstatus = event.get("dialstatus")
+        is_pstn = channel_type in (ChannelType.TO_PSTN.value, "to_pstn")
+        if is_pstn and dialstatus in ("NOANSWER", "CANCEL"):
+            self.logger.debug(
+                "Skip Dial %s to_pstn (COUNTER from ChannelDestroyed HangupCause)",
+                dialstatus,
+            )
             return
 
         if not self.client:
@@ -188,11 +211,6 @@ class LegacyEventForwarder:
             }
             event_json = json.dumps(event_with_call_type)
             payload = bytes(event_json, encoding="utf8")
-
-            peer = event.get("peer") or {}
-            peer_id = peer.get("id") if isinstance(peer, dict) else getattr(peer, "id", None)
-            if peer_id and self.pending_dial_store:
-                self.pending_dial_store.refresh(str(peer_id))
 
             self._submit_process_event(
                 payload,
@@ -442,26 +460,27 @@ class LegacyEventForwarder:
             self.logger.error("Error forwarding RouteValidationFailed: %s", e)
             self.client = None
 
-    def submit_dial_cancel(
-        self, campaign_id: Any, contact_id: Any, number: str, callid: Optional[str] = None
+    def _submit_dial_status(
+        self,
+        dialstatus: str,
+        campaign_id: Any,
+        contact_id: Any,
+        number: str,
+        callid: Optional[str] = None,
     ) -> None:
-        """
-        Envía a process-event un evento Dial con dialstatus=CANCEL para que el dialer
-        trate la cancelación (canal PSTN destruido antes de contestar) como fallo de
-        marcado (set_contact_status, decrement, send-reports). Usado en lugar de
-        ChannelDestroyed cuando la llamada se clasifica como CANCEL.
-        """
+        """Envía a process-event un Dial con el dialstatus indicado (to_pstn)."""
+        context = f"submit_dial_{dialstatus.lower()}"
         payload_dict = self._attach_business_fields(
             {
                 "type": "Dial",
                 "call_type": "to_pstn",
-                "dialstatus": "CANCEL",
+                "dialstatus": dialstatus,
                 "callid": callid or "",
             },
             campaign_id=campaign_id,
             contact_id=contact_id,
             phone_number=number,
-            context="submit_dial_cancel",
+            context=context,
         )
         if not payload_dict:
             return
@@ -473,28 +492,117 @@ class LegacyEventForwarder:
         payload_bytes = bytes(event_json, encoding="utf8")
         self._submit_process_event(
             payload_bytes,
-            context="submit_dial_cancel",
+            context=context,
             summary={"campaign_id": campaign_id, "contact_id": contact_id},
         )
         self.logger.debug(
-            "Forwarded Dial CANCEL to Gearman: campaign_id=%s contact_id=%s",
+            "Forwarded Dial %s to Gearman: campaign_id=%s contact_id=%s",
+            dialstatus,
             campaign_id,
             contact_id,
         )
 
-    def submit_dial_originate_failed(
+    def submit_dial_cancel(
         self, campaign_id: Any, contact_id: Any, number: str, callid: Optional[str] = None
+    ) -> None:
+        """
+        Envía a process-event un evento Dial con dialstatus=CANCEL para que el dialer
+        trate la cancelación (canal PSTN destruido antes de contestar) como fallo de
+        marcado (set_contact_status, decrement, send-reports). Usado en lugar de
+        ChannelDestroyed cuando la llamada se clasifica como CANCEL.
+        """
+        self._submit_dial_status("CANCEL", campaign_id, contact_id, number, callid=callid)
+
+    def submit_dial_invalid_number(
+        self, campaign_id: Any, contact_id: Any, number: str, callid: Optional[str] = None
+    ) -> None:
+        """
+        Envía a process-event un Dial INVALID_NUMBER (p. ej. número no ruteable).
+        Usado cuando se requiere ese dialstatus explícito; los SIP 404 van por
+        submit_dial_not_found. El dialer trata INVALID_NUMBER como fallo sin
+        reglas de incidencia.
+        """
+        self._submit_dial_status(
+            "INVALID_NUMBER", campaign_id, contact_id, number, callid=callid
+        )
+
+    def submit_dial_not_found(
+        self, campaign_id: Any, contact_id: Any, number: str, callid: Optional[str] = None
+    ) -> None:
+        """
+        Envía a process-event un Dial 404_NOT_FOUND (SIP 404 / cause 1).
+        El dialer lo contabiliza con dialstatus propio (sin rules de incidencia)
+        y libera OML:CALLS vía CALLS_DECR_DIAL_STATUSES.
+        """
+        self._submit_dial_status(
+            "404_NOT_FOUND", campaign_id, contact_id, number, callid=callid
+        )
+
+    def submit_dial_chanunavail(
+        self, campaign_id: Any, contact_id: Any, number: str, callid: Optional[str] = None
+    ) -> None:
+        """
+        Envía a process-event un Dial CHANUNAVAIL (p. ej. SIP 603 Decline /
+        log 603_DECLINED, SIP 403 Forbidden / log 403_FORBIDDEN,
+        SIP 405 Method Not Allowed / log 405_NOT_ALLOWED,
+        SIP 406 Not Acceptable / log 406_NO_ACCEPTABLE,
+        SIP 408 Request Timeout / log 408_REQUEST_TIMEOUT,
+        SIP 488 Not Acceptable Here / log 488_NOT_ACCEPTABLE_HERE, o
+        SIP 608 Rejected / log 608_REJECTED).
+        El dialer trata CHANUNAVAIL como fallo sin reglas de incidencia y libera OML:CALLS
+        cuando está en CALLS_DECR_DIAL_STATUSES.
+        """
+        self._submit_dial_status(
+            "CHANUNAVAIL", campaign_id, contact_id, number, callid=callid
+        )
+
+    def submit_dial_noanswer(
+        self, campaign_id: Any, contact_id: Any, number: str, callid: Optional[str] = None
+    ) -> None:
+        """
+        Envía a process-event un Dial NOANSWER (p. ej. SIP 487 Request Terminated /
+        log 487_REQUEST_TERMINATED). El dialer lo contabiliza como NOANSWER y puede
+        aplicar reglas de incidencia para rellamar.
+        """
+        self._submit_dial_status(
+            "NOANSWER", campaign_id, contact_id, number, callid=callid
+        )
+
+    def submit_dial_temporarily_unavailable(
+        self, campaign_id: Any, contact_id: Any, number: str, callid: Optional[str] = None
+    ) -> None:
+        """
+        Envía a process-event un Dial 480_TEMPORARILY_UNAVAILABLE (SIP 480).
+        El dialer lo contabiliza con dialstatus propio y puede aplicar reglas de incidencia.
+        """
+        self._submit_dial_status(
+            "480_TEMPORARILY_UNAVAILABLE",
+            campaign_id,
+            contact_id,
+            number,
+            callid=callid,
+        )
+
+    def submit_dial_originate_failed(
+        self,
+        campaign_id: Any,
+        contact_id: Any,
+        number: str,
+        callid: Optional[str] = None,
+        reason: str = "",
     ) -> None:
         """
         Envía a process-event un Dial ORIGINATE_FAILED para decrementar OML:CALLS
         cuando originate hacia PSTN falló (sin canal en Asterisk).
+        Si hay reporter, también registra ORIGINATE_FAILED en interactions_summary.
         """
+        resolved_callid = callid or f"{int(time.time())}.{contact_id}"
         payload_dict = self._attach_business_fields(
             {
                 "type": "Dial",
                 "call_type": "to_pstn",
                 "dialstatus": "ORIGINATE_FAILED",
-                "callid": callid or f"{int(time.time())}.{contact_id}",
+                "callid": resolved_callid,
             },
             campaign_id=campaign_id,
             contact_id=contact_id,
@@ -505,19 +613,68 @@ class LegacyEventForwarder:
             return
         if not self.client:
             self._connect()
-        if not self.client:
-            return
-        payload_bytes = bytes(json.dumps(payload_dict), encoding="utf8")
-        self._submit_process_event(
-            payload_bytes,
-            context="submit_dial_originate_failed",
-            summary={"campaign_id": campaign_id, "contact_id": contact_id},
-        )
-        self.logger.debug(
-            "Forwarded Dial ORIGINATE_FAILED to Gearman: campaign_id=%s contact_id=%s",
-            campaign_id,
-            contact_id,
-        )
+        if self.client:
+            payload_bytes = bytes(json.dumps(payload_dict), encoding="utf8")
+            self._submit_process_event(
+                payload_bytes,
+                context="submit_dial_originate_failed",
+                summary={"campaign_id": campaign_id, "contact_id": contact_id},
+            )
+            self.logger.debug(
+                "Forwarded Dial ORIGINATE_FAILED to Gearman: campaign_id=%s contact_id=%s",
+                campaign_id,
+                contact_id,
+            )
+        else:
+            self.logger.warning(
+                "ORIGINATE_FAILED without Gearman client: camp=%s contact=%s",
+                campaign_id,
+                contact_id,
+            )
+
+        if self.reporter:
+            try:
+                end_iso = datetime.now().astimezone().isoformat()
+                custom_data = {}
+                if reason:
+                    custom_data["originate_fail_reason"] = reason
+                call_data = {
+                    "callid": resolved_callid,
+                    "id_camp": campaign_id,
+                    "id_customer": contact_id,
+                    "phone_number": number,
+                    "tel_customer": number,
+                    "call_type": CallType.DIALER_ID,
+                    "ts_start_iso": end_iso,
+                    "ts_answer_iso": None,
+                }
+                self.reporter.log_segment_end(
+                    call_data=call_data,
+                    event_final=HangupCause.ORIGINATE_FAILED.value,
+                    is_transfer=False,
+                    quien_corto=0,
+                    uniqueid=resolved_callid,
+                    callid=resolved_callid,
+                    end_iso=end_iso,
+                    bridge_wait_time=0.0,
+                    duracion_llamada=0.0,
+                    bot_duration=0.0,
+                    agent_duration=0.0,
+                    channel_leg="PSTN",
+                    channel_leg_id=resolved_callid,
+                    channel_leg_name=resolved_callid,
+                    channel_leg_start_ts=end_iso,
+                    channel_leg_answer_ts=None,
+                    channel_leg_end_ts=end_iso,
+                    custom_data=custom_data or None,
+                )
+            except Exception:
+                self.logger.exception(
+                    "Error reportando ORIGINATE_FAILED a logger "
+                    "(campaign_id=%s contact_id=%s)",
+                    campaign_id,
+                    contact_id,
+                )
 
     def submit_dial_amd(
         self, campaign_id: Any, contact_id: Any, number: str, callid: Optional[str] = None
@@ -616,7 +773,9 @@ class LegacyEventForwarder:
             id_customer = metadata.get("id_customer", metadata.get("contact_id", ""))
             tel = metadata.get("tel_customer", metadata.get("phone_number", ""))
             callid = self._get_callid(metadata) or channel_id
-            self.submit_dial_originate_failed(id_camp, id_customer, tel, callid=callid)
+            self.submit_dial_originate_failed(
+                id_camp, id_customer, tel, callid=callid, reason="shutdown_flush",
+            )
             self.pending_dial_store.pop(channel_id)
             sent += 1
             self.logger.warning(

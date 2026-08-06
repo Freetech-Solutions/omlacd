@@ -4,7 +4,13 @@ from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional
 
 from ari_manager import ARI
-from constants import CallType, ChannelType, HangupCause, SHORTCALL_DURATION_THRESHOLD_SEC
+from constants import (
+    CallType,
+    ChannelType,
+    HangupCause,
+    SHORTCALL_DURATION_THRESHOLD_SEC,
+    map_unanswered_hangup_to_event,
+)
 from models import (
     parse_ari_event,
     StasisStartEvent,
@@ -815,23 +821,48 @@ class AcDRouter:
         channel_id = event.channel.id
         self._channel_ids_dial_sent_to_logger.discard(channel_id)
         is_cancel_path = False
+        early_fail_event = None  # CANCEL / 603_DECLINED / 404_NOT_FOUND / …
         event_final_for_dialer = None
         pstn_cleaned_by_app = False
         id_camp = id_customer = tel_customer = ""
-        # Simetría con MANUAL: reportar CANCEL a acd-log-processor solo cuando se destruye
-        # la pierna PSTN DIALER antes de contestar (canal no estaba Up). Si state=Up y hay meta,
-        # contestó y colgó sin contexto (p. ej. durante AMD): reportar EXIT_SHORTCALL o EXIT_ANSWERED.
-        # No reportar CANCEL si ya se reportó BUSY/CONGESTION/CHANUNAVAIL en el evento Dial.
+        # Simetría con MANUAL: reportar fallo a acd-log-processor cuando se destruye
+        # la pierna PSTN DIALER antes de contestar (canal no estaba Up). Clasificar por
+        # cause/tech_cause (603→603_DECLINED, 403→403_FORBIDDEN, 404→404_NOT_FOUND,
+        # 405→405_NOT_ALLOWED, 406→406_NO_ACCEPTABLE, 408→408_REQUEST_TIMEOUT,
+        # 480→480_TEMPORARILY_UNAVAILABLE, 487→487_REQUEST_TERMINATED,
+        # 488→488_NOT_ACCEPTABLE_HERE, 608→608_REJECTED); fallback CANCEL.
+        # Si state=Up y hay meta, contestó y colgó sin contexto (p. ej. durante AMD):
+        # reportar EXIT_SHORTCALL o EXIT_ANSWERED.
+        # No reportar si ya se reportó BUSY/CONGESTION/CHANUNAVAIL en el evento Dial.
         if self.legacy_forwarder and self.reporter:
             channel_state = getattr(event.channel, "state", None) or ""
             meta = self.legacy_forwarder.get_pending_dial_metadata(channel_id)
             if meta and channel_id not in self._channel_ids_dial_failure_reported and channel_state != "Up":
                 is_cancel_path = True
+                hangup_cause = getattr(event, "cause", None)
+                if hangup_cause is None:
+                    hangup_cause = getattr(event.channel, "cause", None)
+                hangup_cause_txt = getattr(event, "cause_txt", None) or getattr(
+                    event.channel, "cause_txt", None
+                )
+                tech_cause = getattr(event, "tech_cause", None)
+                early_fail_event = map_unanswered_hangup_to_event(
+                    cause=hangup_cause,
+                    tech_cause=tech_cause,
+                    default=HangupCause.CANCEL.value,
+                )
                 id_camp = meta.get("id_camp") or meta.get("campaign_id") or ""
                 id_customer = meta.get("id_customer") or meta.get("contact_id") or ""
                 tel_customer = meta.get("tel_customer") or meta.get("phone_number") or ""
                 call_id = str(channel_id)
                 now_iso = datetime.now().astimezone().isoformat()
+                custom_data = {}
+                if tech_cause is not None:
+                    try:
+                        custom_data["tech_cause"] = int(tech_cause)
+                        custom_data["sip_code"] = int(tech_cause)
+                    except (TypeError, ValueError):
+                        custom_data["tech_cause"] = tech_cause
                 try:
                     self.reporter.log_dial(
                         call_id=call_id,
@@ -866,12 +897,14 @@ class AcDRouter:
                             call_data["numero_origen"] = trunk_callerid
                     self.reporter.log_segment_end(
                         call_data=call_data,
-                        event_final="CANCEL",
+                        event_final=early_fail_event,
                         is_transfer=False,
                         quien_corto=2,
                         uniqueid=None,
                         callid=call_id,
                         end_iso=now_iso,
+                        hangup_cause=hangup_cause,
+                        hangup_cause_txt=hangup_cause_txt,
                         bridge_wait_time=0.0,
                         duracion_llamada=0.0,
                         bot_duration=0.0,
@@ -882,10 +915,13 @@ class AcDRouter:
                         channel_leg_start_ts=now_iso,
                         channel_leg_answer_ts=None,
                         channel_leg_end_ts=now_iso,
+                        custom_data=custom_data or None,
                     )
                 except Exception as e:
                     self.logger.warning(
-                        "Error reportando DIALER CANCEL a acd-log-processor: %s", e,
+                        "Error reportando DIALER %s a acd-log-processor: %s",
+                        early_fail_event,
+                        e,
                         exc_info=True,
                     )
             elif meta and channel_state == "Up":
@@ -997,7 +1033,16 @@ class AcDRouter:
                                 exc_info=True,
                             )
             self._channel_ids_dial_failure_reported.discard(channel_id)
-        # CANCEL: enviar Dial CANCEL a process-event y limpiar metadata (no ChannelDestroyed).
+        # Early-fail (CANCEL/603_DECLINED/404_NOT_FOUND/403_FORBIDDEN/405_NOT_ALLOWED/
+        # 406_NO_ACCEPTABLE/408_REQUEST_TIMEOUT/480_TEMPORARILY_UNAVAILABLE/
+        # 487_REQUEST_TERMINATED/488_NOT_ACCEPTABLE_HERE/608_REJECTED/
+        # CHANUNAVAIL/ERROR): Dial status a process-event y limpiar metadata.
+        #   404_NOT_FOUND → 404_NOT_FOUND (dialstatus propio; sin incidence rules)
+        #   480_TEMPORARILY_UNAVAILABLE → dialstatus propio (con incidence rules)
+        #   487_REQUEST_TERMINATED → NOANSWER (con incidence rules)
+        #   603_DECLINED + 403/405/406/408/488/608 + CHANUNAVAIL + ERROR → CHANUNAVAIL
+        #     (fail sin reglas; libera OML:CALLS)
+        #   CANCEL (y residuales p. ej. HangupCause.NOANSWER Q.850) → CANCEL.
         # EXIT_SHORTCALL: enviar Dial EXIT_SHORTCALL a process-event y limpiar (no ChannelDestroyed).
         # PSTN limpiado por app: enviar ChannelDestroyed a process-event para que el dialer
         # decremente OML:CALLS:{id_camp}:DIALER (el segment_end ya fue reportado, no duplicar).
@@ -1009,7 +1054,37 @@ class AcDRouter:
                 self.legacy_forwarder.handle_channel_destroyed(channel_id)
             elif is_cancel_path:
                 callid = meta.get("callid") or meta.get("uniqueid") or "" if meta else ""
-                self.legacy_forwarder.submit_dial_cancel(id_camp, id_customer, tel_customer, callid=callid)
+                if early_fail_event == HangupCause.NOT_FOUND.value:
+                    self.legacy_forwarder.submit_dial_not_found(
+                        id_camp, id_customer, tel_customer, callid=callid
+                    )
+                elif early_fail_event == HangupCause.TEMPORARILY_UNAVAILABLE.value:
+                    self.legacy_forwarder.submit_dial_temporarily_unavailable(
+                        id_camp, id_customer, tel_customer, callid=callid
+                    )
+                elif early_fail_event == HangupCause.REQUEST_TERMINATED.value:
+                    self.legacy_forwarder.submit_dial_noanswer(
+                        id_camp, id_customer, tel_customer, callid=callid
+                    )
+                elif early_fail_event in (
+                    HangupCause.DECLINED.value,
+                    HangupCause.FORBIDDEN.value,
+                    HangupCause.METHOD_NOT_ALLOWED.value,
+                    HangupCause.NOT_ACCEPTABLE.value,
+                    HangupCause.REQUEST_TIMEOUT.value,
+                    HangupCause.NOT_ACCEPTABLE_HERE.value,
+                    HangupCause.SIP_REJECTED.value,
+                    HangupCause.CHANUNAVAIL.value,
+                    HangupCause.ERROR.value,
+                ):
+                    self.legacy_forwarder.submit_dial_chanunavail(
+                        id_camp, id_customer, tel_customer, callid=callid
+                    )
+                else:
+                    # CANCEL y residuales early-fail → CANCEL (sin incidence rules)
+                    self.legacy_forwarder.submit_dial_cancel(
+                        id_camp, id_customer, tel_customer, callid=callid
+                    )
                 self.legacy_forwarder.cleanup_pending_dial(channel_id)
             elif event_final_for_dialer == HangupCause.EXIT_SHORTCALL.value:
                 callid = meta.get("callid") or meta.get("uniqueid") or "" if meta else ""

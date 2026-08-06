@@ -82,7 +82,7 @@ class DialingService:
             return
         if self.legacy_forwarder:
             self.legacy_forwarder.submit_dial_originate_failed(
-                campaign_id, contact_id, number, callid=callid,
+                campaign_id, contact_id, number, callid=callid, reason=reason,
             )
         else:
             self.logger.warning(

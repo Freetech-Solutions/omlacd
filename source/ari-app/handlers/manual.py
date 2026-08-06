@@ -19,7 +19,14 @@ from config import settings
 from services.call_manager import CallActionService
 from services.agent_status_service import AgentStatusService
 from services.backend_notifier import notify_call_blocked
-from constants import CallType, ChannelType, HangupCause, RedisKeys
+from constants import (
+    CallType,
+    ChannelType,
+    HangupCause,
+    RedisKeys,
+    AST_CAUSE_TO_EVENT,
+    map_unanswered_hangup_to_event,
+)
 from models import (
     BaseARIEvent,
     StasisStartEvent,
@@ -37,27 +44,8 @@ class ManualCallHandler(BaseHandler):
     Refactorizado para delegar operaciones de bajo nivel a CallActionService.
     """
 
-    AST_CAUSE_MAPPING = {
-        1: HangupCause.ERROR.value,          # Unallocated (unassigned) number
-        3: HangupCause.NOANSWER.value,       # No route to destination
-        16: HangupCause.HANGUP.value,        # Normal Clearing
-        17: HangupCause.BUSY.value,          # User busy
-        18: HangupCause.NOANSWER.value,      # No user responding
-        19: HangupCause.NOANSWER.value,      # No answer from the user (user alerted)
-        20: HangupCause.NOANSWER.value,      # Subscriber absent
-        21: HangupCause.REJECTED.value,      # Call rejected
-        22: HangupCause.ERROR.value,         # Number changed
-        27: HangupCause.ERROR.value,         # Destination out of order
-        28: HangupCause.ERROR.value,         # Invalid number format
-        34: HangupCause.CONGESTION.value,    # No circuit/channel available
-        38: HangupCause.CHANUNAVAIL.value,   # Network out of order
-        41: HangupCause.CONGESTION.value,    # Temporary failure
-        42: HangupCause.CONGESTION.value,    # Switching equipment congestion
-        58: HangupCause.CHANUNAVAIL.value,   # Bearer capability not presently available
-        88: HangupCause.CONGESTION.value,    # Incompatible destination
-        95: HangupCause.ERROR.value,         # Invalid message, unspecified
-        111: HangupCause.ERROR.value,        # Protocol error, unspecified
-    }
+    # Fuente de verdad compartida con dialer early-fail (router).
+    AST_CAUSE_MAPPING = AST_CAUSE_TO_EVENT
 
     def __init__(self, ari_client, state_store, reporter, asterisk_app: Optional[str] = None, call_service: Optional[CallActionService] = None, redis_client=None, agent_status_service: Optional[AgentStatusService] = None, route_validator=None, recording_service=None):
         super().__init__(ari_client, state_store, reporter)
@@ -648,8 +636,11 @@ class ManualCallHandler(BaseHandler):
         if cause == 16 and is_answered:
             return HangupCause.EXIT_ANSWERED.value
 
-        # Usar el mapeo estándar
-        return self.AST_CAUSE_MAPPING.get(cause, HangupCause.HANGUP.value)
+        # Usar el mapeo estándar (default HANGUP para cause desconocida en manual)
+        return map_unanswered_hangup_to_event(
+            cause=cause,
+            default=HangupCause.HANGUP.value,
+        )
 
     def _reason_for_dial_not_answered(self, event_final: str) -> str:
         """
@@ -662,7 +653,33 @@ class ManualCallHandler(BaseHandler):
             HangupCause.CONGESTION.value: "La llamada no fue contestada: congestión de red.",
             HangupCause.CHANUNAVAIL.value: "La llamada no fue contestada: canal no disponible.",
             HangupCause.CANCEL.value: "La llamada fue cancelada antes de conectar.",
+            HangupCause.DECLINED.value: "La llamada no fue contestada: llamada rechazada (603_DECLINED).",
             HangupCause.REJECTED.value: "La llamada no fue contestada: llamada rechazada.",
+            HangupCause.NOT_FOUND.value: "La llamada no fue contestada: número no encontrado.",
+            HangupCause.FORBIDDEN.value: (
+                "La llamada no fue contestada: prohibida (SIP 403)."
+            ),
+            HangupCause.METHOD_NOT_ALLOWED.value: (
+                "La llamada no fue contestada: método no permitido (SIP 405)."
+            ),
+            HangupCause.NOT_ACCEPTABLE.value: (
+                "La llamada no fue contestada: no aceptable (SIP 406)."
+            ),
+            HangupCause.REQUEST_TIMEOUT.value: (
+                "La llamada no fue contestada: timeout de solicitud (SIP 408)."
+            ),
+            HangupCause.TEMPORARILY_UNAVAILABLE.value: (
+                "La llamada no fue contestada: temporalmente no disponible (SIP 480)."
+            ),
+            HangupCause.REQUEST_TERMINATED.value: (
+                "La llamada no fue contestada: solicitud terminada (SIP 487)."
+            ),
+            HangupCause.NOT_ACCEPTABLE_HERE.value: (
+                "La llamada no fue contestada: no aceptable aquí (SIP 488)."
+            ),
+            HangupCause.SIP_REJECTED.value: (
+                "La llamada no fue contestada: rechazada (SIP 608)."
+            ),
             HangupCause.ERROR.value: "La llamada no fue contestada: error en la red.",
             HangupCause.EXIT_TIMEOUT.value: "La llamada no fue contestada: tiempo agotado.",
             HangupCause.EXIT_ABANDON.value: "La llamada no fue contestada: abandonada.",

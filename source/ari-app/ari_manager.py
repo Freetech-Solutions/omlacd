@@ -752,6 +752,10 @@ class ARI:
     def list_channels(self):
         """
         Obtiene la lista de todos los canales activos en Asterisk.
+
+        Las variables incluidas en la respuesta se configuran mediante
+        ``channelvars`` en ari.conf; GET /channels no admite un parámetro
+        ``variable``.
         """
         result = self.get('channels')
         return self._unwrap_data(result)

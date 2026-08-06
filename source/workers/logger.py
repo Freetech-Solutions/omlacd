@@ -25,9 +25,15 @@ FINAL_STATES = {
     HangupCause.EXIT_HANDOFF_TIMEOUT.value, HangupCause.EXIT_AMD.value,
     HangupCause.BUSY.value, HangupCause.CONGESTION.value, HangupCause.CHANUNAVAIL.value,
     HangupCause.NOANSWER.value, HangupCause.CANCEL.value,
+    HangupCause.DECLINED.value, HangupCause.REJECTED.value, HangupCause.NOT_FOUND.value,
+    HangupCause.FORBIDDEN.value,
+    HangupCause.METHOD_NOT_ALLOWED.value, HangupCause.NOT_ACCEPTABLE.value,
+    HangupCause.REQUEST_TIMEOUT.value, HangupCause.TEMPORARILY_UNAVAILABLE.value,
+    HangupCause.REQUEST_TERMINATED.value, HangupCause.NOT_ACCEPTABLE_HERE.value,
+    HangupCause.SIP_REJECTED.value,
     HangupCause.HANGUP.value,
     HangupCause.BLACKLIST.value, HangupCause.ERROR.value,
-    HangupCause.NONDIALPLAN.value,
+    HangupCause.NONDIALPLAN.value, HangupCause.ORIGINATE_FAILED.value, 'INVALID_NUMBER',
 }
 
 # --- CONFIGURACIÓN DE LOGGING ---
@@ -200,10 +206,17 @@ def is_finalization_event(event_name):
     finalization_events = [
         HangupCause.EXIT_ANSWERED.value, HangupCause.EXIT_SHORTCALL.value, HangupCause.EXIT_UNKNOWN.value,
         HangupCause.BUSY.value, HangupCause.CONGESTION.value, HangupCause.NOANSWER.value,
-        HangupCause.CANCEL.value, HangupCause.ERROR.value, HangupCause.EXIT_TIMEOUT.value,
+        HangupCause.CANCEL.value, HangupCause.DECLINED.value, HangupCause.REJECTED.value,
+        HangupCause.NOT_FOUND.value, HangupCause.FORBIDDEN.value,
+        HangupCause.METHOD_NOT_ALLOWED.value,
+        HangupCause.NOT_ACCEPTABLE.value, HangupCause.REQUEST_TIMEOUT.value,
+        HangupCause.TEMPORARILY_UNAVAILABLE.value, HangupCause.REQUEST_TERMINATED.value,
+        HangupCause.NOT_ACCEPTABLE_HERE.value, HangupCause.SIP_REJECTED.value,
+        HangupCause.ERROR.value,
+        HangupCause.EXIT_TIMEOUT.value,
         HangupCause.EXIT_HANDOFF_TIMEOUT.value, HangupCause.EXIT_ABANDON.value,
         HangupCause.EXIT_HANDOFF_ABANDON.value, HangupCause.BLACKLIST.value, HangupCause.EXIT_AMD.value,
-        HangupCause.NONDIALPLAN.value,
+        HangupCause.NONDIALPLAN.value, HangupCause.ORIGINATE_FAILED.value, 'INVALID_NUMBER',
         HangupCause.COMPLETEAGENT.value, HangupCause.COMPLETEOUTNUM.value, HangupCause.HANGUP.value
     ]
     
@@ -536,8 +549,14 @@ def insert_llamada_resumen(message):
             node_id = None
         
         hangup_trigger = clean_hangup_trigger(message.get("hangup_trigger"))
-        # Para status EXIT_AMD, EXIT_SHORTCALL y NONDIALPLAN, forzar hangup_cause SYSTEM en interactions_summary
-        if event_name in (HangupCause.EXIT_AMD.value, HangupCause.EXIT_SHORTCALL.value, HangupCause.NONDIALPLAN.value):
+        # Para status EXIT_AMD, EXIT_SHORTCALL, NONDIALPLAN y ORIGINATE_FAILED,
+        # forzar hangup_cause SYSTEM en interactions_summary
+        if event_name in (
+            HangupCause.EXIT_AMD.value,
+            HangupCause.EXIT_SHORTCALL.value,
+            HangupCause.NONDIALPLAN.value,
+            HangupCause.ORIGINATE_FAILED.value,
+        ):
             hangup_trigger = "SYSTEM"
         direction = 'INBOUND' if (t_campana == CallType.INBOUND_ID) else 'OUTBOUND'
         start_time = fecha_inicio or datetime.now().astimezone().isoformat()
@@ -690,12 +709,19 @@ def _publish_inbound_abandon_time(redis_client, campana_id, bridge_wait_time):
 # Alineado con LlamadaLog.EVENTOS_NO_CONTACTACION + EVENTOS_NO_DIALOGO
 CAMP_DIALER_NO_CONTACT_EVENTS = frozenset([
     HangupCause.NOANSWER.value, HangupCause.BUSY.value, HangupCause.CANCEL.value,
+    HangupCause.DECLINED.value, HangupCause.REJECTED.value, HangupCause.NOT_FOUND.value,
+    HangupCause.FORBIDDEN.value,
+    HangupCause.METHOD_NOT_ALLOWED.value, HangupCause.NOT_ACCEPTABLE.value,
+    HangupCause.REQUEST_TIMEOUT.value, HangupCause.TEMPORARILY_UNAVAILABLE.value,
+    HangupCause.REQUEST_TERMINATED.value, HangupCause.NOT_ACCEPTABLE_HERE.value,
+    HangupCause.SIP_REJECTED.value,
     HangupCause.CHANUNAVAIL.value, HangupCause.CONGESTION.value,
     HangupCause.EXIT_ABANDON.value, HangupCause.EXIT_TIMEOUT.value,
     HangupCause.EXIT_HANDOFF_ABANDON.value, HangupCause.EXIT_HANDOFF_TIMEOUT.value,
     HangupCause.EXIT_AMD.value,
     HangupCause.BLACKLIST.value, HangupCause.ERROR.value, HangupCause.NONDIALPLAN.value,
-    'ABANDON', 'ABANDONWEL',
+    HangupCause.ORIGINATE_FAILED.value,
+    'INVALID_NUMBER', 'ABANDON', 'ABANDONWEL',
 ])
 
 
@@ -1125,6 +1151,13 @@ def task_callback(gearman_worker, gearman_job):
             HangupCause.EXIT_TIMEOUT.value, HangupCause.EXIT_HANDOFF_ABANDON.value,
             HangupCause.EXIT_HANDOFF_TIMEOUT.value, HangupCause.HANGUP.value, HangupCause.BUSY.value,
             HangupCause.CONGESTION.value, HangupCause.CHANUNAVAIL.value,
+            HangupCause.DECLINED.value, HangupCause.REJECTED.value, HangupCause.NOT_FOUND.value,
+            HangupCause.FORBIDDEN.value,
+            HangupCause.METHOD_NOT_ALLOWED.value, HangupCause.NOT_ACCEPTABLE.value,
+            HangupCause.REQUEST_TIMEOUT.value, HangupCause.TEMPORARILY_UNAVAILABLE.value,
+            HangupCause.REQUEST_TERMINATED.value, HangupCause.NOT_ACCEPTABLE_HERE.value,
+            HangupCause.SIP_REJECTED.value,
+            HangupCause.NOANSWER.value, HangupCause.CANCEL.value,
             'INVALID_NUMBER'
         ] or "TRANSFER" in str(event_name).upper():
             logger.info(
@@ -1165,6 +1198,13 @@ def task_callback(gearman_worker, gearman_job):
                 HangupCause.EXIT_TIMEOUT.value, HangupCause.EXIT_HANDOFF_ABANDON.value,
                 HangupCause.EXIT_HANDOFF_TIMEOUT.value, HangupCause.HANGUP.value, HangupCause.BUSY.value,
                 HangupCause.CONGESTION.value, HangupCause.CHANUNAVAIL.value,
+                HangupCause.DECLINED.value, HangupCause.REJECTED.value, HangupCause.NOT_FOUND.value,
+                HangupCause.FORBIDDEN.value,
+                HangupCause.METHOD_NOT_ALLOWED.value, HangupCause.NOT_ACCEPTABLE.value,
+                HangupCause.REQUEST_TIMEOUT.value, HangupCause.TEMPORARILY_UNAVAILABLE.value,
+                HangupCause.REQUEST_TERMINATED.value, HangupCause.NOT_ACCEPTABLE_HERE.value,
+                HangupCause.SIP_REJECTED.value,
+                HangupCause.NOANSWER.value, HangupCause.CANCEL.value,
                 'INVALID_NUMBER'
             ] or "TRANSFER" in str(event_name).upper():
                 logger.info(

@@ -271,6 +271,10 @@ class ACDReporter:
             'EXIT_SHORTCALL', 'EXIT_ANSWERED', 'BUSY', 'CONGESTION', 'CHANUNAVAIL',
             'EXIT_TIMEOUT', 'EXIT_ABANDON', 'EXIT_HANDOFF_TIMEOUT', 'EXIT_HANDOFF_ABANDON',
             'NOANSWER', 'CANCEL', 'AMD', 'INVALID_NUMBER',
+            '603_DECLINED', '404_NOT_FOUND', 'REJECTED', '403_FORBIDDEN', '405_NOT_ALLOWED',
+            '406_NO_ACCEPTABLE',
+            '408_REQUEST_TIMEOUT', '480_TEMPORARILY_UNAVAILABLE', '487_REQUEST_TERMINATED',
+            '488_NOT_ACCEPTABLE_HERE', '608_REJECTED',
         )
         tipo_campana = self._clean_id(call_data.get('call_type'))
         tipo_llamada = self._clean_id(call_data.get('call_type'))

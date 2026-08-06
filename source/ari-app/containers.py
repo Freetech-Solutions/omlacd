@@ -130,6 +130,7 @@ class ACDContainer(containers.DeclarativeContainer):
     legacy_forwarder = providers.Singleton(
         LegacyEventForwarder,
         pending_dial_store=pending_dial_store,
+        reporter=reporter,
     )
 
     # Call Service (definido antes de dialing_service y distribution_service)
