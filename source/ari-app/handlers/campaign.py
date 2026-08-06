@@ -16,7 +16,7 @@ import redis
 
 from ari_manager import ARI
 from config import settings
-from constants import CallType, HangupCause, RedisKeys
+from constants import CallType, DIALER_MOH_CLASS, HangupCause, RedisKeys
 from handlers.base import BaseHandler
 from handlers.inbound import (
     CAMPAIGN_CFG_TTL_SEC,
@@ -697,7 +697,6 @@ class ProgressiveCampaignHandler(BaseHandler):
         campaign_cfg: Dict[str, Any],
     ) -> None:
         """Bridge ya creado: answer, agregar al bridge, MOH, contexto, cola y distribución (voicebot o humanos)."""
-        moh_sound = campaign_cfg.get("moh_sound")
         max_wait_time = campaign_cfg.get("max_wait_time", 3600)
         strategy = campaign_cfg.get("strategy", "fewestcalls")
         ring_timeout = campaign_cfg.get("ring_timeout", settings.DEFAULT_ORIGINATE_TIMEOUT)
@@ -710,13 +709,10 @@ class ProgressiveCampaignHandler(BaseHandler):
         except Exception:
             logger.exception("Error agregando PSTN %s al bridge %s", channel_id, bridge_id)
         try:
-            if moh_sound:
-                self.ari_client.post(
-                    f"bridges/{bridge_id}/moh",
-                    params={"mohClass": moh_sound},
-                )
-            else:
-                self.call_service.start_moh_on_bridge(bridge_id)
+            self.ari_client.post(
+                f"bridges/{bridge_id}/moh",
+                params={"mohClass": DIALER_MOH_CLASS},
+            )
         except Exception:
             logger.exception("Error iniciando MOH en bridge %s", bridge_id)
 

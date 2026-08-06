@@ -35,7 +35,29 @@ class HangupCause(Enum):
     CONGESTION = 'CONGESTION'
     ERROR = 'ERROR'
     CANCEL = 'CANCEL'
+    # SIP 603 Decline / Asterisk cause 21 (Call Rejected). Preferido sobre REJECTED.
+    DECLINED = '603_DECLINED'
+    # Alias legacy de DECLINED (cause 21); mantener por compatibilidad de payloads/tests.
     REJECTED = 'REJECTED'
+    # SIP 404 Not Found / Asterisk cause 1 (Unallocated number).
+    NOT_FOUND = '404_NOT_FOUND'
+    # SIP 403 Forbidden (tech_cause SIP; Q.850 suele ser 21 Call Rejected).
+    FORBIDDEN = '403_FORBIDDEN'
+    # SIP 405 Method Not Allowed (tech_cause SIP; Q.850 suele ser 127 Interworking).
+    METHOD_NOT_ALLOWED = '405_NOT_ALLOWED'
+    # SIP 406 Not Acceptable (tech_cause SIP; Q.850 suele ser 127 Interworking).
+    NOT_ACCEPTABLE = '406_NO_ACCEPTABLE'
+    # SIP 408 Request Timeout (tech_cause SIP; Q.850 suele ser 18 No user responding).
+    REQUEST_TIMEOUT = '408_REQUEST_TIMEOUT'
+    # SIP 480 Temporarily Unavailable (tech_cause SIP; Q.850 suele ser 19/20).
+    TEMPORARILY_UNAVAILABLE = '480_TEMPORARILY_UNAVAILABLE'
+    # SIP 487 Request Terminated (tech_cause SIP; Q.850 suele ser 127 Interworking).
+    REQUEST_TERMINATED = '487_REQUEST_TERMINATED'
+    # SIP 488 Not Acceptable Here (tech_cause SIP; Q.850 suele ser 58 Bearer capability).
+    NOT_ACCEPTABLE_HERE = '488_NOT_ACCEPTABLE_HERE'
+    # SIP 608 Rejected (tech_cause SIP; Q.850 suele ser 127 Interworking).
+    # Distinto del alias legacy REJECTED='REJECTED'.
+    SIP_REJECTED = '608_REJECTED'
     CHANUNAVAIL = 'CHANUNAVAIL'
     EXIT_ABANDON = 'EXIT_ABANDON'
     EXIT_TIMEOUT = 'EXIT_TIMEOUT'
@@ -47,11 +69,83 @@ class HangupCause(Enum):
     COMPLETEOUTNUM = 'COMPLETEOUTNUM'
     BLACKLIST = 'BLACKLIST'
     NONDIALPLAN = 'NONDIALPLAN'
+    # Originate ARI falló sin crear canal PSTN (p. ej. Allocation failed).
+    ORIGINATE_FAILED = 'ORIGINATE_FAILED'
     EXIT_UNKNOWN = 'EXIT_UNKNOWN'
+
+
+# Mapeo Q.850 (Asterisk cause) → evento de negocio para pierna PSTN no contestada.
+AST_CAUSE_TO_EVENT = {
+    1: HangupCause.NOT_FOUND.value,      # Unallocated (unassigned) number — tip. SIP 404
+    3: HangupCause.NOANSWER.value,       # No route to destination
+    16: HangupCause.HANGUP.value,        # Normal Clearing
+    17: HangupCause.BUSY.value,          # User busy
+    18: HangupCause.NOANSWER.value,      # No user responding
+    19: HangupCause.NOANSWER.value,      # No answer from the user (user alerted)
+    20: HangupCause.NOANSWER.value,      # Subscriber absent
+    21: HangupCause.DECLINED.value,      # Call rejected — tip. SIP 603
+    22: HangupCause.ERROR.value,         # Number changed
+    27: HangupCause.ERROR.value,         # Destination out of order
+    28: HangupCause.ERROR.value,         # Invalid number format
+    34: HangupCause.CONGESTION.value,    # No circuit/channel available
+    38: HangupCause.CHANUNAVAIL.value,   # Network out of order
+    41: HangupCause.CONGESTION.value,    # Temporary failure
+    42: HangupCause.CONGESTION.value,    # Switching equipment congestion
+    58: HangupCause.CHANUNAVAIL.value,   # Bearer capability not presently available
+    88: HangupCause.CONGESTION.value,    # Incompatible destination
+    95: HangupCause.ERROR.value,         # Invalid message, unspecified
+    111: HangupCause.ERROR.value,        # Protocol error, unspecified
+}
+
+
+def map_unanswered_hangup_to_event(
+    cause: Optional[int] = None,
+    tech_cause: Optional[int] = None,
+    default: str = HangupCause.CANCEL.value,
+) -> str:
+    """
+    Clasifica un hangup PSTN antes de contestar según cause Q.850 y/o SIP tech_cause.
+
+    Prioriza tech_cause SIP cuando es inequívoco
+    (603→603_DECLINED, 403→403_FORBIDDEN, 404→404_NOT_FOUND, 405→405_NOT_ALLOWED,
+     406→406_NO_ACCEPTABLE, 408→408_REQUEST_TIMEOUT,
+     480→480_TEMPORARILY_UNAVAILABLE, 487→487_REQUEST_TERMINATED,
+     488→488_NOT_ACCEPTABLE_HERE, 608→608_REJECTED).
+    """
+    if tech_cause == 603:
+        return HangupCause.DECLINED.value
+    if tech_cause == 403:
+        return HangupCause.FORBIDDEN.value
+    if tech_cause == 404:
+        return HangupCause.NOT_FOUND.value
+    if tech_cause == 405:
+        return HangupCause.METHOD_NOT_ALLOWED.value
+    if tech_cause == 406:
+        return HangupCause.NOT_ACCEPTABLE.value
+    if tech_cause == 408:
+        return HangupCause.REQUEST_TIMEOUT.value
+    if tech_cause == 480:
+        return HangupCause.TEMPORARILY_UNAVAILABLE.value
+    if tech_cause == 487:
+        return HangupCause.REQUEST_TERMINATED.value
+    if tech_cause == 488:
+        return HangupCause.NOT_ACCEPTABLE_HERE.value
+    if tech_cause == 608:
+        return HangupCause.SIP_REJECTED.value
+    if cause is not None:
+        try:
+            cause_int = int(cause)
+        except (TypeError, ValueError):
+            return default
+        return AST_CAUSE_TO_EVENT.get(cause_int, default)
+    return default
 
 
 # Umbral en segundos: llamadas contestadas con duración menor se reportan como EXIT_SHORTCALL
 SHORTCALL_DURATION_THRESHOLD_SEC = 5
+
+# Clase MOH fija para llamadas dialer (bridge mientras espera agente)
+DIALER_MOH_CLASS = "dialer_1"
 
 
 class ProtocolPrefix(Enum):

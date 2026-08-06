@@ -220,15 +220,22 @@ class GearmanListener(threading.Thread):
             return b"ERROR"
     
     def _execute_audit_task(self, worker, job):
-        """Retorna JSON {camp_id: count} de canales dialer PSTN activos en Asterisk."""
+        """
+        Retorna JSON envelope de canales dialer PSTN activos en Asterisk:
+        {"ok": true, "counts": {"4": 2}} o {"ok": false, "error": "...", "counts": {}}.
+        """
         try:
             if not self.channel_audit_service:
                 logger.warning("audit-dialer-channels: channel_audit_service not configured")
-                return b'{}'
+                return json.dumps(
+                    {"ok": False, "error": "channel_audit_service_not_configured", "counts": {}}
+                ).encode("utf-8")
             return self.channel_audit_service.audit_json_bytes()
         except Exception as e:
             logger.error("Error in audit-dialer-channels: %s", e, exc_info=True)
-            return b'{}'
+            return json.dumps(
+                {"ok": False, "error": "audit_exception", "counts": {}}
+            ).encode("utf-8")
     
     def stop(self):
         """

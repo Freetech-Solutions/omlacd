@@ -11,6 +11,9 @@ from unittest.mock import MagicMock
 # Agregar el path para importar módulos de ari-app
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "ari-app"))
 
+sys.modules.setdefault("redis", MagicMock())
+sys.modules.setdefault("gearman", MagicMock())
+
 # Mock liviano de config/settings para evitar depender de envs reales en import.
 if "config" not in sys.modules:
     config_module = types.ModuleType("config")
@@ -131,6 +134,64 @@ def test_submit_dial_originate_failed_includes_business_fields():
     assert payload["callid"] == "1739372776.10"
 
 
+def test_submit_dial_originate_failed_reports_to_interactions_summary():
+    from constants import HangupCause
+
+    reporter = MagicMock()
+    forwarder = LegacyEventForwarder(reporter=reporter)
+    forwarder.client = MagicMock()
+
+    forwarder.submit_dial_originate_failed(
+        campaign_id=16,
+        contact_id=125,
+        number="0973101",
+        callid="1785934084.125",
+        reason="originate_failed",
+    )
+
+    assert forwarder.client.submit_job.call_count == 1
+    reporter.log_segment_end.assert_called_once()
+    kwargs = reporter.log_segment_end.call_args[1]
+    assert kwargs["event_final"] == HangupCause.ORIGINATE_FAILED.value
+    assert kwargs["callid"] == "1785934084.125"
+    assert kwargs["call_data"]["id_camp"] == 16
+    assert kwargs["call_data"]["id_customer"] == 125
+    assert kwargs["call_data"]["phone_number"] == "0973101"
+    assert kwargs["channel_leg"] == "PSTN"
+    assert kwargs["custom_data"]["originate_fail_reason"] == "originate_failed"
+
+
+def test_originate_failed_in_hangup_cause_and_logger_whitelists():
+    from constants import HangupCause
+
+    assert HangupCause.ORIGINATE_FAILED.value == "ORIGINATE_FAILED"
+
+    logger_path = os.path.join(os.path.dirname(__file__), "..", "workers", "logger.py")
+    with open(logger_path, "r", encoding="utf-8") as f:
+        content = f.read()
+    assert "HangupCause.ORIGINATE_FAILED.value" in content
+    assert "ORIGINATE_FAILED" in content
+
+
+def test_submit_dial_chanunavail_includes_business_fields():
+    forwarder = LegacyEventForwarder()
+    forwarder.client = MagicMock()
+
+    forwarder.submit_dial_chanunavail(
+        campaign_id=16, contact_id=116, number="0973102", callid="1785716490.116",
+    )
+
+    assert forwarder.client.submit_job.call_count == 1
+    payload = _decode_payload(forwarder.client.submit_job.call_args_list[0])
+    assert payload["type"] == "Dial"
+    assert payload["call_type"] == "to_pstn"
+    assert payload["dialstatus"] == "CHANUNAVAIL"
+    assert payload["id_campaign"] == "16"
+    assert payload["contact_id"] == "116"
+    assert payload["phone_number"] == "0973102"
+    assert payload["callid"] == "1785716490.116"
+
+
 def test_handle_dial_event_uses_pending_metadata_for_business_fields():
     pending_store = PendingDialMetadataStore()
     pending_store.register(
@@ -165,3 +226,91 @@ def test_handle_dial_event_uses_pending_metadata_for_business_fields():
     assert payload["contact_id"] == "55"
     assert payload["phone_number"] == "11445566"
     assert "callid" in payload
+
+
+def _pending_pstn(peer_id="PJSIP-SKIP", channel_type="to_pstn"):
+    pending_store = PendingDialMetadataStore()
+    pending_store.register(
+        peer_id,
+        {
+            "call_type": "2",
+            "channel_type": channel_type,
+            "id_camp": "7",
+            "id_customer": "55",
+            "tel_customer": "11445566",
+        },
+    )
+    return pending_store
+
+
+def test_handle_dial_event_skips_noanswer_to_pstn():
+    pending_store = _pending_pstn("PJSIP-NOA")
+    event = {
+        "type": "Dial",
+        "dialstatus": "NOANSWER",
+        "dialstring": "11445566@trunk",
+        "peer": {
+            "id": "PJSIP-NOA",
+            "dialplan": {"app_data": "(Outgoing Line)"},
+        },
+    }
+    forwarder = LegacyEventForwarder(pending_dial_store=pending_store)
+    forwarder.client = MagicMock()
+    forwarder.handle_dial_event(event)
+    assert forwarder.client.submit_job.call_count == 0
+
+
+def test_handle_dial_event_skips_cancel_to_pstn():
+    pending_store = _pending_pstn("PJSIP-CAN")
+    event = {
+        "type": "Dial",
+        "dialstatus": "CANCEL",
+        "dialstring": "11445566@trunk",
+        "peer": {
+            "id": "PJSIP-CAN",
+            "dialplan": {"app_data": "(Outgoing Line)"},
+        },
+    }
+    forwarder = LegacyEventForwarder(pending_dial_store=pending_store)
+    forwarder.client = MagicMock()
+    forwarder.handle_dial_event(event)
+    assert forwarder.client.submit_job.call_count == 0
+
+
+def test_handle_dial_event_forwards_busy_to_pstn():
+    pending_store = _pending_pstn("PJSIP-BUSY")
+    event = {
+        "type": "Dial",
+        "dialstatus": "BUSY",
+        "dialstring": "11445566@trunk",
+        "peer": {
+            "id": "PJSIP-BUSY",
+            "dialplan": {"app_data": "(Outgoing Line)"},
+        },
+    }
+    forwarder = LegacyEventForwarder(pending_dial_store=pending_store)
+    forwarder.client = MagicMock()
+    forwarder.handle_dial_event(event)
+    assert forwarder.client.submit_job.call_count == 1
+    payload = _decode_payload(forwarder.client.submit_job.call_args_list[0])
+    assert payload["dialstatus"] == "BUSY"
+
+
+def test_handle_dial_event_forwards_cancel_to_agent():
+    pending_store = _pending_pstn("PJSIP-AGT", channel_type="to_agent")
+    event = {
+        "type": "Dial",
+        "dialstatus": "CANCEL",
+        "dialstring": "agent@queue",
+        "peer": {
+            "id": "PJSIP-AGT",
+            "dialplan": {"app_data": "(Outgoing Line)"},
+        },
+    }
+    forwarder = LegacyEventForwarder(pending_dial_store=pending_store)
+    forwarder.client = MagicMock()
+    forwarder.handle_dial_event(event)
+    assert forwarder.client.submit_job.call_count == 1
+    payload = _decode_payload(forwarder.client.submit_job.call_args_list[0])
+    assert payload["dialstatus"] == "CANCEL"
+    assert payload["call_type"] == "to_agent"

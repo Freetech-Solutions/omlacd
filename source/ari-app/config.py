@@ -148,11 +148,6 @@ class Settings(BaseSettings):
         ge=60,
         description="TTL en segundos de metadata pending_dial en Redis (llamadas dialer largas)",
     )
-    DIALER_CHANNEL_AUDIT_INTERVAL_SEC: int = Field(
-        default=60,
-        ge=10,
-        description="Intervalo sugerido para auditoría de canales dialer (referencia operativa)",
-    )
 
     # Caché de agentes de campaña (loop de distribución)
     AGENTS_CACHE_TTL_SEC: int = Field(default=5, ge=1, description="TTL en segundos del caché de lista de agentes de campaña")

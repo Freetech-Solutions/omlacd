@@ -3,9 +3,7 @@ Auditoría de canales dialer activos en Asterisk vía ARI list_channels.
 """
 import json
 import logging
-from typing import Any, Dict, Optional
-
-from constants import CallType, ChannelType
+from typing import Any, Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -130,18 +128,36 @@ class DialerChannelAuditService:
         self.acd_app = acd_app or ""
         self.logger = logging.getLogger(__name__)
 
-    def audit(self) -> Dict[str, int]:
+    def audit(self) -> Tuple[bool, Dict[str, int], Optional[str]]:
+        """
+        Retorna (ok, counts, error).
+        ok=False implica que no se debe reconciliar Redis en el dialer.
+        """
         if not self.ari_client:
             self.logger.warning("DialerChannelAuditService: ari_client not available")
-            return {}
+            return False, {}, "ari_client_unavailable"
         try:
             result = self.ari_client.list_channels()
         except Exception as e:
-            self.logger.error("DialerChannelAuditService: list_channels failed: %s", e, exc_info=True)
-            return {}
+            self.logger.error(
+                "DialerChannelAuditService: list_channels failed: %s", e, exc_info=True,
+            )
+            return False, {}, "list_channels_failed"
+        # ARI.list_channels devuelve None cuando el GET falla. No confundir
+        # ese caso con una lista vacía válida, que significa cero canales.
+        if result is None:
+            self.logger.error(
+                "DialerChannelAuditService: list_channels returned no result",
+            )
+            return False, {}, "list_channels_failed"
         counts = count_dialer_channels_by_campaign(result, acd_app=self.acd_app)
         self.logger.debug("DialerChannelAuditService: counts=%s", counts)
-        return counts
+        return True, counts, None
 
     def audit_json_bytes(self) -> bytes:
-        return json.dumps(self.audit()).encode("utf-8")
+        ok, counts, error = self.audit()
+        if ok:
+            payload = {"ok": True, "counts": counts}
+        else:
+            payload = {"ok": False, "error": error or "audit_failed", "counts": {}}
+        return json.dumps(payload).encode("utf-8")
