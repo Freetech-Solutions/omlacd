@@ -12,7 +12,7 @@ include:
 
 variables:
   IMAGE_NAME: "acd"
-  # Valores válidos: omnileads | freetechsolutions. Vacío = según rama (master-2.0 → omnileads).
+  # Valores válidos: omnileads | freetechsolutions. Vacío = según rama (master-2.0 / master-3.0 → omnileads).
   DOCKER_ORG: ""
   FULL: ""
   BUILD: ""
@@ -44,21 +44,21 @@ stages:
 
 .sonar-rules: &sonar-rules
   rules:
-    - if: '$FULL == "true" && $CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "develop" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "master-2.0")'
+    - if: '$FULL == "true" && $CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "develop" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "develop-3.0" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "master-2.0" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "master-3.0")'
     - if: '$FULL == "true" && $CI_PIPELINE_SOURCE == "web"'
-    - if: '$FULL != "true" && $BUILD != "true" && $CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "develop" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "master-2.0")'
+    - if: '$FULL != "true" && $BUILD != "true" && $CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "develop" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "develop-3.0" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "master-2.0" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "master-3.0")'
     - if: '$FULL != "true" && $BUILD != "true" && $CI_PIPELINE_SOURCE == "web"'
-    - if: '$FULL != "true" && $BUILD != "true" && ($CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "master-2.0")'
+    - if: '$FULL != "true" && $BUILD != "true" && ($CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "develop-3.0" || $CI_COMMIT_BRANCH == "master-2.0" || $CI_COMMIT_BRANCH == "master-3.0")'
 
 .build-rules: &build-rules
   rules:
     - if: '$BUILD == "true" && $FULL != "true"'
-    - if: '$FULL == "true" && $CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "develop" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "master-2.0")'
+    - if: '$FULL == "true" && $CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "develop" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "develop-3.0" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "master-2.0" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "master-3.0")'
     - if: '$FULL == "true" && $CI_PIPELINE_SOURCE == "web"'
-    - if: '$FULL == "true" && ($CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "master-2.0")'
+    - if: '$FULL == "true" && ($CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "develop-3.0" || $CI_COMMIT_BRANCH == "master-2.0" || $CI_COMMIT_BRANCH == "master-3.0")'
     - if: '$FULL != "true" && $BUILD != "true" && $CI_PIPELINE_SOURCE == "web"'
     - if: '$FULL != "true" && $BUILD != "true" && $CI_PIPELINE_SOURCE == "merge_request_event"'
-    - if: '$FULL != "true" && $BUILD != "true" && ($CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "master-2.0")'
+    - if: '$FULL != "true" && $BUILD != "true" && ($CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "develop-3.0" || $CI_COMMIT_BRANCH == "master-2.0" || $CI_COMMIT_BRANCH == "master-3.0")'
 
 # Las reglas de Trivy se heredan por defecto de la plantilla central
 
@@ -66,11 +66,11 @@ stages:
   rules:
     - if: '$BUILD == "true" && $FULL != "true"'
       when: never
-    - if: '$FULL == "true" && $CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "develop" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "master-2.0")'
+    - if: '$FULL == "true" && $CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "develop" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "develop-3.0" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "master-2.0" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "master-3.0")'
     - if: '$FULL == "true" && $CI_PIPELINE_SOURCE == "web"'
-    - if: '$FULL == "true" && ($CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "master-2.0")'
-    - if: '$FULL != "true" && $BUILD != "true" && $CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "develop" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "master-2.0" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^master-.*$/)'
-    - if: '$FULL != "true" && $BUILD != "true" && ($CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "master-2.0" || $CI_COMMIT_BRANCH =~ /^master-.*$/)'
+    - if: '$FULL == "true" && ($CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "develop-3.0" || $CI_COMMIT_BRANCH == "master-2.0" || $CI_COMMIT_BRANCH == "master-3.0")'
+    - if: '$FULL != "true" && $BUILD != "true" && $CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "develop" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "develop-3.0" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "master-2.0" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "master-3.0" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^master-.*$/ || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^develop-.*$/)'
+    - if: '$FULL != "true" && $BUILD != "true" && ($CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "develop-3.0" || $CI_COMMIT_BRANCH == "master-2.0" || $CI_COMMIT_BRANCH == "master-3.0" || $CI_COMMIT_BRANCH =~ /^master-.*$/ || $CI_COMMIT_BRANCH =~ /^develop-.*$/)'
 
 .owasp-rules: &owasp-rules
   rules:
@@ -78,11 +78,11 @@ stages:
       when: never
     - if: '$BUILD == "true" && $FULL != "true"'
       when: never
-    - if: '$FULL == "true" && $CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "develop" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "master-2.0")'
+    - if: '$FULL == "true" && $CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "develop" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "develop-3.0" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "master-2.0" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "master-3.0")'
     - if: '$FULL == "true" && $CI_PIPELINE_SOURCE == "web"'
-    - if: '$FULL == "true" && ($CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "master-2.0")'
-    - if: '$FULL != "true" && $BUILD != "true" && $CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "develop" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "master-2.0" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^master-.*$/)'
-    - if: '$FULL != "true" && $BUILD != "true" && ($CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "master-2.0" || $CI_COMMIT_BRANCH =~ /^master-.*$/)'
+    - if: '$FULL == "true" && ($CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "develop-3.0" || $CI_COMMIT_BRANCH == "master-2.0" || $CI_COMMIT_BRANCH == "master-3.0")'
+    - if: '$FULL != "true" && $BUILD != "true" && $CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "develop" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "develop-3.0" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "master-2.0" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "master-3.0" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^master-.*$/ || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^develop-.*$/)'
+    - if: '$FULL != "true" && $BUILD != "true" && ($CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "develop-3.0" || $CI_COMMIT_BRANCH == "master-2.0" || $CI_COMMIT_BRANCH == "master-3.0" || $CI_COMMIT_BRANCH =~ /^master-.*$/ || $CI_COMMIT_BRANCH =~ /^develop-.*$/)'
 
 # Job SonarQube centralizado en omnileads/devsecops (templates/sonarqube.yml).
 sonarqube_scan:
@@ -121,7 +121,7 @@ sonarqube_defectdojo_upload:
             exit 1
           fi
           PUSH_ORG="${DOCKER_ORG}"
-        elif [[ "${CI_COMMIT_BRANCH}" == "master-2.0" ]]; then
+        elif [[ "${CI_COMMIT_BRANCH}" == "master-2.0" || "${CI_COMMIT_BRANCH}" == "master-3.0" ]]; then
           PUSH_ORG="omnileads"
         else
           PUSH_ORG="freetechsolutions"
