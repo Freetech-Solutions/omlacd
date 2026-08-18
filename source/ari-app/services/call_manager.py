@@ -518,6 +518,8 @@ class CallActionService:
                     "campaign_id": id_camp,  # alias para router (meta.get("campaign_id"))
                     "id_customer": metadata.get("id_customer", metadata.get("contact_id", "")),
                     "tel_customer": metadata.get("tel_customer", metadata.get("phone_number", number)),
+                    # ART: marcado al create del canal PSTN; Dial ANSWER calcula ring_duration.
+                    "originate_ts": datetime.now().astimezone().isoformat(),
                 }
                 if related_call_id:
                     stored_meta["related_call_id"] = related_call_id

@@ -111,6 +111,27 @@ class TestVoicebotActiveCalls(unittest.TestCase):
             "PSTN_CHANNEL_ID",
         )
 
+    def test_register_increments_maxqcalls_counter_once(self):
+        """El cupo MAXQCALLS se toma al registrar (bot contestó), una sola vez por call_id."""
+        self.redis.hexists.return_value = False
+
+        self.service.register_voicebot_active_call(
+            self.agent_id, "call-1", "bridge-1", campaign_id=20, contact_number="111"
+        )
+
+        counter_key = RedisKeys.voicebot_calls("20", self.agent_id)
+        self.redis.incr.assert_called_once_with(counter_key)
+
+    def test_register_is_idempotent_for_counter(self):
+        """Re-registrar el mismo call_id no vuelve a incrementar el contador."""
+        self.redis.hexists.return_value = True  # ya estaba registrado
+
+        self.service.register_voicebot_active_call(
+            self.agent_id, "call-1", "bridge-1", campaign_id=20, contact_number="111"
+        )
+
+        self.redis.incr.assert_not_called()
+
     def test_release_voicebot_call_decr_and_unregister(self):
         self.redis.hexists.return_value = True
         self.redis.hgetall.return_value = {}

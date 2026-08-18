@@ -171,6 +171,13 @@ class Settings(BaseSettings):
         description="TTL en segundos de espera del comando Redis tras REFER desde voicebot antes de iniciar distribución",
         validation_alias=AliasChoices('VOICEBOT_TRANSFER_WAIT_TTL_SEC', 'ACD_WEBHOOK_TRANSFER_TTL'),
     )
+    # TTL del comando voicebot_transfer_proceed recibido antes de que el REFER registre el waiter
+    VOICEBOT_TRANSFER_PENDING_CMD_TTL_SEC: int = Field(
+        default=30,
+        ge=1,
+        le=300,
+        description="TTL en segundos del comando voicebot_transfer_proceed pendiente cuando llega antes que el waiter del REFER (race comando/REFER)",
+    )
 
     # Prometheus (métricas)
     PROMETHEUS_METRICS_PORT: int = Field(default=7088, ge=1, le=65535, description="Puerto del servidor HTTP de métricas Prometheus")

@@ -209,6 +209,13 @@ class LegacyEventForwarder:
                 **business_fields,
                 "callid": callid,
             }
+            # ART: solo Dial ANSWER to_pstn con originate_ts en pending (campo opcional).
+            if is_pstn and dialstatus == "ANSWER" and peer_id and self.pending_dial_store:
+                ring_duration = self._compute_ring_duration_from_pending(
+                    str(peer_id), event.get("timestamp"),
+                )
+                if ring_duration is not None:
+                    event_with_call_type["ring_duration"] = ring_duration
             event_json = json.dumps(event_with_call_type)
             payload = bytes(event_json, encoding="utf8")
 
@@ -229,6 +236,47 @@ class LegacyEventForwarder:
         except Exception as e:
             self.logger.error("Error forwarding Dial event: %s", e)
             self.client = None
+
+    @staticmethod
+    def _parse_iso_timestamp(ts_str: Optional[str]) -> Optional[datetime]:
+        """Parsea timestamp ISO (con o sin Z) a datetime aware; None si inválido."""
+        if not ts_str or not isinstance(ts_str, str):
+            return None
+        try:
+            dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=datetime.now().astimezone().tzinfo)
+            return dt
+        except (ValueError, TypeError):
+            return None
+
+    def _compute_ring_duration_from_pending(
+        self,
+        peer_id: str,
+        answer_ts_raw: Optional[str],
+    ) -> Optional[float]:
+        """
+        ART en segundos: answer_ts - originate_ts (pending_dial_store).
+        Retorna None si falta metadata u originate_ts inválido (forward sin el campo).
+        """
+        if not self.pending_dial_store or not peer_id:
+            return None
+        meta = self.pending_dial_store.get(peer_id) or {}
+        originate_dt = self._parse_iso_timestamp(meta.get("originate_ts"))
+        if originate_dt is None:
+            return None
+        answer_dt = self._parse_iso_timestamp(answer_ts_raw)
+        if answer_dt is None:
+            answer_dt = datetime.now().astimezone()
+        try:
+            if answer_dt.tzinfo is None and originate_dt.tzinfo is not None:
+                answer_dt = answer_dt.replace(tzinfo=originate_dt.tzinfo)
+            elif originate_dt.tzinfo is None and answer_dt.tzinfo is not None:
+                originate_dt = originate_dt.replace(tzinfo=answer_dt.tzinfo)
+            duration = (answer_dt - originate_dt).total_seconds()
+            return max(0.0, float(duration))
+        except (TypeError, ValueError):
+            return None
 
     def should_forward_dial(self, event: Dict[str, Any]) -> bool:
         """
@@ -676,6 +724,68 @@ class LegacyEventForwarder:
                     contact_id,
                 )
 
+    def compute_amd_duration_sec(
+        self,
+        amd_start_ts: Optional[str],
+        end_ts_raw: Optional[str] = None,
+    ) -> Optional[float]:
+        """
+        Segundos entre amd_start_ts (pending_amd) y fin del análisis AMD.
+        None si falta amd_start_ts (ACD viejo / no instrumentado).
+        """
+        start_dt = self._parse_iso_timestamp(amd_start_ts)
+        if start_dt is None:
+            return None
+        end_dt = self._parse_iso_timestamp(end_ts_raw)
+        if end_dt is None:
+            end_dt = datetime.now().astimezone()
+        try:
+            if end_dt.tzinfo is None and start_dt.tzinfo is not None:
+                end_dt = end_dt.replace(tzinfo=start_dt.tzinfo)
+            elif start_dt.tzinfo is None and end_dt.tzinfo is not None:
+                start_dt = start_dt.replace(tzinfo=end_dt.tzinfo)
+            return max(0.0, float((end_dt - start_dt).total_seconds()))
+        except (TypeError, ValueError):
+            return None
+
+    def submit_amd_latency(
+        self,
+        campaign_id: Any,
+        amd_duration: float,
+        callid: Optional[str] = None,
+    ) -> None:
+        """
+        Envía AmdLatency a process-event (solo métrica; sin status/DECR).
+        Usado en HUMAN y MACHINE al salir del dialplan [amd].
+        """
+        try:
+            duration = max(0.0, float(amd_duration))
+        except (TypeError, ValueError):
+            return
+        if campaign_id in (None, ""):
+            return
+        payload_dict = {
+            "type": "AmdLatency",
+            "id_campaign": str(campaign_id),
+            "amd_duration": duration,
+            "callid": callid or "",
+        }
+        if not self.client:
+            self._connect()
+        if not self.client:
+            return
+        payload_bytes = bytes(json.dumps(payload_dict), encoding="utf8")
+        self._submit_process_event(
+            payload_bytes,
+            context="submit_amd_latency",
+            summary={"campaign_id": campaign_id, "amd_duration": duration},
+        )
+        self.logger.debug(
+            "Forwarded AmdLatency to Gearman: campaign_id=%s amd_duration=%s",
+            campaign_id,
+            duration,
+        )
+
     def submit_dial_amd(
         self, campaign_id: Any, contact_id: Any, number: str, callid: Optional[str] = None
     ) -> None:
@@ -724,17 +834,63 @@ class LegacyEventForwarder:
         (set_contact_status, decrement, send-reports, final_status=2). Usado cuando
         ChannelDestroyed con state=Up y duración < umbral.
         """
+        self._submit_dial_status(
+            "EXIT_SHORTCALL", campaign_id, contact_id, number, callid=callid
+        )
+
+    def submit_dial_exit_abandon(
+        self, campaign_id: Any, contact_id: Any, number: str, callid: Optional[str] = None
+    ) -> None:
+        """
+        Envía a process-event un Dial EXIT_ABANDON (PSTN contestó, cliente abandonó
+        la cola sin agente). El dialer contabiliza status propio sin incidence rules
+        y libera OML:CALLS.
+        """
+        self._submit_dial_status(
+            "EXIT_ABANDON", campaign_id, contact_id, number, callid=callid
+        )
+
+    def submit_dial_exit_timeout(
+        self, campaign_id: Any, contact_id: Any, number: str, callid: Optional[str] = None
+    ) -> None:
+        """
+        Envía a process-event un Dial EXIT_TIMEOUT (PSTN contestó, timeout de cola
+        sin agente). El dialer contabiliza status propio sin incidence rules
+        y libera OML:CALLS.
+        """
+        self._submit_dial_status(
+            "EXIT_TIMEOUT", campaign_id, contact_id, number, callid=callid
+        )
+
+    def submit_dial_exit_answered(
+        self,
+        campaign_id: Any,
+        contact_id: Any,
+        number: str,
+        agent_duration: float,
+        callid: Optional[str] = None,
+    ) -> None:
+        """
+        Envía a process-event un Dial EXIT_ANSWERED con agent_duration para que el
+        dialer actualice el ATT (Average Talk Time) de la campaña en Redis DB3.
+        No libera OML:CALLS (eso lo hace ChannelDestroyed); no hacer cleanup_pending_dial.
+        """
+        try:
+            duration = max(0.0, float(agent_duration))
+        except (TypeError, ValueError):
+            duration = 0.0
         payload_dict = self._attach_business_fields(
             {
                 "type": "Dial",
                 "call_type": "to_pstn",
-                "dialstatus": "EXIT_SHORTCALL",
+                "dialstatus": "EXIT_ANSWERED",
                 "callid": callid or "",
+                "agent_duration": duration,
             },
             campaign_id=campaign_id,
             contact_id=contact_id,
             phone_number=number,
-            context="submit_dial_exit_shortcall",
+            context="submit_dial_exit_answered",
         )
         if not payload_dict:
             return
@@ -745,13 +901,19 @@ class LegacyEventForwarder:
         payload_bytes = bytes(json.dumps(payload_dict), encoding="utf8")
         self._submit_process_event(
             payload_bytes,
-            context="submit_dial_exit_shortcall",
-            summary={"campaign_id": campaign_id, "contact_id": contact_id},
+            context="submit_dial_exit_answered",
+            summary={
+                "campaign_id": campaign_id,
+                "contact_id": contact_id,
+                "agent_duration": duration,
+            },
         )
         self.logger.debug(
-            "Forwarded Dial EXIT_SHORTCALL to Gearman: campaign_id=%s contact_id=%s",
+            "Forwarded Dial EXIT_ANSWERED to Gearman: campaign_id=%s contact_id=%s "
+            "agent_duration=%s",
             campaign_id,
             contact_id,
+            duration,
         )
 
     def flush_pending_dialer_decrements_on_shutdown(self) -> int:

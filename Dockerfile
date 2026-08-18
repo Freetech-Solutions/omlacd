@@ -7,7 +7,7 @@ COPY build/requirements.txt /
 
 # sngrep: debug SIP. git solo para pip VCS (gearman3); se purga al final
 # para no dejar Perl/CVEs de git en la imagen runtime.
-RUN apt update && apt install -y --no-install-recommends \
+RUN apt update && apt upgrade -y && apt install -y --no-install-recommends \
     sngrep \
     git \
     && pip install --no-cache-dir --upgrade pip \
