@@ -74,7 +74,13 @@ from models import ChannelDestroyedEvent  # noqa: E402
 from state import CallContext, CallType as StateCallType  # noqa: E402
 
 
-def _make_handler(state_store=None, reporter=None, distribution_service=None):
+def _make_handler(
+    state_store=None,
+    reporter=None,
+    distribution_service=None,
+    legacy_forwarder=None,
+    pstn_reported_store=None,
+):
     store = state_store or MagicMock()
     rep = reporter or MagicMock()
     dist = distribution_service or MagicMock()
@@ -89,7 +95,8 @@ def _make_handler(state_store=None, reporter=None, distribution_service=None):
         redis_client=MagicMock(),
         agent_status_service=None,
         route_validator=None,
-        pstn_reported_store=MagicMock(),
+        pstn_reported_store=pstn_reported_store if pstn_reported_store is not None else MagicMock(),
+        legacy_forwarder=legacy_forwarder,
     )
 
 
@@ -228,6 +235,144 @@ class TestFinalizeProgressivePstnEnd(unittest.TestCase):
 
         dist.stop_distribution.assert_called_once_with("prog-1")
         handler.ari_client.destroy_bridge.assert_called_once_with("bridge-1")
+
+    def test_abandon_notifies_dialer_via_legacy_forwarder(self):
+        state_store = MagicMock()
+        reporter = MagicMock()
+        legacy_forwarder = MagicMock()
+        context = _progressive_context(agent_answered=False)
+        # Sin queue timeout: evita que bridge_wait_time vs clock marque EXIT_TIMEOUT.
+        context.queue_timeout_seconds = None
+        state_store.get_by_channel.return_value = context
+        state_store.mark_call_ended_atomic.return_value = True
+        state_store.get.return_value = context
+        state_store.lock.return_value.__enter__ = MagicMock(return_value=None)
+        state_store.lock.return_value.__exit__ = MagicMock(return_value=False)
+
+        handler = _make_handler(
+            state_store=state_store,
+            reporter=reporter,
+            legacy_forwarder=legacy_forwarder,
+        )
+        handler.on_pstn_stasis_end("pstn-ch-1")
+
+        reporter.log_segment_end.assert_called_once()
+        self.assertEqual(
+            reporter.log_segment_end.call_args.kwargs.get("event_final"),
+            "EXIT_ABANDON",
+        )
+        legacy_forwarder.submit_dial_exit_abandon.assert_called_once_with(
+            16, 21, "123456766", callid="prog-1",
+        )
+        legacy_forwarder.cleanup_pending_dial.assert_called_once_with("pstn-ch-1")
+        legacy_forwarder.submit_dial_exit_timeout.assert_not_called()
+
+    def test_timeout_notifies_dialer_via_legacy_forwarder(self):
+        state_store = MagicMock()
+        reporter = MagicMock()
+        legacy_forwarder = MagicMock()
+        context = _progressive_context(agent_answered=False)
+        context.queue_timeout_seconds = None
+        state_store.get_by_channel.return_value = context
+        state_store.mark_call_ended_atomic.return_value = True
+        state_store.get.return_value = context
+        state_store.lock.return_value.__enter__ = MagicMock(return_value=None)
+        state_store.lock.return_value.__exit__ = MagicMock(return_value=False)
+
+        handler = _make_handler(
+            state_store=state_store,
+            reporter=reporter,
+            legacy_forwarder=legacy_forwarder,
+        )
+        handler._mark_pstn_hangup_by_app("pstn-ch-1")
+        handler.on_pstn_stasis_end("pstn-ch-1")
+
+        reporter.log_segment_end.assert_called_once()
+        self.assertEqual(
+            reporter.log_segment_end.call_args.kwargs.get("event_final"),
+            "EXIT_TIMEOUT",
+        )
+        legacy_forwarder.submit_dial_exit_timeout.assert_called_once_with(
+            16, 21, "123456766", callid="prog-1",
+        )
+        legacy_forwarder.cleanup_pending_dial.assert_called_once_with("pstn-ch-1")
+        legacy_forwarder.submit_dial_exit_abandon.assert_not_called()
+
+    def test_exit_answered_does_not_notify_dialer_abandon(self):
+        state_store = MagicMock()
+        reporter = MagicMock()
+        legacy_forwarder = MagicMock()
+        context = _progressive_context(agent_answered=True)
+        state_store.get_by_channel.return_value = context
+        state_store.mark_call_ended_atomic.return_value = True
+        state_store.get.return_value = context
+        state_store.lock.return_value.__enter__ = MagicMock(return_value=None)
+        state_store.lock.return_value.__exit__ = MagicMock(return_value=False)
+
+        handler = _make_handler(
+            state_store=state_store,
+            reporter=reporter,
+            legacy_forwarder=legacy_forwarder,
+        )
+        event = MagicMock(spec=ChannelDestroyedEvent)
+        event.channel = MagicMock()
+        event.channel.id = "pstn-ch-1"
+        handler.on_failure(event)
+
+        legacy_forwarder.submit_dial_exit_abandon.assert_not_called()
+        legacy_forwarder.submit_dial_exit_timeout.assert_not_called()
+        legacy_forwarder.submit_dial_exit_answered.assert_called_once()
+        call_kwargs = legacy_forwarder.submit_dial_exit_answered.call_args
+        self.assertEqual(call_kwargs[0][0], 16)
+        self.assertEqual(call_kwargs[0][1], 21)
+        self.assertEqual(call_kwargs[0][2], "123456766")
+        self.assertEqual(call_kwargs.kwargs.get("callid"), "prog-1")
+        legacy_forwarder.cleanup_pending_dial.assert_not_called()
+
+
+class TestQueueTimeoutDialerCallback(unittest.TestCase):
+    """Timeout de cola progressive acusa EXIT_TIMEOUT al dialer y marca pstn_reported_store."""
+
+    def test_on_queue_timeout_for_dialer_submits_exit_timeout(self):
+        state_store = MagicMock()
+        legacy_forwarder = MagicMock()
+        pstn_reported_store = MagicMock()
+        context = _progressive_context(agent_answered=False)
+        state_store.get.return_value = context
+
+        handler = _make_handler(
+            state_store=state_store,
+            legacy_forwarder=legacy_forwarder,
+            pstn_reported_store=pstn_reported_store,
+        )
+        handler._on_queue_timeout_for_dialer("prog-1", "pstn-ch-1")
+
+        with handler._pstn_hangup_lock:
+            self.assertIn("pstn-ch-1", handler._pstn_hangup_initiated_by_app)
+        pstn_reported_store.add.assert_called_once_with("pstn-ch-1")
+        legacy_forwarder.submit_dial_exit_timeout.assert_called_once_with(
+            16, 21, "123456766", callid="prog-1",
+        )
+        legacy_forwarder.cleanup_pending_dial.assert_called_once_with("pstn-ch-1")
+        legacy_forwarder.submit_dial_exit_shortcall.assert_not_called()
+        legacy_forwarder.submit_dial_exit_abandon.assert_not_called()
+
+    def test_on_queue_timeout_for_dialer_without_context_skips_dialer(self):
+        state_store = MagicMock()
+        legacy_forwarder = MagicMock()
+        pstn_reported_store = MagicMock()
+        state_store.get.return_value = None
+
+        handler = _make_handler(
+            state_store=state_store,
+            legacy_forwarder=legacy_forwarder,
+            pstn_reported_store=pstn_reported_store,
+        )
+        handler._on_queue_timeout_for_dialer("prog-missing", "pstn-ch-1")
+
+        pstn_reported_store.add.assert_called_once_with("pstn-ch-1")
+        legacy_forwarder.submit_dial_exit_timeout.assert_not_called()
+        legacy_forwarder.cleanup_pending_dial.assert_not_called()
 
 
 if __name__ == "__main__":

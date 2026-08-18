@@ -493,7 +493,25 @@ class AgentStatusService:
                 "node_id": str(node_id),
             }
             active_key = RedisKeys.voicebot_active_calls(agent_id)
+            already_registered = bool(self.redis_client.hexists(active_key, str(call_id)))
             self.redis_client.hset(active_key, str(call_id), json.dumps(payload))
+
+            # El cupo MAXQCALLS (contador VOICEBOT-CALLS) se incrementa aquí, cuando el
+            # voicebot ya contestó y la llamada queda registrada: así INCR+HSET quedan
+            # ligados y release_voicebot_call (DECR+HDEL) es exactamente simétrico.
+            # Incrementar al originar (antes del answer) fugaba cupo cuando la llamada
+            # moría con el originate en vuelo, ya que la liberación exige el registro.
+            if not already_registered and campaign_id is not None and str(campaign_id).strip():
+                try:
+                    self.redis_client.incr(RedisKeys.voicebot_calls(str(campaign_id), agent_id))
+                except Exception as e:
+                    self.logger.warning(
+                        "register_voicebot_active_call: error INCR VOICEBOT-CALLS campaña %s "
+                        "agente %s: %s",
+                        campaign_id,
+                        agent_id,
+                        e,
+                    )
 
             try:
                 agent_key = RedisKeys.agent_hash(str(agent_id))

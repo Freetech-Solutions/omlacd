@@ -75,8 +75,9 @@ class CommandDispatcher:
                         f"CommandDispatcher: voicebot_transfer_proceed despertó waiter para call_id={call_id}"
                     )
                 else:
-                    self.logger.warning(
-                        f"CommandDispatcher: voicebot_transfer_proceed sin waiter registrado para call_id={call_id}"
+                    self.logger.info(
+                        f"CommandDispatcher: voicebot_transfer_proceed para call_id={call_id} "
+                        "quedó pendiente (llegó antes que el REFER registre el waiter)"
                     )
             else:
                 self.logger.warning(

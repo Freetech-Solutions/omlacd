@@ -192,6 +192,80 @@ def test_submit_dial_chanunavail_includes_business_fields():
     assert payload["callid"] == "1785716490.116"
 
 
+def test_submit_dial_exit_abandon_includes_business_fields():
+    forwarder = LegacyEventForwarder()
+    forwarder.client = MagicMock()
+
+    forwarder.submit_dial_exit_abandon(
+        campaign_id=16, contact_id=21, number="123456766", callid="prog-1",
+    )
+
+    assert forwarder.client.submit_job.call_count == 1
+    payload = _decode_payload(forwarder.client.submit_job.call_args_list[0])
+    assert payload["type"] == "Dial"
+    assert payload["call_type"] == "to_pstn"
+    assert payload["dialstatus"] == "EXIT_ABANDON"
+    assert payload["id_campaign"] == "16"
+    assert payload["contact_id"] == "21"
+    assert payload["phone_number"] == "123456766"
+    assert payload["callid"] == "prog-1"
+
+
+def test_submit_dial_exit_timeout_includes_business_fields():
+    forwarder = LegacyEventForwarder()
+    forwarder.client = MagicMock()
+
+    forwarder.submit_dial_exit_timeout(
+        campaign_id=16, contact_id=21, number="123456766", callid="prog-timeout",
+    )
+
+    assert forwarder.client.submit_job.call_count == 1
+    payload = _decode_payload(forwarder.client.submit_job.call_args_list[0])
+    assert payload["type"] == "Dial"
+    assert payload["call_type"] == "to_pstn"
+    assert payload["dialstatus"] == "EXIT_TIMEOUT"
+    assert payload["id_campaign"] == "16"
+    assert payload["contact_id"] == "21"
+    assert payload["phone_number"] == "123456766"
+    assert payload["callid"] == "prog-timeout"
+
+
+def test_submit_dial_exit_answered_includes_agent_duration():
+    forwarder = LegacyEventForwarder()
+    forwarder.client = MagicMock()
+
+    forwarder.submit_dial_exit_answered(
+        campaign_id=16,
+        contact_id=21,
+        number="123456766",
+        agent_duration=42.5,
+        callid="prog-answered",
+    )
+
+    assert forwarder.client.submit_job.call_count == 1
+    payload = _decode_payload(forwarder.client.submit_job.call_args_list[0])
+    assert payload["type"] == "Dial"
+    assert payload["call_type"] == "to_pstn"
+    assert payload["dialstatus"] == "EXIT_ANSWERED"
+    assert payload["id_campaign"] == "16"
+    assert payload["contact_id"] == "21"
+    assert payload["phone_number"] == "123456766"
+    assert payload["callid"] == "prog-answered"
+    assert payload["agent_duration"] == 42.5
+
+
+def test_submit_dial_exit_answered_clamps_negative_duration():
+    forwarder = LegacyEventForwarder()
+    forwarder.client = MagicMock()
+
+    forwarder.submit_dial_exit_answered(
+        campaign_id=1, contact_id=2, number="1", agent_duration=-5, callid="x",
+    )
+
+    payload = _decode_payload(forwarder.client.submit_job.call_args_list[0])
+    assert payload["agent_duration"] == 0.0
+
+
 def test_handle_dial_event_uses_pending_metadata_for_business_fields():
     pending_store = PendingDialMetadataStore()
     pending_store.register(
@@ -314,3 +388,162 @@ def test_handle_dial_event_forwards_cancel_to_agent():
     payload = _decode_payload(forwarder.client.submit_job.call_args_list[0])
     assert payload["dialstatus"] == "CANCEL"
     assert payload["call_type"] == "to_agent"
+
+
+def test_handle_dial_answer_to_pstn_includes_ring_duration():
+    from datetime import datetime, timedelta, timezone
+
+    peer_id = "PJSIP-ART"
+    originate = datetime(2026, 8, 7, 12, 0, 0, tzinfo=timezone.utc)
+    answer = originate + timedelta(seconds=8.5)
+    pending_store = PendingDialMetadataStore()
+    pending_store.register(
+        peer_id,
+        {
+            "call_type": "2",
+            "channel_type": "to_pstn",
+            "id_camp": "7",
+            "id_customer": "55",
+            "tel_customer": "11445566",
+            "originate_ts": originate.isoformat(),
+        },
+    )
+    event = {
+        "type": "Dial",
+        "dialstatus": "ANSWER",
+        "timestamp": answer.isoformat().replace("+00:00", "Z"),
+        "dialstring": "11445566@trunk",
+        "peer": {
+            "id": peer_id,
+            "dialplan": {"app_data": "(Outgoing Line)"},
+        },
+    }
+    forwarder = LegacyEventForwarder(pending_dial_store=pending_store)
+    forwarder.client = MagicMock()
+    forwarder.handle_dial_event(event)
+
+    assert forwarder.client.submit_job.call_count == 1
+    payload = _decode_payload(forwarder.client.submit_job.call_args_list[0])
+    assert payload["dialstatus"] == "ANSWER"
+    assert payload["call_type"] == "to_pstn"
+    assert "ring_duration" in payload
+    assert abs(payload["ring_duration"] - 8.5) < 0.01
+
+
+def test_handle_dial_answer_to_pstn_omits_ring_duration_without_originate_ts():
+    pending_store = _pending_pstn("PJSIP-NO-ART")
+    event = {
+        "type": "Dial",
+        "dialstatus": "ANSWER",
+        "timestamp": "2026-08-07T12:00:08Z",
+        "dialstring": "11445566@trunk",
+        "peer": {
+            "id": "PJSIP-NO-ART",
+            "dialplan": {"app_data": "(Outgoing Line)"},
+        },
+    }
+    forwarder = LegacyEventForwarder(pending_dial_store=pending_store)
+    forwarder.client = MagicMock()
+    forwarder.handle_dial_event(event)
+
+    assert forwarder.client.submit_job.call_count == 1
+    payload = _decode_payload(forwarder.client.submit_job.call_args_list[0])
+    assert payload["dialstatus"] == "ANSWER"
+    assert "ring_duration" not in payload
+
+
+def test_handle_dial_answer_to_agent_omits_ring_duration():
+    from datetime import datetime, timezone
+
+    peer_id = "PJSIP-AGT-ANS"
+    pending_store = PendingDialMetadataStore()
+    pending_store.register(
+        peer_id,
+        {
+            "call_type": "2",
+            "channel_type": "to_agent",
+            "id_camp": "7",
+            "id_customer": "55",
+            "tel_customer": "11445566",
+            "originate_ts": datetime(2026, 8, 7, 12, 0, 0, tzinfo=timezone.utc).isoformat(),
+        },
+    )
+    event = {
+        "type": "Dial",
+        "dialstatus": "ANSWER",
+        "timestamp": "2026-08-07T12:00:08Z",
+        "dialstring": "agent@queue",
+        "peer": {
+            "id": peer_id,
+            "dialplan": {"app_data": "(Outgoing Line)"},
+        },
+    }
+    forwarder = LegacyEventForwarder(pending_dial_store=pending_store)
+    forwarder.client = MagicMock()
+    forwarder.handle_dial_event(event)
+
+    assert forwarder.client.submit_job.call_count == 1
+    payload = _decode_payload(forwarder.client.submit_job.call_args_list[0])
+    assert payload["call_type"] == "to_agent"
+    assert "ring_duration" not in payload
+
+
+def test_compute_ring_duration_clamps_negative():
+    from datetime import datetime, timedelta, timezone
+
+    peer_id = "PJSIP-NEG"
+    originate = datetime(2026, 8, 7, 12, 0, 10, tzinfo=timezone.utc)
+    answer = originate - timedelta(seconds=2)
+    pending_store = PendingDialMetadataStore()
+    pending_store.register(
+        peer_id,
+        {"originate_ts": originate.isoformat()},
+    )
+    forwarder = LegacyEventForwarder(pending_dial_store=pending_store)
+    duration = forwarder._compute_ring_duration_from_pending(
+        peer_id, answer.isoformat(),
+    )
+    assert duration == 0.0
+
+
+def test_compute_amd_duration_sec_from_start_ts():
+    from datetime import datetime, timedelta, timezone
+
+    start = datetime(2026, 8, 10, 12, 0, 0, tzinfo=timezone.utc)
+    end = start + timedelta(seconds=2.5)
+    forwarder = LegacyEventForwarder()
+    duration = forwarder.compute_amd_duration_sec(start.isoformat(), end.isoformat())
+    assert abs(duration - 2.5) < 0.01
+
+
+def test_compute_amd_duration_sec_none_without_start():
+    forwarder = LegacyEventForwarder()
+    assert forwarder.compute_amd_duration_sec(None, "2026-08-10T12:00:00+00:00") is None
+
+
+def test_compute_amd_duration_sec_clamps_negative():
+    from datetime import datetime, timedelta, timezone
+
+    start = datetime(2026, 8, 10, 12, 0, 10, tzinfo=timezone.utc)
+    end = start - timedelta(seconds=3)
+    forwarder = LegacyEventForwarder()
+    assert forwarder.compute_amd_duration_sec(start.isoformat(), end.isoformat()) == 0.0
+
+
+def test_submit_amd_latency_payload():
+    forwarder = LegacyEventForwarder()
+    forwarder.client = MagicMock()
+    forwarder.submit_amd_latency(17, 2.35, callid="call-amd-1")
+    assert forwarder.client.submit_job.call_count == 1
+    payload = _decode_payload(forwarder.client.submit_job.call_args_list[0])
+    assert payload["type"] == "AmdLatency"
+    assert payload["id_campaign"] == "17"
+    assert abs(payload["amd_duration"] - 2.35) < 0.01
+    assert payload["callid"] == "call-amd-1"
+
+
+def test_submit_amd_latency_skips_invalid_campaign():
+    forwarder = LegacyEventForwarder()
+    forwarder.client = MagicMock()
+    forwarder.submit_amd_latency(None, 1.0, callid="x")
+    forwarder.client.submit_job.assert_not_called()

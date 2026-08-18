@@ -8,7 +8,7 @@ from constants import (
     CallType,
     ChannelType,
     HangupCause,
-    SHORTCALL_DURATION_THRESHOLD_SEC,
+    RedisKeys,
     map_unanswered_hangup_to_event,
 )
 from models import (
@@ -47,7 +47,6 @@ from state_helpers import (
 from utils import parse_ari_args
 from log_config import set_log_call_id
 
-
 def _build_sip_refer_context(
     state_store: CallRegistry,
     transfer_manager: Any,
@@ -66,7 +65,6 @@ def _build_sip_refer_context(
         redis_client=redis_client,
         on_queue_timeout_callback=on_queue_timeout_callback,
     )
-
 
 class AcDRouter:
     """
@@ -111,6 +109,7 @@ class AcDRouter:
         self.sip_refer_handlers = sip_refer_handlers
         self.route_validator = route_validator
         self.pstn_reported_store = pstn_reported_store
+        self.redis_client = redis_client
         self.logger = logging.getLogger(__name__)
         # Canales para los que ya se reportó BUSY/CONGESTION/CHANUNAVAIL en evento Dial;
         # no enviar CANCEL en ChannelDestroyed para evitar duplicado.
@@ -126,7 +125,9 @@ class AcDRouter:
         if sip_refer_handlers and transfer_manager and distribution_service and get_campaign_config:
             prog_handler = handlers.get(CallType.PROGRESSIVE.value) if handlers else None
             q_timeout_cb = None
-            if prog_handler is not None and hasattr(prog_handler, "_mark_pstn_hangup_by_app"):
+            if prog_handler is not None and hasattr(prog_handler, "_on_queue_timeout_for_dialer"):
+                q_timeout_cb = prog_handler._on_queue_timeout_for_dialer
+            elif prog_handler is not None and hasattr(prog_handler, "_mark_pstn_hangup_by_app"):
                 q_timeout_cb = lambda _cid, pch: prog_handler._mark_pstn_hangup_by_app(pch)
             self._sip_refer_context = _build_sip_refer_context(
                 state_store,
@@ -166,7 +167,7 @@ class AcDRouter:
                         id_customer = args.get("id_customer") or args.get("contact_id") or ""
                         tel_customer = args.get("tel_customer") or args.get("phone_number") or ""
                         if peer_id and (id_camp or id_customer or tel_customer):
-                            call_id = str(peer_id)
+                            call_id = self._pstn_business_callid(args, peer_id)
                             now_iso = datetime.now().astimezone().isoformat()
                             try:
                                 if peer_id not in self._channel_ids_dial_sent_to_logger:
@@ -234,7 +235,7 @@ class AcDRouter:
                             now_iso = datetime.now().astimezone().isoformat()
                             try:
                                 self.reporter.log_dial(
-                                    call_id=str(peer_id),
+                                    call_id=self._pstn_business_callid(args, peer_id),
                                     numero=tel_customer,
                                     campana_id=id_camp,
                                     contacto_id=id_customer,
@@ -254,7 +255,7 @@ class AcDRouter:
                                     exc_info=True,
                                 )
             elif dialstatus == "ANSWER":
-                # Registrar timestamp de contestación PSTN para EXIT_SHORTCALL (duración < 5s).
+                # Registrar timestamp de contestación PSTN (duración en reporte EXIT_ANSWERED).
                 args = self.legacy_forwarder._get_dial_event_args(event_dict) if self.legacy_forwarder else None
                 if args and args.get("channel_type") in (ChannelType.TO_PSTN.value, "to_pstn"):
                     peer = event_dict.get("peer") or {}
@@ -798,6 +799,125 @@ class AcDRouter:
                     exc_info=True,
                 )
 
+    def _load_pending_amd(self, channel_id: str) -> Optional[Dict[str, Any]]:
+        """JSON de pending_amd en Redis, o None si el canal no está en dialplan [amd]."""
+        if not channel_id or not self.redis_client:
+            return None
+        try:
+            node_id = getattr(self.state_store, "node_id", None) or "default"
+            raw = self.redis_client.get(RedisKeys.pending_amd(node_id, channel_id))
+            if not raw:
+                return None
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8")
+            data = json.loads(raw)
+            return data if isinstance(data, dict) else None
+        except Exception:
+            self.logger.debug(
+                "pending_amd load failed channel_id=%s", channel_id, exc_info=True,
+            )
+            return None
+
+    def _report_exit_amd_on_channel_destroyed(
+        self,
+        channel_id: str,
+        pending_amd: Dict[str, Any],
+        meta: Optional[Dict[str, Any]],
+    ) -> None:
+        """Hangup durante [amd]: CDR EXIT_AMD + Dial AMD al dialer (callid de negocio)."""
+        meta = meta or {}
+        id_camp = pending_amd.get("id_camp") or meta.get("id_camp") or meta.get("campaign_id") or ""
+        id_customer = (
+            pending_amd.get("id_customer")
+            or meta.get("id_customer")
+            or meta.get("contact_id")
+            or ""
+        )
+        tel_customer = (
+            pending_amd.get("tel_customer")
+            or meta.get("tel_customer")
+            or meta.get("phone_number")
+            or ""
+        )
+        call_id = (
+            pending_amd.get("callid")
+            or meta.get("callid")
+            or meta.get("related_call_id")
+            or channel_id
+        )
+        uniqueid = pending_amd.get("uniqueid") or channel_id
+        end_iso = datetime.now().astimezone().isoformat()
+        self.logger.info(
+            "ChannelDestroyed durante AMD: EXIT_AMD callid=%s channel_id=%s camp=%s contact=%s",
+            call_id,
+            channel_id,
+            id_camp,
+            id_customer,
+        )
+        if self.reporter and id_camp:
+            try:
+                call_data = {
+                    "callid": call_id,
+                    "id_camp": id_camp,
+                    "id_customer": id_customer,
+                    "phone_number": tel_customer,
+                    "tel_customer": tel_customer,
+                    "call_type": CallType.DIALER_ID,
+                    "ts_start_iso": end_iso,
+                    "ts_answer_iso": None,
+                }
+                if self.route_validator:
+                    trunk_callerid = self.route_validator.get_trunk_callerid(
+                        id_camp,
+                        override_route_id=(
+                            pending_amd.get("effective_route_id")
+                            or meta.get("effective_route_id")
+                        ),
+                    )
+                    if trunk_callerid is not None:
+                        call_data["numero_origen"] = trunk_callerid
+                self.reporter.log_segment_end(
+                    call_data=call_data,
+                    event_final=HangupCause.EXIT_AMD.value,
+                    is_transfer=False,
+                    quien_corto=0,
+                    uniqueid=uniqueid,
+                    callid=call_id,
+                    end_iso=end_iso,
+                    bridge_wait_time=0.0,
+                    duracion_llamada=0.0,
+                    bot_duration=0.0,
+                    agent_duration=0.0,
+                    channel_leg="PSTN",
+                    channel_leg_id=channel_id,
+                    channel_leg_name=str(channel_id),
+                    channel_leg_start_ts=end_iso,
+                    channel_leg_answer_ts=None,
+                    channel_leg_end_ts=end_iso,
+                )
+            except Exception as e:
+                self.logger.warning(
+                    "Error reportando EXIT_AMD (hangup durante AMD) channel_id=%s: %s",
+                    channel_id,
+                    e,
+                    exc_info=True,
+                )
+        if self.legacy_forwarder and id_camp:
+            self.legacy_forwarder.submit_dial_amd(
+                id_camp,
+                id_customer or "",
+                tel_customer or "",
+                callid=call_id or "",
+            )
+        try:
+            if self.redis_client:
+                node_id = getattr(self.state_store, "node_id", None) or "default"
+                self.redis_client.delete(RedisKeys.pending_amd(node_id, channel_id))
+        except Exception:
+            pass
+        if self.pstn_reported_store and channel_id:
+            self.pstn_reported_store.add(channel_id)
+
     def _cleanup_old_pstn_answer_ts(self) -> None:
         """Elimina entradas con timestamp mayor a _pstn_answer_ts_max_age_sec para evitar crecimiento indefinido."""
         if not self._pstn_answer_ts:
@@ -817,9 +937,49 @@ class AcDRouter:
         for ch_id in to_remove:
             self._pstn_answer_ts.pop(ch_id, None)
 
+    @staticmethod
+    def _pstn_business_callid(source: Optional[Dict[str, Any]], channel_id: str) -> str:
+        """callid de negocio ({epoch}.{contact_id}); no usar uniqueid ARI del canal PSTN."""
+        if source:
+            for key in ("callid", "related_call_id"):
+                val = source.get(key)
+                if val not in (None, ""):
+                    return str(val)
+        return str(channel_id)
+
+    def _maybe_log_dial_for_pstn_channel(
+        self,
+        channel_id: str,
+        *,
+        numero: str,
+        campana_id,
+        contacto_id,
+        now_iso: str,
+        call_id: Optional[str] = None,
+    ) -> None:
+        """Envía DIAL a acd-log-processor una sola vez por canal PSTN (CALL_TYPE:2:DIAL)."""
+        if not channel_id or channel_id in self._channel_ids_dial_sent_to_logger:
+            return
+        if not self.reporter:
+            return
+        self.reporter.log_dial(
+            call_id=str(call_id or channel_id),
+            numero=numero,
+            campana_id=campana_id,
+            contacto_id=contacto_id,
+            agente_id=None,
+            tipo_campana=2,
+            tipo_llamada=2,
+            uniqueid=None,
+            channel_leg="PSTN",
+            channel_leg_id=channel_id,
+            channel_leg_name=str(channel_id),
+            channel_leg_start_ts=now_iso,
+        )
+        self._channel_ids_dial_sent_to_logger.add(channel_id)
+
     def _handle_channel_destroyed(self, event: ChannelDestroyedEvent) -> None:
         channel_id = event.channel.id
-        self._channel_ids_dial_sent_to_logger.discard(channel_id)
         is_cancel_path = False
         early_fail_event = None  # CANCEL / 603_DECLINED / 404_NOT_FOUND / …
         event_final_for_dialer = None
@@ -832,7 +992,7 @@ class AcDRouter:
         # 480→480_TEMPORARILY_UNAVAILABLE, 487→487_REQUEST_TERMINATED,
         # 488→488_NOT_ACCEPTABLE_HERE, 608→608_REJECTED); fallback CANCEL.
         # Si state=Up y hay meta, contestó y colgó sin contexto (p. ej. durante AMD):
-        # reportar EXIT_SHORTCALL o EXIT_ANSWERED.
+        # reportar EXIT_ANSWERED (nunca EXIT_SHORTCALL sin AGENT_ANSWER / bridge ACD–agente).
         # No reportar si ya se reportó BUSY/CONGESTION/CHANUNAVAIL en el evento Dial.
         if self.legacy_forwarder and self.reporter:
             channel_state = getattr(event.channel, "state", None) or ""
@@ -854,7 +1014,7 @@ class AcDRouter:
                 id_camp = meta.get("id_camp") or meta.get("campaign_id") or ""
                 id_customer = meta.get("id_customer") or meta.get("contact_id") or ""
                 tel_customer = meta.get("tel_customer") or meta.get("phone_number") or ""
-                call_id = str(channel_id)
+                call_id = self._pstn_business_callid(meta, channel_id)
                 now_iso = datetime.now().astimezone().isoformat()
                 custom_data = {}
                 if tech_cause is not None:
@@ -864,19 +1024,13 @@ class AcDRouter:
                     except (TypeError, ValueError):
                         custom_data["tech_cause"] = tech_cause
                 try:
-                    self.reporter.log_dial(
-                        call_id=call_id,
+                    self._maybe_log_dial_for_pstn_channel(
+                        channel_id,
                         numero=tel_customer,
                         campana_id=id_camp,
                         contacto_id=id_customer,
-                        agente_id=None,
-                        tipo_campana=2,
-                        tipo_llamada=2,
-                        uniqueid=None,
-                        channel_leg="PSTN",
-                        channel_leg_id=channel_id,
-                        channel_leg_name=str(channel_id),
-                        channel_leg_start_ts=now_iso,
+                        now_iso=now_iso,
+                        call_id=call_id,
                     )
                     call_data = {
                         "callid": call_id,
@@ -941,21 +1095,38 @@ class AcDRouter:
                         ctx_by_channel = self.state_store.get_by_channel(channel_id)
                         if ctx_by_channel and getattr(ctx_by_channel, "pstn_channel", None) == channel_id:
                             pstn_cleaned_by_app = True
+                pending_amd = None if pstn_cleaned_by_app else self._load_pending_amd(channel_id)
+                if pending_amd:
+                    # Canal en [amd]: StasisEnd al redirigir deja sin contexto. Si cuelga
+                    # ahí, no inventar EXIT_ANSWERED. Reportar EXIT_AMD + Dial AMD para
+                    # que el primer originate deje CDR y saque el contacto de SELECTED.
+                    self._report_exit_amd_on_channel_destroyed(
+                        channel_id, pending_amd, meta,
+                    )
+                    pstn_cleaned_by_app = True
                 if not pstn_cleaned_by_app:
-                    # Contestó y colgó sin contexto (p. ej. durante AMD): EXIT_SHORTCALL si < 5s, si no EXIT_ANSWERED.
+                    meta_callid = (meta or {}).get("callid") or (meta or {}).get("related_call_id")
+                    if meta_callid and str(meta_callid) != str(channel_id):
+                        # Canal PSTN peer/duplicado: el CDR de negocio usa callid,
+                        # no el uniqueid ARI del canal.
+                        pstn_cleaned_by_app = True
+                if not pstn_cleaned_by_app:
+                    # Contestó y colgó sin contexto (p. ej. durante AMD).
+                    # EXIT_SHORTCALL solo aplica si el bridge ACD–agente estuvo establecido
+                    # (agent_answered). Sin agente NUNCA shortcall: reportar EXIT_ANSWERED.
                     id_camp = meta.get("id_camp") or meta.get("campaign_id") or ""
                     id_customer = meta.get("id_customer") or meta.get("contact_id") or ""
                     tel_customer = meta.get("tel_customer") or meta.get("phone_number") or ""
-                    # No reportar EXIT_SHORTCALL/EXIT_ANSWERED sin campaña (evita interactions_summary sin Redis)
+                    # No reportar EXIT_ANSWERED sin campaña (evita interactions_summary sin Redis)
                     if not id_camp or (isinstance(id_camp, (int, float)) and int(id_camp) == 0) or (
                         isinstance(id_camp, str) and str(id_camp).strip() == ""
                     ):
                         self.logger.warning(
-                            "No se puede reportar EXIT_SHORTCALL/EXIT_ANSWERED sin campaña (channel_id=%s, meta sin id_camp/campaign_id)",
+                            "No se puede reportar EXIT_ANSWERED sin campaña (channel_id=%s, meta sin id_camp/campaign_id)",
                             channel_id,
                         )
                     else:
-                        call_id = str(channel_id)
+                        call_id = self._pstn_business_callid(meta, channel_id)
                         now = datetime.now().astimezone()
                         now_iso = now.isoformat()
                         answer_ts_str = self._pstn_answer_ts.pop(channel_id, None)
@@ -970,26 +1141,18 @@ class AcDRouter:
                                 answer_ts_iso = answer_ts_str
                             except (ValueError, TypeError):
                                 pass
-                        event_final = (
-                            HangupCause.EXIT_SHORTCALL.value
-                            if duracion_llamada < SHORTCALL_DURATION_THRESHOLD_SEC
-                            else HangupCause.EXIT_ANSWERED.value
-                        )
+                        # Fallback sin contexto vinculado: no hay evidencia de AGENT_ANSWER.
+                        # SHORTCALL solo con bridge ACD–agente; aquí siempre EXIT_ANSWERED.
+                        event_final = HangupCause.EXIT_ANSWERED.value
                         event_final_for_dialer = event_final
                         try:
-                            self.reporter.log_dial(
-                                call_id=call_id,
+                            self._maybe_log_dial_for_pstn_channel(
+                                channel_id,
                                 numero=tel_customer,
                                 campana_id=id_camp,
                                 contacto_id=id_customer,
-                                agente_id=None,
-                                tipo_campana=2,
-                                tipo_llamada=2,
-                                uniqueid=None,
-                                channel_leg="PSTN",
-                                channel_leg_id=channel_id,
-                                channel_leg_name=str(channel_id),
-                                channel_leg_start_ts=now_iso,
+                                now_iso=now_iso,
+                                call_id=call_id,
                             )
                             call_data = {
                                 "callid": call_id,
@@ -1029,10 +1192,11 @@ class AcDRouter:
                             )
                         except Exception as e:
                             self.logger.warning(
-                                "Error reportando DIALER EXIT_SHORTCALL/EXIT_ANSWERED a acd-log-processor: %s", e,
+                                "Error reportando DIALER EXIT_ANSWERED a acd-log-processor: %s", e,
                                 exc_info=True,
                             )
             self._channel_ids_dial_failure_reported.discard(channel_id)
+            self._channel_ids_dial_sent_to_logger.discard(channel_id)
         # Early-fail (CANCEL/603_DECLINED/404_NOT_FOUND/403_FORBIDDEN/405_NOT_ALLOWED/
         # 406_NO_ACCEPTABLE/408_REQUEST_TIMEOUT/480_TEMPORARILY_UNAVAILABLE/
         # 487_REQUEST_TERMINATED/488_NOT_ACCEPTABLE_HERE/608_REJECTED/

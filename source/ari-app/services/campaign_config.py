@@ -91,7 +91,12 @@ def fetch_campaign_cfg_from_redis(
     external_ag_host = (
         str(external_ag_host_raw).strip() if external_ag_host_raw is not None else ""
     )
-    maxqcall_raw = normalized.get("maxqcall")
+    # Django escribe MAXQCALLS (cola.maxlen). Aceptar maxqcalls y el alias maxqcall.
+    maxqcall_raw = (
+        normalized.get("maxqcalls")
+        or normalized.get("maxqcall")
+        or normalized.get("maxlen")
+    )
     try:
         maxqcall = int(maxqcall_raw) if maxqcall_raw is not None else 10
     except Exception:

@@ -17,6 +17,12 @@ ARI_APP_DIR = os.path.join(SOURCE_DIR, "ari-app")
 if ARI_APP_DIR not in sys.path:
     sys.path.insert(0, ARI_APP_DIR)
 
+os.environ.setdefault("ARI_USER", "test")
+os.environ.setdefault("ARI_PASSWORD", "test")
+os.environ.setdefault("ARI_APP", "test_app")
+os.environ.setdefault("ARI_URL", "http://127.0.0.1:8088")
+os.environ.setdefault("REDIS_URL", "redis://127.0.0.1:6379/0")
+
 sys.modules.setdefault("redis", MagicMock())
 sys.modules.setdefault("gearman", MagicMock())
 
@@ -377,6 +383,55 @@ class TestRouterEarlyPstnFailureReports(unittest.TestCase):
         self.mock_legacy_forwarder.submit_dial_chanunavail.assert_not_called()
         self.mock_legacy_forwarder.submit_dial_noanswer.assert_not_called()
         self.mock_legacy_forwarder.cleanup_pending_dial.assert_called_once_with(self.channel_id)
+
+    def test_destroy_does_not_repeat_log_dial_if_ringing_already_sent(self):
+        """RINGING ya envió DIAL: ChannelDestroyed solo cierra con segment_end."""
+        self.router._channel_ids_dial_sent_to_logger.add(self.channel_id)
+        event = self._event(27, "Destination out of order", None)
+        self.router._handle_channel_destroyed(event)
+
+        self.mock_reporter.log_dial.assert_not_called()
+        self.mock_reporter.log_segment_end.assert_called_once()
+        kwargs = self.mock_reporter.log_segment_end.call_args[1]
+        self.assertEqual(kwargs["event_final"], HangupCause.ERROR.value)
+
+    def test_destroy_sends_log_dial_once_when_not_previously_sent(self):
+        event = self._event(27, "Destination out of order", None)
+        self.router._handle_channel_destroyed(event)
+        self.mock_reporter.log_dial.assert_called_once()
+        self.mock_reporter.log_segment_end.assert_called_once()
+        kwargs = self.mock_reporter.log_segment_end.call_args[1]
+        self.assertEqual(kwargs["callid"], "1785598686.116")
+        self.assertNotEqual(kwargs["callid"], self.channel_id)
+        dial_kwargs = self.mock_reporter.log_dial.call_args[1]
+        self.assertEqual(dial_kwargs["call_id"], "1785598686.116")
+
+    def test_dial_busy_uses_business_callid_not_peer_channel(self):
+        """BUSY no debe usar uniqueid ARI: colisiona con {epoch}.{otro_contact_id} (camp 13 / 4100)."""
+        peer_id = "1787014163.1414"
+        business = "1787014163.4100"
+        self.mock_legacy_forwarder.should_forward_dial.return_value = True
+        self.mock_legacy_forwarder._get_dial_event_args.return_value = {
+            "channel_type": "to_pstn",
+            "id_camp": "13",
+            "id_customer": "4100",
+            "tel_customer": "0940903",
+            "callid": business,
+        }
+        event_dict = {
+            "type": "Dial",
+            "dialstatus": "BUSY",
+            "timestamp": "2026-08-17T21:49:23.144-0300",
+            "peer": {"id": peer_id},
+        }
+        self.router.handle_event(event_dict)
+        self.mock_reporter.log_segment_end.assert_called_once()
+        kwargs = self.mock_reporter.log_segment_end.call_args[1]
+        self.assertEqual(kwargs["event_final"], "BUSY")
+        self.assertEqual(kwargs["callid"], business)
+        self.assertNotEqual(kwargs["callid"], peer_id)
+        dial_kwargs = self.mock_reporter.log_dial.call_args[1]
+        self.assertEqual(dial_kwargs["call_id"], business)
 
 
 if __name__ == "__main__":

@@ -83,6 +83,41 @@ class ProgressiveCampaignHandler(BaseHandler):
         with self._pstn_hangup_lock:
             self._pstn_hangup_initiated_by_app.add(channel_id)
 
+    def _on_queue_timeout_for_dialer(self, call_id: str, pstn_channel_id: str) -> None:
+        """
+        Callback de timeout de cola: marca hangup iniciado por app, acusa EXIT_TIMEOUT
+        al dialer y registra el PSTN en pstn_reported_store para que ChannelDestroyed
+        no invente EXIT_SHORTCALL (DistributionService ya reporta al logger).
+        """
+        if pstn_channel_id:
+            self._mark_pstn_hangup_by_app(pstn_channel_id)
+            if self.pstn_reported_store:
+                self.pstn_reported_store.add(pstn_channel_id)
+
+        if not self.legacy_forwarder or not pstn_channel_id:
+            return
+
+        try:
+            context = self.state_store.get(call_id) if call_id else None
+            id_camp = getattr(context, "id_camp", None) if context else None
+            if id_camp is None:
+                logger.warning(
+                    "_on_queue_timeout_for_dialer: sin id_camp para call_id=%s, no se acusa dialer",
+                    call_id,
+                )
+                return
+            id_customer = (getattr(context, "id_customer", None) or "") if context else ""
+            phone = (getattr(context, "phone_number", None) or "") if context else ""
+            self.legacy_forwarder.submit_dial_exit_timeout(
+                id_camp, id_customer, phone, callid=call_id or ""
+            )
+            self.legacy_forwarder.cleanup_pending_dial(pstn_channel_id)
+        except Exception:
+            logger.exception(
+                "Error acusando EXIT_TIMEOUT al dialer call_id=%s",
+                call_id,
+            )
+
     def _is_pstn_leg_channel(self, channel_id: str, context: CallContext) -> bool:
         pstn_channel = getattr(context, "pstn_channel", None)
         uniqueid_pstn = getattr(context, "uniqueid_pstn", None)
@@ -224,7 +259,31 @@ class ProgressiveCampaignHandler(BaseHandler):
                     )
                 except Exception:
                     logger.exception("Error log_segment_end para %s", call_id)
+            # Acuse al dialer (process-event): EXIT_ABANDON / EXIT_TIMEOUT.
+            # cleanup_pending_dial evita doble DECR vía ChannelDestroyed.
+            if self.legacy_forwarder and context.id_camp is not None:
+                try:
+                    dialer_callid = call_id or uniqueid or ""
+                    id_customer = context.id_customer or ""
+                    phone = context.phone_number or ""
+                    if treat_as_timeout:
+                        self.legacy_forwarder.submit_dial_exit_timeout(
+                            context.id_camp, id_customer, phone, callid=dialer_callid
+                        )
+                    else:
+                        self.legacy_forwarder.submit_dial_exit_abandon(
+                            context.id_camp, id_customer, phone, callid=dialer_callid
+                        )
+                    self.legacy_forwarder.cleanup_pending_dial(channel_id)
+                except Exception:
+                    logger.exception(
+                        "Error acusando EXIT_ABANDON/EXIT_TIMEOUT al dialer call_id=%s",
+                        call_id,
+                    )
         else:
+            bot_duration, agent_duration = compute_bot_agent_durations(
+                context, end_iso, duracion_llamada
+            )
             if self.reporter:
                 try:
                     if context.agent_answered_ts and context.bridge_created_ts:
@@ -260,9 +319,6 @@ class ProgressiveCampaignHandler(BaseHandler):
                         if trunk_callerid is not None:
                             call_data["numero_origen"] = trunk_callerid
                     quien_corto = 1 if getattr(context, "inbound_agent_hung_up_first", False) else 2
-                    bot_duration, agent_duration = compute_bot_agent_durations(
-                        context, end_iso, duracion_llamada
-                    )
                     self.reporter.log_segment_end(
                         call_data=call_data,
                         event_final="EXIT_ANSWERED",
@@ -284,6 +340,21 @@ class ProgressiveCampaignHandler(BaseHandler):
                     )
                 except Exception:
                     logger.exception("Error log_segment_end EXIT_ANSWERED para %s", call_id)
+            # ATT al dialer; sin cleanup_pending_dial (ChannelDestroyed libera OML:CALLS).
+            if self.legacy_forwarder and context.id_camp is not None:
+                try:
+                    self.legacy_forwarder.submit_dial_exit_answered(
+                        context.id_camp,
+                        context.id_customer or "",
+                        context.phone_number or "",
+                        agent_duration,
+                        callid=call_id or uniqueid or "",
+                    )
+                except Exception:
+                    logger.exception(
+                        "Error acusando EXIT_ANSWERED (ATT) al dialer call_id=%s",
+                        call_id,
+                    )
 
     def finalize_progressive_pstn_end(
         self,
@@ -626,6 +697,8 @@ class ProgressiveCampaignHandler(BaseHandler):
                     "maxqcall": campaign_cfg.get("maxqcall", 10),
                     "voicebot": campaign_cfg.get("voicebot"),
                     "voicebot_strategy": campaign_cfg.get("voicebot_strategy", "random"),
+                    # H7: marca el inicio del análisis AMD (dialplan [amd]).
+                    "amd_start_ts": datetime.now().astimezone().isoformat(),
                 }
                 redirect_ok = False
                 try:
@@ -762,7 +835,7 @@ class ProgressiveCampaignHandler(BaseHandler):
                     distribution_metadata=distribution_metadata,
                     external_host=campaign_cfg["external_ag_host"],
                     max_qcalls=campaign_cfg.get("maxqcall", 10),
-                    on_queue_timeout_callback=lambda cid, ch: self._mark_pstn_hangup_by_app(ch),
+                    on_queue_timeout_callback=self._on_queue_timeout_for_dialer,
                 )
             else:
                 self.distribution_service.start_distribution(
@@ -775,7 +848,7 @@ class ProgressiveCampaignHandler(BaseHandler):
                     pstn_channel_id=channel_id,
                     uniqueid=uniqueid,
                     distribution_metadata=distribution_metadata,
-                    on_queue_timeout_callback=lambda cid, ch: self._mark_pstn_hangup_by_app(ch),
+                    on_queue_timeout_callback=self._on_queue_timeout_for_dialer,
                 )
         except Exception:
             logger.exception("Error iniciando distribución para %s", call_id)
@@ -829,6 +902,23 @@ class ProgressiveCampaignHandler(BaseHandler):
         except Exception:
             pass
 
+        id_camp = pending_data.get("id_camp")
+        id_customer = pending_data.get("id_customer")
+        tel_customer = pending_data.get("tel_customer")
+        call_id = pending_data.get("callid") or channel_id
+        uniqueid = pending_data.get("uniqueid") or channel_id
+        end_iso = datetime.now().astimezone().isoformat()
+
+        # H7: latencia AMD → dialer (HUMAN y MACHINE); sin amd_start_ts = no-op.
+        if self.legacy_forwarder and id_camp is not None:
+            amd_duration = self.legacy_forwarder.compute_amd_duration_sec(
+                pending_data.get("amd_start_ts"), end_iso,
+            )
+            if amd_duration is not None:
+                self.legacy_forwarder.submit_amd_latency(
+                    id_camp, amd_duration, callid=call_id or "",
+                )
+
         if amd_status.upper() != "HUMAN":
             logger.info(
                 "ProgressiveCampaignHandler.on_amd_done: AMD resultado no HUMAN (status=%s, cause=%s), colgando canal %s",
@@ -836,12 +926,6 @@ class ProgressiveCampaignHandler(BaseHandler):
                 amd_cause,
                 channel_id,
             )
-            id_camp = pending_data.get("id_camp")
-            id_customer = pending_data.get("id_customer")
-            tel_customer = pending_data.get("tel_customer")
-            call_id = pending_data.get("callid") or channel_id
-            uniqueid = pending_data.get("uniqueid") or channel_id
-            end_iso = datetime.now().astimezone().isoformat()
             # Registrar EXIT_AMD en interactions_summary (vía acd-log-processor)
             if self.reporter and id_camp is not None:
                 try:
@@ -894,6 +978,8 @@ class ProgressiveCampaignHandler(BaseHandler):
                     callid=call_id or "",
                 )
                 self.legacy_forwarder.cleanup_pending_dial(channel_id)
+            if self.pstn_reported_store and channel_id:
+                self.pstn_reported_store.add(channel_id)
             try:
                 self.ari_client.hangup_channel(channel_id)
             except Exception:
@@ -1228,13 +1314,17 @@ class ProgressiveCampaignHandler(BaseHandler):
                         self.state_store.register_unsafe(context.call_id, fresh)
             except Exception:
                 pass
+            # La grabación debe detenerse con la pierna PSTN aún en el bridge: cuando el
+            # último canal real sale, Asterisk expulsa el canal Recorder interno (flag
+            # LONELY) y la live recording se autocompleta; un stop posterior da 404.
+            if bridge_id.strip():
+                self._stop_active_recording(context, bridge_id)
             if pstn_channel.strip():
                 try:
                     self.ari_client.hangup_channel(pstn_channel)
                 except Exception:
                     logger.exception("Error colgando PSTN %s", pstn_channel)
             if bridge_id.strip():
-                self._stop_active_recording(context, bridge_id)
                 try:
                     self.ari_client.destroy_bridge(bridge_id)
                 except Exception:

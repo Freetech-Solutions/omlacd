@@ -637,7 +637,7 @@ def insert_llamada_resumen(message):
             conn.commit()
         
         pg_pool.putconn(conn)
-        
+
         logger.info(
             f"insert_llamada_resumen: Registro insertado/actualizado exitosamente - "
             f"event={event_name}, call_id={callid}"

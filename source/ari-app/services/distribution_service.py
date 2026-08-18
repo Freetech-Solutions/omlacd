@@ -33,12 +33,10 @@ from utils import compute_bot_agent_durations
 if TYPE_CHECKING:
     from services.agent_status_service import AgentStatusService
 
-
 logger = logging.getLogger(__name__)
 
 # Tipo para callback opcional al dispararse el timeout de cola (call_id, pstn_channel_id)
 OnQueueTimeoutCallback = Optional[Callable[[str, str], None]]
-
 
 class DistributionService:
     """
@@ -81,6 +79,20 @@ class DistributionService:
         # Espera de comando Redis tras REFER desde voicebot: (event, payload para start_distribution)
         self._voicebot_transfer_waiters: Dict[str, Tuple[threading.Event, Dict[str, Any]]] = {}
         self._voicebot_transfer_waiters_lock = threading.Lock()
+        # Comandos voicebot_transfer_proceed recibidos ANTES de que el REFER registre el
+        # waiter (race comando Redis vs evento ARI): call_id -> monotonic ts. Se consumen
+        # al registrar el waiter y se purgan por TTL (VOICEBOT_TRANSFER_PENDING_CMD_TTL_SEC).
+        self._voicebot_transfer_pending: Dict[str, float] = {}
+
+    def _purge_voicebot_transfer_pending_locked(self) -> None:
+        """Elimina comandos pendientes expirados. Llamar con _voicebot_transfer_waiters_lock tomado."""
+        ttl = settings.VOICEBOT_TRANSFER_PENDING_CMD_TTL_SEC
+        now = time.monotonic()
+        expired = [
+            cid for cid, ts in self._voicebot_transfer_pending.items() if now - ts > ttl
+        ]
+        for cid in expired:
+            self._voicebot_transfer_pending.pop(cid, None)
 
     def register_voicebot_transfer_waiter(
         self, call_id: str, payload: Dict[str, Any]
@@ -89,25 +101,45 @@ class DistributionService:
         Registra un waiter para que, al recibir comando Redis o cumplirse TTL,
         se invoque start_distribution con payload. Retorna el Event que el thread
         debe esperar (con timeout TTL).
+        Si el comando voicebot_transfer_proceed llegó antes del REFER (race), queda
+        pendiente y se consume aquí: el event retorna ya seteado.
         """
         event = threading.Event()
         with self._voicebot_transfer_waiters_lock:
             self._voicebot_transfer_waiters[call_id] = (event, payload)
+            self._purge_voicebot_transfer_pending_locked()
+            pending_ts = self._voicebot_transfer_pending.pop(call_id, None)
+        if pending_ts is not None:
+            logger.info(
+                "DistributionService: waiter voicebot call_id=%s consume comando "
+                "voicebot_transfer_proceed pendiente (race comando/REFER resuelta)",
+                call_id,
+            )
+            event.set()
         return event
 
     def set_voicebot_transfer_proceed(self, call_id: str) -> bool:
         """
         Despierta al thread que espera tras REFER desde voicebot (hace event.set()).
         No llama a start_distribution; el thread lo hace al despertar.
-        Returns True si había un waiter registrado para call_id.
+        Si no hay waiter activo (el comando llegó antes que el REFER), el comando
+        queda pendiente con TTL corto y se consume en register_voicebot_transfer_waiter.
+        Returns True si había un waiter registrado para call_id; False si quedó pendiente.
         """
         with self._voicebot_transfer_waiters_lock:
             entry = self._voicebot_transfer_waiters.get(call_id)
-        if entry:
-            event, _ = entry
-            event.set()
-            return True
-        return False
+            if entry is None:
+                self._voicebot_transfer_pending[call_id] = time.monotonic()
+                self._purge_voicebot_transfer_pending_locked()
+                logger.info(
+                    "DistributionService: voicebot_transfer_proceed sin waiter activo para "
+                    "call_id=%s; queda pendiente por si el REFER lo registra después",
+                    call_id,
+                )
+                return False
+        event, _ = entry
+        event.set()
+        return True
 
     def unregister_voicebot_transfer_waiter(self, call_id: str) -> None:
         """Elimina el registro de waiter para call_id (tras ejecutar start_distribution o limpieza)."""
@@ -364,7 +396,10 @@ class DistributionService:
     ) -> None:
         """Loop de distribución hacia voicebots: candidatos VOICEBOT=1 (sin exigir READY), origen a PJSIP/sip@{external_host}.
         El orden de candidatos viene de la estrategia (p. ej. \"random\" por defecto vía voicebot_strategy en config).
-        En el futuro la estrategia puede configurarse vía Redis/GUI (clave voicebot_strategy) sin cambiar este loop."""
+        En el futuro la estrategia puede configurarse vía Redis/GUI (clave voicebot_strategy) sin cambiar este loop.
+        Invariante de negocio: una campaña voicebot NUNCA entrega llamadas a agentes humanos desde
+        este loop; ante voicebot ocupado (lock) o tope MAXQCALLS se espera y se reintenta el bot.
+        El handoff a humanos solo ocurre vía SIP REFER (sip_refer_listener → start_distribution)."""
         try:
             logger.info(
                 "[DistributionService] Loop voicebot iniciado para call_id=%s, campaña=%s, external_host=%s",
@@ -456,11 +491,25 @@ class DistributionService:
 
                             voicebot_calls_key = RedisKeys.voicebot_calls(id_camp, candidate.agent_id)
                             try:
-                                self.redis_client.incr(voicebot_calls_key)
-                            except Exception as e:
-                                logger.warning("VoicebotLoop: INCR %s falló: %s", voicebot_calls_key, e)
+                                current_vb = int(self.redis_client.get(voicebot_calls_key) or 0)
+                            except Exception:
+                                current_vb = 0
+                            if max_qcalls > 0 and current_vb >= max_qcalls:
+                                # Regla de negocio: campaña voicebot nunca deriva a humanos
+                                # desde este loop; se espera y se reintenta el voicebot.
+                                logger.info(
+                                    "VoicebotLoop: voicebot %s en tope MAXQCALLS=%s (actual=%s), "
+                                    "se reintenta voicebot call_id=%s",
+                                    candidate.agent_id,
+                                    max_qcalls,
+                                    current_vb,
+                                    call_id,
+                                )
                                 continue
 
+                            # El cupo MAXQCALLS (INCR de VOICEBOT-CALLS) se toma recién en
+                            # register_voicebot_active_call, cuando el bot contesta: originar
+                            # no consume cupo y los originates muertos en vuelo no lo fugan.
                             metadata = {
                                 "id_customer": distribution_metadata.get("id_customer"),
                                 "id_camp": distribution_metadata.get("id_camp"),
@@ -474,10 +523,14 @@ class DistributionService:
                                 candidate.agent_id, ring_timeout, call_id, cas_ready=False
                             )
                             if not lock_key:
-                                try:
-                                    self.redis_client.decr(voicebot_calls_key)
-                                except Exception:
-                                    pass
+                                # Regla de negocio: campaña voicebot nunca deriva a humanos
+                                # desde este loop; se espera y se reintenta el voicebot.
+                                logger.info(
+                                    "VoicebotLoop: voicebot %s ocupado (lock), "
+                                    "se reintenta voicebot call_id=%s",
+                                    candidate.agent_id,
+                                    call_id,
+                                )
                                 continue
                             voicebot_addr: Optional[str] = None
                             try:
@@ -521,10 +574,6 @@ class DistributionService:
                                 with self._dialing_lock:
                                     self._active_attempts.pop(call_id, None)
                                     self._voicebot_attempt_agent_id.pop(call_id, None)
-                                try:
-                                    self.redis_client.decr(voicebot_calls_key)
-                                except Exception:
-                                    pass
                                 self._release_agent_reservation(
                                     candidate.agent_id, call_id, lock_key
                                 )
@@ -534,10 +583,6 @@ class DistributionService:
                                 with self._dialing_lock:
                                     self._active_attempts.pop(call_id, None)
                                     self._voicebot_attempt_agent_id.pop(call_id, None)
-                                try:
-                                    self.redis_client.decr(voicebot_calls_key)
-                                except Exception:
-                                    pass
                                 self._release_agent_reservation(
                                     candidate.agent_id, call_id, lock_key
                                 )
@@ -551,15 +596,18 @@ class DistributionService:
                                     ctx.agent_id = candidate.agent_id
                                     self.state_store.register_unsafe(call_id, ctx)
 
+                            # El lock del voicebot solo serializa la CREACIÓN del originate:
+                            # se libera ni bien el canal queda en vuelo. Liberarlo al answer
+                            # serializaba el ingreso al bot (~1 llamada por ciclo de answer)
+                            # y bajo ráfaga las llamadas expiraban en cola sin ser intentadas.
+                            # La concurrencia real la gobierna MAXQCALLS (activas al answer).
+                            self._release_agent_reservation(
+                                candidate.agent_id, call_id, lock_key
+                            )
+
                             answered_or_failed = attempt_finished.wait(timeout=ring_timeout)
 
                             if stop_event.is_set():
-                                # Solo DECR si no fue porque el agente contestó (si contestó, no liberar cupo aquí)
-                                if not answered_or_failed:
-                                    try:
-                                        self.redis_client.decr(voicebot_calls_key)
-                                    except Exception:
-                                        pass
                                 self._release_agent_reservation(
                                     candidate.agent_id, call_id, lock_key
                                 )
@@ -568,10 +616,6 @@ class DistributionService:
                             if not answered_or_failed:
                                 try:
                                     self.ari_client.hangup_channel(agent_channel_id)
-                                except Exception:
-                                    pass
-                                try:
-                                    self.redis_client.decr(voicebot_calls_key)
                                 except Exception:
                                     pass
                                 with self._dialing_lock:
@@ -594,10 +638,6 @@ class DistributionService:
                             )
                             try:
                                 self.ari_client.hangup_channel(agent_channel_id)
-                            except Exception:
-                                pass
-                            try:
-                                self.redis_client.decr(voicebot_calls_key)
                             except Exception:
                                 pass
                             with self._dialing_lock:
@@ -635,44 +675,23 @@ class DistributionService:
                         RedisKeys.agent_lock(str(attempt_agent_id)),
                     )
                 if agent_ch:
+                    # Canal de voicebot huérfano (originate en vuelo que nunca contestó):
+                    # no consumió cupo MAXQCALLS (el INCR ocurre al answer, en
+                    # register_voicebot_active_call), así que aquí solo se cuelga y se
+                    # limpia el contexto. La liberación de cupo de llamadas contestadas
+                    # ocurre en finalize/handoff vía release_voicebot_call.
                     try:
                         self.ari_client.hangup_channel(agent_ch)
                     except Exception:
                         pass
                     try:
-                        agent_id_for_decr = attempt_agent_id
                         with self.state_store.lock(call_id):
                             ctx = self.state_store.get(call_id)
                             if ctx and getattr(ctx, "is_voicebot", False):
-                                if agent_id_for_decr is None and getattr(ctx, "agent_id", None) is not None:
-                                    agent_id_for_decr = ctx.agent_id
                                 ctx.is_voicebot = False
                                 self.state_store.register_unsafe(call_id, ctx)
-                        if agent_id_for_decr is not None:
-                            if self.agent_status_service:
-                                try:
-                                    self.agent_status_service.release_voicebot_call(
-                                        id_camp,
-                                        agent_id_for_decr,
-                                        call_id,
-                                    )
-                                except Exception:
-                                    if attempt_agent_id is not None:
-                                        try:
-                                            voicebot_calls_key = RedisKeys.voicebot_calls(id_camp, attempt_agent_id)
-                                            self.redis_client.decr(voicebot_calls_key)
-                                        except Exception:
-                                            pass
-                            else:
-                                voicebot_calls_key = RedisKeys.voicebot_calls(id_camp, agent_id_for_decr)
-                                self.redis_client.decr(voicebot_calls_key)
                     except Exception:
-                        if attempt_agent_id is not None:
-                            try:
-                                voicebot_calls_key = RedisKeys.voicebot_calls(id_camp, attempt_agent_id)
-                                self.redis_client.decr(voicebot_calls_key)
-                            except Exception:
-                                pass
+                        pass
         except Exception as e:
             logger.error(
                 "Voicebot distribution loop crashed for call %s: %s",
