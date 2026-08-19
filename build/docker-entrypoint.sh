@@ -55,11 +55,11 @@ ACD_SIP_PUBLIC_BIND_PORT=${ACD_SIP_PUBLIC_BIND_PORT:-5070}
 STASIS_INITIAL_SIZE=${STASIS_INITIAL_SIZE:-10}
 STASIS_IDLE_TIMEOUT_SEC=${STASIS_IDLE_TIMEOUT_SEC:-120}
 STASIS_MAX_SIZE=${STASIS_MAX_SIZE:-60}
-TIMER_B=${TIMER_B:-6400}
-TIMER_T1=${TIMER_T1:-100}
+TIMER_B=${TIMER_B:-64000}
+TIMER_T1=${TIMER_T1:-500}
 THREADPOOL_IDLE_TIMEOUT=${THREADPOOL_IDLE_TIMEOUT:-60}
-THREADPOOL_MAX_SIZE=${THREADPOOL_MAX_SIZE:-50}
-THREADPOOL_INITIAL_SIZE=${THREADPOOL_INITIAL_SIZE:-8}
+THREADPOOL_MAX_SIZE=${THREADPOOL_MAX_SIZE:-100}
+THREADPOOL_INITIAL_SIZE=${THREADPOOL_INITIAL_SIZE:-10}
 THREADPOOL_AUTO_INCREMENT=${THREADPOOL_AUTO_INCREMENT:-5}
 
 # Optional flags
@@ -139,11 +139,13 @@ configure_scale() {
   sed -i "s/;max_size=50/max_size=${STASIS_MAX_SIZE}/g" /etc/asterisk/stasis.conf
 
   sed -i "s/timer_b=64000/timer_b=${TIMER_B}/g" /etc/asterisk/oml_pjsip.conf
-  sed -i "s/timer_t1=1000/timer_t1=${TIMER_T1}/g" /etc/asterisk/oml_pjsip.conf
+  sed -i "s/timer_t1=500/timer_t1=${TIMER_T1}/g" /etc/asterisk/oml_pjsip.conf
   sed -i "s/threadpool_idle_timeout=60/threadpool_idle_timeout=${THREADPOOL_IDLE_TIMEOUT}/g" /etc/asterisk/oml_pjsip.conf
-  sed -i "s/threadpool_max_size=50/threadpool_max_size=${THREADPOOL_MAX_SIZE}/g" /etc/asterisk/oml_pjsip.conf
-  sed -i "s/threadpool_initial_size=0/threadpool_initial_size=${THREADPOOL_INITIAL_SIZE}/g" /etc/asterisk/oml_pjsip.conf
+  sed -i "s/threadpool_max_size=100/threadpool_max_size=${THREADPOOL_MAX_SIZE}/g" /etc/asterisk/oml_pjsip.conf
+  sed -i "s/threadpool_initial_size=10/threadpool_initial_size=${THREADPOOL_INITIAL_SIZE}/g" /etc/asterisk/oml_pjsip.conf
   sed -i "s/threadpool_auto_increment=5/threadpool_auto_increment=${THREADPOOL_AUTO_INCREMENT}/g" /etc/asterisk/oml_pjsip.conf
+  sed -i "s/taskpool_max_size=100/taskpool_max_size=${THREADPOOL_MAX_SIZE}/g" /etc/asterisk/oml_pjsip.conf
+  sed -i "s/taskpool_initial_size=10/taskpool_initial_size=${THREADPOOL_INITIAL_SIZE}/g" /etc/asterisk/oml_pjsip.conf
 }
 
 configure_rtp_ports() {
