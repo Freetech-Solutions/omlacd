@@ -26,6 +26,7 @@ from services.command_dispatcher import CommandDispatcher
 from services.legacy_forwarder import LegacyEventForwarder
 from services.pending_dial_metadata import PendingDialMetadataStore
 from services.pstn_reported_store import PstnReportedStore
+from services.pstn_ring_timer import PstnRingTimerService
 from handlers.recording import RecordingEventHandler
 from services.route_validator import RouteValidator
 from services.dialing_service import DialingService
@@ -123,6 +124,13 @@ class ACDContainer(containers.DeclarativeContainer):
         redis_client=redis_client_base,
     )
 
+    # Timer de RINGTIME de negocio para originaciones PSTN (CANCEL vs 480 real)
+    pstn_ring_timer = providers.Singleton(
+        PstnRingTimerService,
+        ari_client=ari_client,
+        pending_dial_store=pending_dial_store,
+    )
+
     # PSTN reported store (canales PSTN cuyo evento final ya fue enviado por on_pstn_stasis_end)
     pstn_reported_store = providers.Singleton(PstnReportedStore)
 
@@ -144,6 +152,7 @@ class ACDContainer(containers.DeclarativeContainer):
         route_validator=route_validator,
         pending_dial_store=pending_dial_store,
         reporter=reporter,
+        pstn_ring_timer=pstn_ring_timer,
     )
 
     # Dialing Service (orquestación de marcado: agent, PSTN, predictivo)
@@ -226,6 +235,7 @@ class ACDContainer(containers.DeclarativeContainer):
         agent_status_service=agent_status_service,
         route_validator=route_validator,
         recording_service=recording_service,
+        pstn_ring_timer=pstn_ring_timer,
     )
 
     def _make_get_campaign_config(redis_client):
@@ -314,6 +324,7 @@ class ACDContainer(containers.DeclarativeContainer):
         redis_client=redis_client_base,
         route_validator=route_validator,
         pstn_reported_store=pstn_reported_store,
+        pstn_ring_timer=pstn_ring_timer,
     )
 
     command_dispatcher = providers.Singleton(
@@ -389,3 +400,15 @@ class ACDContainer(containers.DeclarativeContainer):
                     logger.debug(f"Cliente Redis dialer no disponible para cierre: {provider_error}")
         except Exception as e:
             logger.warning(f"⚠️ Error cerrando conexión Redis: {e}")
+
+        try:
+            if hasattr(self, 'pstn_ring_timer'):
+                try:
+                    timer_svc = self.pstn_ring_timer()
+                    if timer_svc:
+                        timer_svc.cancel_all()
+                        logger.debug("Timers PSTN ring cancelados en shutdown")
+                except Exception as provider_error:
+                    logger.debug(f"PstnRingTimer no disponible para cierre: {provider_error}")
+        except Exception as e:
+            logger.warning(f"⚠️ Error cancelando timers PSTN ring: {e}")

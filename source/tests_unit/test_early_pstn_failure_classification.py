@@ -9,6 +9,7 @@ SIP 488→488_NOT_ACCEPTABLE_HERE, SIP 608→608_REJECTED.
 import os
 import sys
 import unittest
+from datetime import datetime, timedelta
 from unittest.mock import MagicMock
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -283,12 +284,23 @@ class TestRouterEarlyPstnFailureReports(unittest.TestCase):
         self.mock_legacy_forwarder.cleanup_pending_dial.assert_called_once_with(self.channel_id)
 
     def test_480_reports_temporarily_unavailable_and_submit_own_status(self):
+        """480 real del peer (sin local_cancel ni fallback temporal)."""
+        self.mock_legacy_forwarder.get_pending_dial_metadata.return_value = {
+            "id_camp": "23",
+            "id_customer": "116",
+            "tel_customer": "0924553102",
+            "callid": "1785598686.116",
+            "originate_ts": datetime.now().astimezone().isoformat(),
+            "originate_timeout": 15,
+            "local_cancel": False,
+        }
         event = self._event(19, "User alerting, no answer", 480)
         self.router._handle_channel_destroyed(event)
 
         self.mock_reporter.log_segment_end.assert_called_once()
         kwargs = self.mock_reporter.log_segment_end.call_args[1]
         self.assertEqual(kwargs["event_final"], HangupCause.TEMPORARILY_UNAVAILABLE.value)
+        self.assertEqual(kwargs["quien_corto"], 2)
         self.assertEqual(kwargs["hangup_cause"], 19)
         self.assertEqual(kwargs["custom_data"].get("sip_code"), 480)
 
@@ -297,6 +309,47 @@ class TestRouterEarlyPstnFailureReports(unittest.TestCase):
         self.mock_legacy_forwarder.submit_dial_cancel.assert_not_called()
         self.mock_legacy_forwarder.submit_dial_invalid_number.assert_not_called()
         self.mock_legacy_forwarder.cleanup_pending_dial.assert_called_once_with(self.channel_id)
+
+    def test_480_with_local_cancel_reports_cancel(self):
+        self.mock_legacy_forwarder.get_pending_dial_metadata.return_value = {
+            "id_camp": "23",
+            "id_customer": "116",
+            "tel_customer": "0924553102",
+            "callid": "1785598686.116",
+            "originate_ts": datetime.now().astimezone().isoformat(),
+            "originate_timeout": 15,
+            "local_cancel": True,
+        }
+        event = self._event(19, "User alerting, no answer", 480)
+        self.router._handle_channel_destroyed(event)
+
+        kwargs = self.mock_reporter.log_segment_end.call_args[1]
+        self.assertEqual(kwargs["event_final"], HangupCause.CANCEL.value)
+        self.assertEqual(kwargs["quien_corto"], 0)
+        self.mock_legacy_forwarder.submit_dial_cancel.assert_called_once()
+        self.mock_legacy_forwarder.submit_dial_temporarily_unavailable.assert_not_called()
+
+    def test_480_fallback_elapsed_timeout_reports_cancel(self):
+        from datetime import timedelta
+
+        old_ts = (datetime.now().astimezone() - timedelta(seconds=16)).isoformat()
+        self.mock_legacy_forwarder.get_pending_dial_metadata.return_value = {
+            "id_camp": "23",
+            "id_customer": "116",
+            "tel_customer": "0924553102",
+            "callid": "1785598686.116",
+            "originate_ts": old_ts,
+            "originate_timeout": 15,
+            "local_cancel": False,
+        }
+        event = self._event(19, "User alerting, no answer", 480)
+        self.router._handle_channel_destroyed(event)
+
+        kwargs = self.mock_reporter.log_segment_end.call_args[1]
+        self.assertEqual(kwargs["event_final"], HangupCause.CANCEL.value)
+        self.assertEqual(kwargs["quien_corto"], 0)
+        self.mock_legacy_forwarder.submit_dial_cancel.assert_called_once()
+        self.mock_legacy_forwarder.submit_dial_temporarily_unavailable.assert_not_called()
 
     def test_487_reports_request_terminated_and_submit_noanswer(self):
         event = self._event(127, "Interworking, unspecified", 487)

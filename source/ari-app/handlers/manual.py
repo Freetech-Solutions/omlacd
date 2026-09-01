@@ -19,6 +19,7 @@ from config import settings
 from services.call_manager import CallActionService
 from services.agent_status_service import AgentStatusService
 from services.backend_notifier import notify_call_blocked
+from services.pstn_ring_timer import classify_pstn_early_fail
 from constants import (
     CallType,
     ChannelType,
@@ -47,7 +48,7 @@ class ManualCallHandler(BaseHandler):
     # Fuente de verdad compartida con dialer early-fail (router).
     AST_CAUSE_MAPPING = AST_CAUSE_TO_EVENT
 
-    def __init__(self, ari_client, state_store, reporter, asterisk_app: Optional[str] = None, call_service: Optional[CallActionService] = None, redis_client=None, agent_status_service: Optional[AgentStatusService] = None, route_validator=None, recording_service=None):
+    def __init__(self, ari_client, state_store, reporter, asterisk_app: Optional[str] = None, call_service: Optional[CallActionService] = None, redis_client=None, agent_status_service: Optional[AgentStatusService] = None, route_validator=None, recording_service=None, pstn_ring_timer=None):
         super().__init__(ari_client, state_store, reporter)
         self.asterisk_app = asterisk_app or settings.ARI_APP
         self.call_service = call_service
@@ -55,6 +56,7 @@ class ManualCallHandler(BaseHandler):
         self.agent_status_service = agent_status_service
         self.route_validator = route_validator
         self.recording_service = recording_service
+        self.pstn_ring_timer = pstn_ring_timer
 
     def _parse_args_list(self, event: Union[StasisStartEvent, Dict[str, Any]]) -> list:
         if isinstance(event, StasisStartEvent):
@@ -187,6 +189,8 @@ class ManualCallHandler(BaseHandler):
         return channel_id, channel_name, channel
 
     def _handle_pstn_leg_start(self, channel_id: str, bridge_id: str) -> bool:
+        if self.pstn_ring_timer and channel_id:
+            self.pstn_ring_timer.cancel(channel_id)
         if not bridge_id:
             return False
 
@@ -751,11 +755,14 @@ class ManualCallHandler(BaseHandler):
             logging.error(f"Error calculando métricas: {e}", exc_info=True)
             return 0.0, 0.0
 
-    def _get_channel_info_from_event(self, event) -> Tuple[Optional[str], Optional[int], Optional[str]]:
+    def _get_channel_info_from_event(
+        self, event
+    ) -> Tuple[Optional[str], Optional[int], Optional[str], Optional[int]]:
         """
         Extrae información del canal desde el evento.
-        Returns: (channel_id, cause, cause_txt)
+        Returns: (channel_id, cause, cause_txt, tech_cause)
         """
+        tech_cause = getattr(event, "tech_cause", None)
         if isinstance(event, ChannelDestroyedEvent):
             channel_id = event.channel.id
             cause = event.channel.cause
@@ -776,15 +783,17 @@ class ManualCallHandler(BaseHandler):
         elif isinstance(event, BridgeDestroyedEvent):
             # Para BridgeDestroyed, necesitamos obtener el contexto por bridge_id
             # y luego determinar qué canal se colgó primero
-            return None, None, None
+            return None, None, None, None
         else:
             # Legacy dict support
             channel = event.get('channel', {}) or {}
             channel_id = channel.get('id') if isinstance(channel, dict) else None
             cause = event.get('cause') or (channel.get('cause') if isinstance(channel, dict) else None)
             cause_txt = event.get('cause_txt') or (channel.get('cause_txt') if isinstance(channel, dict) else None)
+            if tech_cause is None:
+                tech_cause = event.get('tech_cause')
 
-        return channel_id, cause, cause_txt
+        return channel_id, cause, cause_txt, tech_cause
 
     def _abort_blind_transfer_if_needed(
         self,
@@ -1118,6 +1127,9 @@ class ManualCallHandler(BaseHandler):
         """
         call_id_to_cleanup = None  # Solo hacemos unregister cuando este thread marcó call_ended
         try:
+            if channel_id and self.pstn_ring_timer:
+                self.pstn_ring_timer.cancel(channel_id)
+            tech_cause = getattr(event, "tech_cause", None) if event is not None else None
             # IMPORTANTE:
             # - A partir de aquí usamos SIEMPRE un contexto fresco obtenido desde Redis.
             # - El objeto `context` que llega como parámetro puede estar desactualizado.
@@ -1343,6 +1355,28 @@ class ManualCallHandler(BaseHandler):
                     f"call_id={fresh_context.call_id}, channel_id={channel_id}. "
                     f"Forzando event_final={event_final}"
                 )
+            elif (
+                channel_id
+                and fresh_context.pstn_channel == channel_id
+                and fresh_context.pstn_answered_ts is None
+                and self.pstn_ring_timer
+            ):
+                pstn_meta = self.pstn_ring_timer.get_metadata(channel_id)
+                event_final, is_pstn_local_cancel = classify_pstn_early_fail(
+                    pstn_meta,
+                    cause,
+                    tech_cause,
+                    default=HangupCause.HANGUP.value,
+                )
+                if is_pstn_local_cancel:
+                    quien_corto = 0
+                    logging.info(
+                        "🔍 _process_call_end: timeout ring PSTN local call_id=%s "
+                        "channel_id=%s event_final=%s",
+                        fresh_context.call_id,
+                        channel_id,
+                        event_final,
+                    )
             else:
                 event_final = self._map_cause_to_event(cause, is_answered)
 
@@ -1427,7 +1461,7 @@ class ManualCallHandler(BaseHandler):
                 cause_txt = None
             else:
                 # ChannelDestroyedEvent
-                channel_id, cause, cause_txt = self._get_channel_info_from_event(event)
+                channel_id, cause, cause_txt, _tech_cause = self._get_channel_info_from_event(event)
                 if not channel_id:
                     return
 
@@ -1461,7 +1495,7 @@ class ManualCallHandler(BaseHandler):
             - Verifica que los recursos existen antes de intentar destruirlos
         """
         try:
-            channel_id, cause, cause_txt = self._get_channel_info_from_event(event)
+            channel_id, cause, cause_txt, _tech_cause = self._get_channel_info_from_event(event)
             if not channel_id:
                 logging.debug("on_hangup_request: No se pudo extraer channel_id del evento")
                 return

@@ -9,7 +9,6 @@ from constants import (
     ChannelType,
     HangupCause,
     RedisKeys,
-    map_unanswered_hangup_to_event,
 )
 from models import (
     parse_ari_event,
@@ -31,6 +30,7 @@ from reporter import ACDReporter
 from services.call_manager import CallActionService
 from services.legacy_forwarder import LegacyEventForwarder
 from services.agent_status_service import AgentStatusService
+from services.pstn_ring_timer import classify_pstn_early_fail
 from handlers.recording import RecordingEventHandler
 from queue_events import QueueEventManager
 from state import CallRegistry, TRANSFER_PHASE_ANSWERED, TRANSFER_PHASE_REQUESTED
@@ -95,6 +95,7 @@ class AcDRouter:
         redis_client: Optional[Any] = None,
         route_validator: Optional[Any] = None,
         pstn_reported_store: Optional[Any] = None,
+        pstn_ring_timer: Optional[Any] = None,
     ):
         self.ari_client = ari_client
         self.state_store = state_store
@@ -109,6 +110,7 @@ class AcDRouter:
         self.sip_refer_handlers = sip_refer_handlers
         self.route_validator = route_validator
         self.pstn_reported_store = pstn_reported_store
+        self.pstn_ring_timer = pstn_ring_timer
         self.redis_client = redis_client
         self.logger = logging.getLogger(__name__)
         # Canales para los que ya se reportó BUSY/CONGESTION/CHANUNAVAIL en evento Dial;
@@ -265,6 +267,8 @@ class AcDRouter:
                         self._pstn_answer_ts[peer_id] = ts
                         if len(self._pstn_answer_ts) > self._pstn_answer_ts_max_size:
                             self._cleanup_old_pstn_answer_ts()
+                    if peer_id and self.pstn_ring_timer:
+                        self.pstn_ring_timer.cancel(str(peer_id))
             self.legacy_forwarder.handle_dial_event(event_dict)
         
         try:
@@ -980,11 +984,14 @@ class AcDRouter:
 
     def _handle_channel_destroyed(self, event: ChannelDestroyedEvent) -> None:
         channel_id = event.channel.id
+        if self.pstn_ring_timer and channel_id:
+            self.pstn_ring_timer.cancel(channel_id)
         is_cancel_path = False
         early_fail_event = None  # CANCEL / 603_DECLINED / 404_NOT_FOUND / …
         event_final_for_dialer = None
         pstn_cleaned_by_app = False
         id_camp = id_customer = tel_customer = ""
+        early_fail_quien_corto = 2
         # Simetría con MANUAL: reportar fallo a acd-log-processor cuando se destruye
         # la pierna PSTN DIALER antes de contestar (canal no estaba Up). Clasificar por
         # cause/tech_cause (603→603_DECLINED, 403→403_FORBIDDEN, 404→404_NOT_FOUND,
@@ -1006,11 +1013,13 @@ class AcDRouter:
                     event.channel, "cause_txt", None
                 )
                 tech_cause = getattr(event, "tech_cause", None)
-                early_fail_event = map_unanswered_hangup_to_event(
+                early_fail_event, is_local_cancel = classify_pstn_early_fail(
+                    meta=meta,
                     cause=hangup_cause,
                     tech_cause=tech_cause,
                     default=HangupCause.CANCEL.value,
                 )
+                early_fail_quien_corto = 0 if is_local_cancel else 2
                 id_camp = meta.get("id_camp") or meta.get("campaign_id") or ""
                 id_customer = meta.get("id_customer") or meta.get("contact_id") or ""
                 tel_customer = meta.get("tel_customer") or meta.get("phone_number") or ""
@@ -1053,7 +1062,7 @@ class AcDRouter:
                         call_data=call_data,
                         event_final=early_fail_event,
                         is_transfer=False,
-                        quien_corto=2,
+                        quien_corto=early_fail_quien_corto,
                         uniqueid=None,
                         callid=call_id,
                         end_iso=now_iso,

@@ -82,6 +82,11 @@ class Settings(BaseSettings):
     ARI_CONNECT_TIMEOUT: int = Field(default=3, ge=1, description="Timeout de conexión HTTP ARI (segundos)")
     ARI_READ_TIMEOUT: int = Field(default=15, ge=1, description="Timeout de lectura HTTP ARI (segundos)")
     DEFAULT_ORIGINATE_TIMEOUT: int = Field(default=30, ge=1, description="Timeout por defecto para originaciones ARI")
+    ORIGINATE_SAFETY_MARGIN_SEC: int = Field(
+        default=2,
+        ge=1,
+        description="Margen extra en timeout ARI sobre el RINGTIME de negocio (timer acd-app)",
+    )
     TRANSFER_TIMEOUT: int = Field(default=30, ge=1, description="Timeout para transferencias ciegas")
     CONSULT_TIMEOUT: int = Field(default=45, ge=1, description="Timeout para transferencias consultivas")
 

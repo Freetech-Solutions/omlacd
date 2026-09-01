@@ -66,6 +66,17 @@ class PendingDialMetadataStore:
             self._memory[channel_id] = {"metadata": payload, "ts": time.monotonic()}
             logger.debug("PendingDialMetadataStore: registered channel_id=%s (memory)", channel_id)
 
+    def update(self, channel_id: str, fields: Dict[str, Any]) -> bool:
+        """Fusiona fields en la metadata existente y renueva TTL."""
+        if not channel_id or not fields:
+            return False
+        current = self.get(channel_id)
+        if not current:
+            return False
+        merged = {**current, **fields}
+        self.register(channel_id, merged)
+        return True
+
     def refresh(self, channel_id: str) -> None:
         """Renueva TTL en actividad del canal (llamadas largas en cola)."""
         if not channel_id:

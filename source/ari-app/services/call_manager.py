@@ -30,6 +30,7 @@ from services.route_validator import RouteValidator, resolve_pstn_originate_time
 if TYPE_CHECKING:
     from services.agent_status_service import AgentStatusService
     from services.pending_dial_metadata import PendingDialMetadataStore
+    from services.pstn_ring_timer import PstnRingTimerService
 
 
 class CallActionService:
@@ -54,6 +55,7 @@ class CallActionService:
         route_validator: Optional[RouteValidator] = None,
         pending_dial_store: Optional["PendingDialMetadataStore"] = None,
         reporter: Optional[Any] = None,  # ACDReporter para registrar NONDIALPLAN en interactions_summary
+        pstn_ring_timer: Optional["PstnRingTimerService"] = None,
     ):
         """
         Inicializa el servicio de acciones de llamadas.
@@ -67,6 +69,7 @@ class CallActionService:
             route_validator: Validador de rutas para campañas (opcional)
             pending_dial_store: Store para metadata de canales originados (Dial events legacy)
             reporter: Reporter para registrar NONDIALPLAN en interactions_summary (opcional)
+            pstn_ring_timer: Timer de RINGTIME de negocio para originaciones PSTN (opcional)
         """
         self.ari_client = ari_client
         self.config = config
@@ -76,6 +79,7 @@ class CallActionService:
         self.route_validator = route_validator
         self.pending_dial_store = pending_dial_store
         self.reporter = reporter
+        self.pstn_ring_timer = pstn_ring_timer
         self.logger = logging.getLogger(__name__)
 
     def execute_dial_command(self, payload: Dict[str, Any]) -> None:
@@ -481,21 +485,24 @@ class CallActionService:
         else:
             variables = None
         
-        # Usar timeout si está disponible, sino usar valor por defecto centralizado
-        timeout_value = timeout if timeout is not None else settings.DEFAULT_ORIGINATE_TIMEOUT
-        
+        # Timeout de negocio (timer acd-app) vs timeout ARI (margen de seguridad).
+        business_timeout = timeout if timeout is not None else settings.DEFAULT_ORIGINATE_TIMEOUT
+        safety_margin = int(getattr(settings, "ORIGINATE_SAFETY_MARGIN_SEC", 2))
+        ari_timeout = business_timeout + safety_margin
+
         self.logger.info(
             f"🚀 Originando llamada hacia PSTN: {endpoint} "
-            f"(timeout={timeout_value}s, related_call_id={related_call_id})"
+            f"(business_timeout={business_timeout}s, ari_timeout={ari_timeout}s, "
+            f"related_call_id={related_call_id})"
         )
-        
+
         result = self.ari_client.originate_channel_op(
             endpoint=endpoint,
             app=self.config['ARI_APP'],
             callerId=caller_id,
             appArgs=app_args,
             variables=variables,
-            timeout=timeout_value,
+            timeout=ari_timeout,
         )
 
         if not result.get("ok"):
@@ -514,28 +521,30 @@ class CallActionService:
             )
             return None
 
-        # Registrar metadata para LegacyEventForwarder: en eventos Dial por originate()
-        # y ChannelDestroyed; el forwarder consulta por channel_id (peer.id en Dial).
+        # Registrar metadata para LegacyEventForwarder / clasificación CANCEL vs 480.
         if self.pending_dial_store:
-            call_type_raw = metadata.get("call_type") or metadata.get("id_calltype")
-            if call_type_raw in (2, "2", CallType.DIALER_ID):
-                id_camp = metadata.get("id_camp") or metadata.get("campaign_id") or ""
-                stored_meta = {
-                    "call_type": call_type_raw,
-                    "channel_type": ChannelType.TO_PSTN.value,
-                    "id_camp": id_camp,
-                    "campaign_id": id_camp,  # alias para router (meta.get("campaign_id"))
-                    "id_customer": metadata.get("id_customer", metadata.get("contact_id", "")),
-                    "tel_customer": metadata.get("tel_customer", metadata.get("phone_number", number)),
-                    # ART: marcado al create del canal PSTN; Dial ANSWER calcula ring_duration.
-                    "originate_ts": datetime.now().astimezone().isoformat(),
-                }
-                if related_call_id:
-                    stored_meta["related_call_id"] = related_call_id
-                callid = metadata.get("callid") or metadata.get("uniqueid") or related_call_id
-                if callid:
-                    stored_meta["callid"] = str(callid)
-                self.pending_dial_store.register(pstn_channel_id, stored_meta)
+            call_type_raw = metadata.get("call_type") or metadata.get("id_calltype") or ""
+            id_camp = metadata.get("id_camp") or metadata.get("campaign_id") or ""
+            stored_meta = {
+                "call_type": call_type_raw,
+                "channel_type": ChannelType.TO_PSTN.value,
+                "id_camp": id_camp,
+                "campaign_id": id_camp,
+                "id_customer": metadata.get("id_customer", metadata.get("contact_id", "")),
+                "tel_customer": metadata.get("tel_customer", metadata.get("phone_number", number)),
+                "originate_ts": datetime.now().astimezone().isoformat(),
+                "originate_timeout": business_timeout,
+                "local_cancel": False,
+            }
+            if related_call_id:
+                stored_meta["related_call_id"] = related_call_id
+            callid = metadata.get("callid") or metadata.get("uniqueid") or related_call_id
+            if callid:
+                stored_meta["callid"] = str(callid)
+            self.pending_dial_store.register(pstn_channel_id, stored_meta)
+
+        if self.pstn_ring_timer:
+            self.pstn_ring_timer.schedule(pstn_channel_id, business_timeout)
 
         self.logger.info(f"✅ Canal PSTN creado: {pstn_channel_id}")
         return pstn_channel_id
