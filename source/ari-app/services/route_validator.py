@@ -20,6 +20,33 @@ from constants import RedisKeys
 logger = logging.getLogger(__name__)
 
 
+def resolve_pstn_originate_timeout(
+    attempt_timeout,
+    route_id: Optional[str],
+    route_validator: Optional["RouteValidator"],
+) -> Optional[int]:
+    """
+    Resuelve el timeout ARI para originates hacia PSTN.
+
+    Precedencia:
+      1. attempt_timeout explícito (entero positivo)
+      2. RINGTIME de OML:OUTR:{route_id} vía route_validator
+      3. None -> el caller aplica DEFAULT_ORIGINATE_TIMEOUT
+
+    El valor de RINGTIME no debe inyectarse en metadata/appArgs/reportes.
+    """
+    if attempt_timeout is not None and attempt_timeout != "":
+        try:
+            parsed = int(attempt_timeout)
+            if parsed > 0:
+                return parsed
+        except (TypeError, ValueError):
+            pass
+    if route_id and route_validator:
+        return route_validator.get_route_ringtime(route_id)
+    return None
+
+
 class AsteriskPatternMatcher:
     """
     Matcher singleton para validar patrones de Asterisk (dialplan).
@@ -132,7 +159,12 @@ class RouteValidator:
     _TRUNK_CACHE_LOCK = threading.RLock()  # Lock para proteger _TRUNK_CACHE
     _TRUNK_CACHE_BY_ROUTE = {}
     TRUNK_CACHE_TTL = 3600  # 1 hora en segundos
-    
+
+    # Cache local de RINGTIME por ruta: {route_id: (ringtime_or_None, expires_at_ts)}
+    # TTL corto alineado con ROUTE_CACHE_TTL para propagar cambios de rutas.
+    _RINGTIME_CACHE = {}
+    _RINGTIME_CACHE_LOCK = threading.RLock()
+
     def __init__(self, redis_client: redis.Redis):
         """
         Inicializa el validador de rutas.
@@ -551,6 +583,83 @@ class RouteValidator:
                 else:
                     RouteValidator._CALLERID_CACHE.pop(id_campaign, None)
             return None
+
+    def get_route_ringtime(self, route_id) -> Optional[int]:
+        """
+        Obtiene el RINGTIME (segundos) de una ruta saliente desde Redis.
+
+        Lee OML:OUTR:{route_id} campo RINGTIME. Solo acepta enteros positivos.
+        Ausente, inválido o error de Redis -> None (el caller usa DEFAULT_ORIGINATE_TIMEOUT).
+
+        El valor se usa únicamente como timeout del originate ARI hacia PSTN;
+        no debe inyectarse en metadata/appArgs de reportes.
+
+        Args:
+            route_id: ID de la ruta saliente (OUTR)
+
+        Returns:
+            int positivo o None
+        """
+        if not route_id:
+            return None
+        route_id = self._normalize_redis_value(route_id)
+        if not route_id:
+            return None
+
+        now = time.time()
+        with RouteValidator._RINGTIME_CACHE_LOCK:
+            cached = RouteValidator._RINGTIME_CACHE.get(route_id)
+            if cached:
+                ringtime, expires_at = cached
+                if expires_at > now:
+                    return ringtime
+
+        try:
+            outr_key = f"OML:OUTR:{route_id}"
+            raw = self.redis_client.hget(outr_key, "RINGTIME")
+        except (redis.ConnectionError, redis.TimeoutError) as e:
+            logger.error(
+                "Error de conexión a Redis leyendo RINGTIME (route_id=%s): %s. "
+                "Se usará timeout por defecto.",
+                route_id, e, exc_info=True,
+            )
+            with RouteValidator._RINGTIME_CACHE_LOCK:
+                RouteValidator._RINGTIME_CACHE.pop(route_id, None)
+            return None
+        except Exception as e:
+            logger.error(
+                "Error inesperado leyendo RINGTIME (route_id=%s): %s. "
+                "Se usará timeout por defecto.",
+                route_id, e, exc_info=True,
+            )
+            with RouteValidator._RINGTIME_CACHE_LOCK:
+                RouteValidator._RINGTIME_CACHE.pop(route_id, None)
+            return None
+
+        ringtime: Optional[int] = None
+        raw_norm = self._normalize_redis_value(raw)
+        if raw_norm is not None and str(raw_norm).strip() != "":
+            try:
+                parsed = int(raw_norm)
+                if parsed > 0:
+                    ringtime = parsed
+                else:
+                    logger.warning(
+                        "RINGTIME inválido para OUTR=%s: %r (debe ser > 0)",
+                        route_id, raw_norm,
+                    )
+            except (TypeError, ValueError):
+                logger.warning(
+                    "RINGTIME no numérico para OUTR=%s: %r",
+                    route_id, raw_norm,
+                )
+
+        with RouteValidator._RINGTIME_CACHE_LOCK:
+            RouteValidator._RINGTIME_CACHE[route_id] = (
+                ringtime,
+                now + RouteValidator.ROUTE_CACHE_TTL,
+            )
+        return ringtime
 
     def _get_patterns_for_route(self, route_id) -> List[Tuple[str, str]]:
         """

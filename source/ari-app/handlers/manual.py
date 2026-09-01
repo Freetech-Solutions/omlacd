@@ -106,6 +106,7 @@ class ManualCallHandler(BaseHandler):
                 "external_sip_trunk": None,
                 "attempt_timeout": None,
                 "command_id": None,
+                "effective_route_id": None,
             }
 
             for arg in args:
@@ -149,6 +150,8 @@ class ManualCallHandler(BaseHandler):
                         data["attempt_timeout"] = None
                 elif key == "command_id":
                     data["command_id"] = value
+                elif key == "effective_route_id":
+                    data["effective_route_id"] = value
 
             if not data["uniqueid"] and channel_id:
                 data["uniqueid"] = channel_id
@@ -311,6 +314,7 @@ class ManualCallHandler(BaseHandler):
 
         command_id = args_dict.get('command_id')
         outbound_prepend = args_dict.get('outbound_prepend')
+        effective_route_id = args_dict.get('effective_route_id')
 
         return {
             'id_camp': id_camp,
@@ -324,6 +328,7 @@ class ManualCallHandler(BaseHandler):
             'attempt_timeout': attempt_timeout,
             'command_id': command_id,
             'outbound_prepend': outbound_prepend,
+            'effective_route_id': effective_route_id,
         }
 
     def _create_and_register_context(self, call_id, channel_id, bridge_id, uniqueid, call_data) -> CallContext:
@@ -393,6 +398,18 @@ class ManualCallHandler(BaseHandler):
             return None
 
         number_to_dial = (call_data.get('outbound_prepend') or '') + call_data['tel_customer']
+        # Precedencia: attempt_timeout explícito > RINGTIME de OUTR > DEFAULT (en dial_pstn).
+        # RINGTIME solo alimenta el timeout ARI; no se inyecta en metadata/reportes.
+        from services.route_validator import RouteValidator, resolve_pstn_originate_timeout
+        route_validator = self.route_validator
+        if not route_validator and self.redis_client:
+            route_validator = RouteValidator(redis_client=self.redis_client)
+        timeout_value = resolve_pstn_originate_timeout(
+            call_data.get('attempt_timeout'),
+            call_data.get('effective_route_id'),
+            route_validator,
+        )
+
         pstn_channel_id = self.call_service.dial_pstn(
             number=number_to_dial,
             related_call_id=call_id,
@@ -406,7 +423,7 @@ class ManualCallHandler(BaseHandler):
                 'call_type': call_data['call_type']
             },
             external_sip_trunk=args_dict.get('external_sip_trunk'),
-            timeout=call_data['attempt_timeout']
+            timeout=timeout_value
         )
 
         if pstn_channel_id:

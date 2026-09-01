@@ -24,7 +24,7 @@ from idempotency import (
 from services.backend_notifier import notify_call_blocked
 from services.call_manager import CallActionService
 from services.agent_status_service import AgentStatusService
-from services.route_validator import RouteValidator
+from services.route_validator import RouteValidator, resolve_pstn_originate_timeout
 
 
 # TTL para idempotencia de comandos manuales (alineado con CommandDispatcher)
@@ -394,6 +394,11 @@ class DialingService:
             if isinstance(data.get("metadata"), dict)
             else None
         )
+        # Precedencia: attempt_timeout explícito > RINGTIME de OUTR > DEFAULT (en dial_pstn).
+        # RINGTIME solo alimenta el timeout ARI; no se inyecta en metadata/reportes.
+        timeout_value = resolve_pstn_originate_timeout(
+            attempt_timeout, effective_route_id, self.route_validator
+        )
 
         try:
             pstn_channel_id = self.call_service.dial_pstn(
@@ -401,7 +406,7 @@ class DialingService:
                 related_call_id=uniqueid,
                 metadata=metadata,
                 external_sip_trunk=external_sip_trunk,
-                timeout=int(attempt_timeout) if attempt_timeout else None,
+                timeout=timeout_value,
             )
             if pstn_channel_id:
                 self.logger.info(

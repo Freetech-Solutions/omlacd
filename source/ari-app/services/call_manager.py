@@ -25,7 +25,7 @@ from idempotency import (
     check_command_idempotency,
     generate_legacy_command_id,
 )
-from services.route_validator import RouteValidator
+from services.route_validator import RouteValidator, resolve_pstn_originate_timeout
 
 if TYPE_CHECKING:
     from services.agent_status_service import AgentStatusService
@@ -231,6 +231,15 @@ class CallActionService:
         if not attempt_timeout and isinstance(payload.get('metadata'), dict):
             attempt_timeout = payload['metadata'].get('attempt_timeout')
 
+        # Precedencia: attempt_timeout explícito > RINGTIME de OUTR > DEFAULT (en dial_pstn).
+        # RINGTIME solo alimenta el timeout ARI; no se inyecta en metadata/reportes.
+        route_validator = self.route_validator or (
+            RouteValidator(redis_client=redis_client) if redis_client else None
+        )
+        timeout_value = resolve_pstn_originate_timeout(
+            attempt_timeout, effective_route_id, route_validator
+        )
+
         try:
             self.logger.info(f"Executing dial_pstn via CallService for {number_to_dial}")
             self.dial_pstn(
@@ -238,7 +247,7 @@ class CallActionService:
                 related_call_id=None,
                 metadata=metadata,
                 external_sip_trunk=external_sip_trunk,
-                timeout=int(attempt_timeout) if attempt_timeout else None,
+                timeout=timeout_value,
             )
         except Exception as e:
             self.logger.error(f"Error executing dial command: {e}", exc_info=True)
