@@ -42,6 +42,7 @@ class TestRouteValidatorGetTrunkCallerid(unittest.TestCase):
         self.RouteValidator._TRUNK_CACHE.clear()
         self.RouteValidator._TRUNK_CACHE_BY_ROUTE.clear()
         self.RouteValidator._ROUTE_CACHE.clear()
+        self.RouteValidator._RINGTIME_CACHE.clear()
         self.RouteValidator._ROUTE_INDEX_CACHE = []
         self.RouteValidator._ROUTE_INDEX_CACHE_EXPIRES_AT = 0.0
 
@@ -318,3 +319,88 @@ class TestRouteValidatorRouteResolution(unittest.TestCase):
         self.assertFalse(valid)
         self.assertIsNone(prepend)
         self.assertIsNone(route_id)
+
+
+class TestRouteValidatorGetRouteRingtime(unittest.TestCase):
+    """Tests para get_route_ringtime (RINGTIME de OML:OUTR)."""
+
+    def setUp(self):
+        if isinstance(sys.modules.get("redis"), MagicMock):
+            del sys.modules["redis"]
+        import services.route_validator as rv
+
+        importlib.reload(rv)
+        self.RouteValidator = rv.RouteValidator
+        self.redis = MagicMock()
+        self.validator = self.RouteValidator(redis_client=self.redis)
+        self.RouteValidator._RINGTIME_CACHE.clear()
+
+    def test_returns_positive_ringtime(self):
+        self.redis.hget.return_value = "15"
+        self.assertEqual(self.validator.get_route_ringtime("1"), 15)
+        self.redis.hget.assert_called_once_with("OML:OUTR:1", "RINGTIME")
+
+    def test_absent_returns_none(self):
+        self.redis.hget.return_value = None
+        self.assertIsNone(self.validator.get_route_ringtime("1"))
+
+    def test_empty_string_returns_none(self):
+        self.redis.hget.return_value = ""
+        self.assertIsNone(self.validator.get_route_ringtime("1"))
+
+    def test_invalid_non_numeric_returns_none(self):
+        self.redis.hget.return_value = "abc"
+        self.assertIsNone(self.validator.get_route_ringtime("1"))
+
+    def test_zero_returns_none(self):
+        self.redis.hget.return_value = "0"
+        self.assertIsNone(self.validator.get_route_ringtime("1"))
+
+    def test_negative_returns_none(self):
+        self.redis.hget.return_value = "-5"
+        self.assertIsNone(self.validator.get_route_ringtime("1"))
+
+    def test_none_route_id_returns_none(self):
+        self.assertIsNone(self.validator.get_route_ringtime(None))
+        self.redis.hget.assert_not_called()
+
+    def test_redis_error_returns_none(self):
+        import redis as real_redis
+
+        self.redis.hget.side_effect = real_redis.ConnectionError("down")
+        self.assertIsNone(self.validator.get_route_ringtime("1"))
+
+    def test_cache_hit_avoids_second_redis_call(self):
+        self.redis.hget.return_value = "15"
+        self.assertEqual(self.validator.get_route_ringtime("1"), 15)
+        self.assertEqual(self.validator.get_route_ringtime("1"), 15)
+        self.redis.hget.assert_called_once()
+
+
+class TestResolvePstnOriginateTimeout(unittest.TestCase):
+    """Tests del helper de precedencia attempt_timeout > RINGTIME > None."""
+
+    def setUp(self):
+        if isinstance(sys.modules.get("redis"), MagicMock):
+            del sys.modules["redis"]
+        import services.route_validator as rv
+
+        importlib.reload(rv)
+        self.resolve = rv.resolve_pstn_originate_timeout
+        self.validator = MagicMock()
+        self.validator.get_route_ringtime.return_value = 15
+
+    def test_explicit_wins(self):
+        self.assertEqual(self.resolve(45, "1", self.validator), 45)
+        self.validator.get_route_ringtime.assert_not_called()
+
+    def test_ringtime_fallback(self):
+        self.assertEqual(self.resolve(None, "1", self.validator), 15)
+        self.validator.get_route_ringtime.assert_called_once_with("1")
+
+    def test_no_route_returns_none(self):
+        self.assertIsNone(self.resolve(None, None, self.validator))
+        self.validator.get_route_ringtime.assert_not_called()
+
+    def test_invalid_explicit_falls_back_to_ringtime(self):
+        self.assertEqual(self.resolve("abc", "1", self.validator), 15)

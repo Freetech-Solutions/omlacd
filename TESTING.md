@@ -367,6 +367,12 @@ En el módulo `transfer.py` (`TransferManager`), se generan los siguientes logs 
     - El `timeout` efectivo en las originaciones hacia el agente cuando aplica.
   - Si `attempt_timeout` no es válido (no numérico o ≤ 0), se ignora y se usa `DEFAULT_ORIGINATE_TIMEOUT`.  
     Se genera un log `warning` con el valor rechazado.
+- **Precedencia de timeout en originates hacia PSTN** (`dial_to_pstn` / manual / legacy):
+  1. `attempt_timeout` explícito en el payload (si es entero positivo).
+  2. `RINGTIME` de la ruta saliente efectiva (`OML:OUTR:{id}`), resuelto por `RouteValidator.get_route_ringtime`.
+  3. `DEFAULT_ORIGINATE_TIMEOUT` (default 30s).
+  - El valor proveniente de `RINGTIME` se usa **solo** como argumento `timeout` del originate ARI.
+    No se inyecta en `metadata` / `appArgs` / payloads de reportes (DIAL, NOANSWER, ChannelDestroyed, etc.).
 - **Estandarización de logging**:
   - Los módulos nuevos y refactorizados usan loggers creados como `logging.getLogger(__name__)`, de modo que:
     - El nombre de logger coincide con el módulo Python.

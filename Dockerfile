@@ -23,6 +23,7 @@ COPY source/astconf/retrieve_conf/ /etc/asterisk/retrieve_conf/
 COPY source/ari-app/ /opt/asterisk/ari-app/
 COPY source/tests_unit/ /opt/asterisk/source/tests_unit/
 COPY source/workers/ /opt/asterisk/workers/
+COPY source/scripts/ /opt/asterisk/scripts/
 COPY .flake8 /opt/asterisk/.flake8
 COPY pytest.ini /opt/asterisk/pytest.ini
 COPY build/docker-entrypoint.sh /docker-entrypoint.sh
