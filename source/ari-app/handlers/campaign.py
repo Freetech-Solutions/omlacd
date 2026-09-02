@@ -39,7 +39,7 @@ from state_helpers import (
 if TYPE_CHECKING:
     from services.legacy_forwarder import LegacyEventForwarder
     from services.pstn_reported_store import PstnReportedStore
-from utils import compute_bot_agent_durations, parse_ari_args
+from utils import compute_bot_agent_durations, is_shortcall_duration, parse_ari_args
 
 
 logger = logging.getLogger(__name__)
@@ -284,6 +284,19 @@ class ProgressiveCampaignHandler(BaseHandler):
             bot_duration, agent_duration = compute_bot_agent_durations(
                 context, end_iso, duracion_llamada
             )
+            is_voicebot = bool(getattr(context, "is_voicebot", False))
+            is_shortcall = is_shortcall_duration(
+                agent_duration,
+                bot_duration,
+                is_voicebot=is_voicebot and not bool(
+                    getattr(context, "is_voicebot_transfer", False)
+                ),
+            )
+            event_final = (
+                HangupCause.EXIT_SHORTCALL.value
+                if is_shortcall
+                else HangupCause.EXIT_ANSWERED.value
+            )
             if self.reporter:
                 try:
                     if context.agent_answered_ts and context.bridge_created_ts:
@@ -321,7 +334,7 @@ class ProgressiveCampaignHandler(BaseHandler):
                     quien_corto = 1 if getattr(context, "inbound_agent_hung_up_first", False) else 2
                     self.reporter.log_segment_end(
                         call_data=call_data,
-                        event_final="EXIT_ANSWERED",
+                        event_final=event_final,
                         is_transfer=False,
                         quien_corto=quien_corto,
                         uniqueid=uniqueid,
@@ -339,20 +352,31 @@ class ProgressiveCampaignHandler(BaseHandler):
                         channel_leg_end_ts=end_iso,
                     )
                 except Exception:
-                    logger.exception("Error log_segment_end EXIT_ANSWERED para %s", call_id)
-            # ATT al dialer; sin cleanup_pending_dial (ChannelDestroyed libera OML:CALLS).
+                    logger.exception(
+                        "Error log_segment_end %s para %s", event_final, call_id
+                    )
+            # Acuse al dialer; sin cleanup_pending_dial (ChannelDestroyed libera OML:CALLS).
             if self.legacy_forwarder and context.id_camp is not None:
                 try:
-                    self.legacy_forwarder.submit_dial_exit_answered(
-                        context.id_camp,
-                        context.id_customer or "",
-                        context.phone_number or "",
-                        agent_duration,
-                        callid=call_id or uniqueid or "",
-                    )
+                    dialer_callid = call_id or uniqueid or ""
+                    id_customer = context.id_customer or ""
+                    phone = context.phone_number or ""
+                    if is_shortcall:
+                        self.legacy_forwarder.submit_dial_exit_shortcall(
+                            context.id_camp, id_customer, phone, callid=dialer_callid
+                        )
+                    else:
+                        self.legacy_forwarder.submit_dial_exit_answered(
+                            context.id_camp,
+                            id_customer,
+                            phone,
+                            agent_duration,
+                            callid=dialer_callid,
+                        )
                 except Exception:
                     logger.exception(
-                        "Error acusando EXIT_ANSWERED (ATT) al dialer call_id=%s",
+                        "Error acusando %s al dialer call_id=%s",
+                        event_final,
                         call_id,
                     )
 
@@ -423,12 +447,14 @@ class ProgressiveCampaignHandler(BaseHandler):
             return False
 
         uniqueid_pstn = getattr(context, "uniqueid_pstn", None)
-        end_iso = datetime.now().isoformat()
+        end_iso = datetime.now().astimezone().isoformat()
         bridge_wait_time = 0.0
         duracion_llamada = 0.0
         if context.bridge_created_ts:
             try:
                 start_dt = datetime.fromisoformat(context.bridge_created_ts)
+                if start_dt.tzinfo is None:
+                    start_dt = start_dt.replace(tzinfo=datetime.now().astimezone().tzinfo)
                 end_dt = datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
                 duracion_llamada = max(0.0, (end_dt - start_dt).total_seconds())
                 bridge_wait_time = duracion_llamada

@@ -29,6 +29,7 @@ sys.modules["config"].settings.NODE_ID = "test-node"
 sys.modules["config"].settings.REDIS_URL = "redis://localhost:6379/0"
 sys.modules["config"].settings.ARI_APP = "oml"
 sys.modules["config"].settings.DEFAULT_ORIGINATE_TIMEOUT = 30
+sys.modules["config"].settings.SHORTCALL_DURATION_THRESHOLD_SEC = 5
 
 try:
     from pydantic import BaseModel as RealBaseModel
@@ -68,7 +69,7 @@ if not USE_REAL_PYDANTIC:
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "ari-app"))
 sys.modules.setdefault("gearman", MagicMock())
 
-from constants import CallType  # noqa: E402
+from constants import CallType, HangupCause  # noqa: E402
 from handlers.campaign import ProgressiveCampaignHandler  # noqa: E402
 from models import ChannelDestroyedEvent  # noqa: E402
 from state import CallContext, CallType as StateCallType  # noqa: E402
@@ -104,6 +105,7 @@ def _progressive_context(
     call_id: str = "prog-1",
     pstn_channel: str = "pstn-ch-1",
     agent_answered: bool = True,
+    agent_answered_ts: str = None,
 ) -> CallContext:
     ctx = CallContext(
         call_id=call_id,
@@ -119,7 +121,7 @@ def _progressive_context(
         queue_timeout_seconds=120,
     )
     if agent_answered:
-        ctx.agent_answered_ts = "2024-06-01T10:00:05+00:00"
+        ctx.agent_answered_ts = agent_answered_ts or "2024-06-01T10:00:05+00:00"
         ctx.agent_connected_channel = "agent-ch-1"
     return ctx
 
@@ -149,6 +151,133 @@ class TestFinalizeProgressivePstnEnd(unittest.TestCase):
             "EXIT_ANSWERED",
         )
         state_store.unregister.assert_called_once_with("prog-1")
+
+    def test_short_agent_talk_reports_exit_shortcall(self):
+        """Con bridge ACD–agente y talk < umbral → EXIT_SHORTCALL + Dial al dialer."""
+        from datetime import datetime, timedelta, timezone
+
+        state_store = MagicMock()
+        reporter = MagicMock()
+        legacy_forwarder = MagicMock()
+        now = datetime.now(timezone.utc)
+        two_sec_ago = (now - timedelta(seconds=2)).isoformat()
+        context = _progressive_context(agent_answered_ts=two_sec_ago)
+        # bridge_created_ts reciente para coherencia de métricas
+        context.bridge_created_ts = (now - timedelta(seconds=5)).isoformat()
+        state_store.get_by_channel.return_value = context
+        state_store.mark_call_ended_atomic.return_value = True
+        state_store.get.return_value = context
+        state_store.lock.return_value.__enter__ = MagicMock(return_value=None)
+        state_store.lock.return_value.__exit__ = MagicMock(return_value=False)
+
+        handler = _make_handler(
+            state_store=state_store,
+            reporter=reporter,
+            legacy_forwarder=legacy_forwarder,
+        )
+        handler.on_pstn_stasis_end("pstn-ch-1")
+
+        reporter.log_segment_end.assert_called_once()
+        self.assertEqual(
+            reporter.log_segment_end.call_args.kwargs.get("event_final"),
+            HangupCause.EXIT_SHORTCALL.value,
+        )
+        legacy_forwarder.submit_dial_exit_shortcall.assert_called_once_with(
+            16, 21, "123456766", callid="prog-1",
+        )
+        legacy_forwarder.submit_dial_exit_answered.assert_not_called()
+
+    def test_long_agent_talk_reports_exit_answered_to_dialer(self):
+        """Talk >= umbral → EXIT_ANSWERED + ATT al dialer."""
+        state_store = MagicMock()
+        reporter = MagicMock()
+        legacy_forwarder = MagicMock()
+        context = _progressive_context()  # ts 2024 → talk largo
+        state_store.get_by_channel.return_value = context
+        state_store.mark_call_ended_atomic.return_value = True
+        state_store.get.return_value = context
+        state_store.lock.return_value.__enter__ = MagicMock(return_value=None)
+        state_store.lock.return_value.__exit__ = MagicMock(return_value=False)
+
+        handler = _make_handler(
+            state_store=state_store,
+            reporter=reporter,
+            legacy_forwarder=legacy_forwarder,
+        )
+        handler.on_pstn_stasis_end("pstn-ch-1")
+
+        self.assertEqual(
+            reporter.log_segment_end.call_args.kwargs.get("event_final"),
+            HangupCause.EXIT_ANSWERED.value,
+        )
+        legacy_forwarder.submit_dial_exit_answered.assert_called_once()
+        legacy_forwarder.submit_dial_exit_shortcall.assert_not_called()
+
+    def test_voicebot_short_bot_duration_reports_exit_shortcall(self):
+        """Solo voicebot con bot_duration < umbral → EXIT_SHORTCALL."""
+        from datetime import datetime, timedelta, timezone
+
+        state_store = MagicMock()
+        reporter = MagicMock()
+        legacy_forwarder = MagicMock()
+        now = datetime.now(timezone.utc)
+        two_sec_ago = (now - timedelta(seconds=2)).isoformat()
+        context = _progressive_context(agent_answered_ts=two_sec_ago)
+        context.bridge_created_ts = (now - timedelta(seconds=3)).isoformat()
+        context.is_voicebot = True
+        context.is_voicebot_transfer = False
+        state_store.get_by_channel.return_value = context
+        state_store.mark_call_ended_atomic.return_value = True
+        state_store.get.return_value = context
+        state_store.lock.return_value.__enter__ = MagicMock(return_value=None)
+        state_store.lock.return_value.__exit__ = MagicMock(return_value=False)
+
+        handler = _make_handler(
+            state_store=state_store,
+            reporter=reporter,
+            legacy_forwarder=legacy_forwarder,
+        )
+        handler.on_pstn_stasis_end("pstn-ch-1")
+
+        self.assertEqual(
+            reporter.log_segment_end.call_args.kwargs.get("event_final"),
+            HangupCause.EXIT_SHORTCALL.value,
+        )
+        legacy_forwarder.submit_dial_exit_shortcall.assert_called_once()
+
+    def test_voicebot_long_bot_duration_reports_exit_answered(self):
+        """Solo voicebot con bot_duration >= umbral → EXIT_ANSWERED."""
+        from datetime import datetime, timedelta, timezone
+
+        state_store = MagicMock()
+        reporter = MagicMock()
+        legacy_forwarder = MagicMock()
+        now = datetime.now(timezone.utc)
+        # bridge hace 30s → bot_duration largo (>= umbral 5)
+        long_ago = (now - timedelta(seconds=30)).isoformat()
+        context = _progressive_context(agent_answered_ts=long_ago)
+        context.bridge_created_ts = long_ago
+        context.is_voicebot = True
+        context.is_voicebot_transfer = False
+        state_store.get_by_channel.return_value = context
+        state_store.mark_call_ended_atomic.return_value = True
+        state_store.get.return_value = context
+        state_store.lock.return_value.__enter__ = MagicMock(return_value=None)
+        state_store.lock.return_value.__exit__ = MagicMock(return_value=False)
+
+        handler = _make_handler(
+            state_store=state_store,
+            reporter=reporter,
+            legacy_forwarder=legacy_forwarder,
+        )
+        handler.on_pstn_stasis_end("pstn-ch-1")
+
+        self.assertEqual(
+            reporter.log_segment_end.call_args.kwargs.get("event_final"),
+            HangupCause.EXIT_ANSWERED.value,
+        )
+        legacy_forwarder.submit_dial_exit_answered.assert_called_once()
+        legacy_forwarder.submit_dial_exit_shortcall.assert_not_called()
 
     def test_stasis_end_reports_when_wins_mark(self):
         state_store = MagicMock()

@@ -2,7 +2,8 @@
 Tests para EXIT_SHORTCALL: llamadas con bridge ACD–agente cortas.
 
 Verifica:
-- Constantes HangupCause.EXIT_SHORTCALL y SHORTCALL_DURATION_THRESHOLD_SEC
+- HangupCause.EXIT_SHORTCALL y umbral SHORTCALL_DURATION_THRESHOLD_SEC (Settings / env)
+- Helper is_shortcall_duration
 - Router guarda timestamp de contestación (Dial ANSWER to_pstn) en _pstn_answer_ts
 - ChannelDestroyed con state=Up y metadata pendiente sin agente: EXIT_ANSWERED (nunca SHORTCALL)
 - pstn_reported_store evita duplicar final tras EXIT_TIMEOUT de cola
@@ -31,7 +32,8 @@ os.environ.setdefault("REDIS_URL", "redis://127.0.0.1:6379/0")
 sys.modules.setdefault("redis", MagicMock())
 sys.modules.setdefault("gearman", MagicMock())
 
-from constants import HangupCause, SHORTCALL_DURATION_THRESHOLD_SEC  # noqa: E402
+from constants import HangupCause  # noqa: E402
+from utils import is_shortcall_duration  # noqa: E402
 
 # Importar router solo si las dependencias están disponibles (requests, etc.)
 AcDRouter = None
@@ -42,13 +44,49 @@ except (ModuleNotFoundError, ImportError):
 
 
 class TestExitShortcallConstants(unittest.TestCase):
-    """Constantes EXIT_SHORTCALL y umbral de duración."""
+    """HangupCause.EXIT_SHORTCALL y presencia del umbral en Settings (código)."""
 
     def test_hangup_cause_has_exit_shortcall(self):
         self.assertEqual(HangupCause.EXIT_SHORTCALL.value, "EXIT_SHORTCALL")
 
-    def test_shortcall_threshold_is_five_seconds(self):
-        self.assertEqual(SHORTCALL_DURATION_THRESHOLD_SEC, 5)
+    def test_shortcall_threshold_defined_in_config_source(self):
+        """Settings declara SHORTCALL_DURATION_THRESHOLD_SEC con default 5 (sin instanciar pydantic)."""
+        config_path = os.path.join(ARI_APP_DIR, "config.py")
+        with open(config_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        self.assertIn("SHORTCALL_DURATION_THRESHOLD_SEC: int = Field(", content)
+        self.assertIn("default=5", content)
+        self.assertNotIn(
+            "SHORTCALL_DURATION_THRESHOLD_SEC = 5",
+            open(os.path.join(ARI_APP_DIR, "constants.py"), encoding="utf-8").read(),
+        )
+
+
+class TestIsShortcallDuration(unittest.TestCase):
+    """Helper is_shortcall_duration: talk < umbral."""
+
+    def test_human_short_is_shortcall(self):
+        self.assertTrue(is_shortcall_duration(2.0, threshold_sec=5))
+
+    def test_human_at_threshold_is_not_shortcall(self):
+        self.assertFalse(is_shortcall_duration(5.0, threshold_sec=5))
+
+    def test_human_long_is_not_shortcall(self):
+        self.assertFalse(is_shortcall_duration(10.0, threshold_sec=5))
+
+    def test_voicebot_uses_bot_duration(self):
+        self.assertTrue(
+            is_shortcall_duration(0.0, bot_duration=2.0, is_voicebot=True, threshold_sec=5)
+        )
+        self.assertFalse(
+            is_shortcall_duration(0.0, bot_duration=10.0, is_voicebot=True, threshold_sec=5)
+        )
+
+    def test_non_voicebot_ignores_bot_duration(self):
+        # agent_duration largo aunque bot sea corto
+        self.assertFalse(
+            is_shortcall_duration(10.0, bot_duration=1.0, is_voicebot=False, threshold_sec=5)
+        )
 
 
 @unittest.skipIf(AcDRouter is None, "router no importable (falta requests u otras deps)")

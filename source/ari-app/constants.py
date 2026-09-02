@@ -141,9 +141,6 @@ def map_unanswered_hangup_to_event(
     return default
 
 
-# Umbral en segundos: llamadas contestadas con duración menor se reportan como EXIT_SHORTCALL
-SHORTCALL_DURATION_THRESHOLD_SEC = 5
-
 # Clase MOH fija para llamadas dialer (bridge mientras espera agente)
 DIALER_MOH_CLASS = "dialer_1"
 

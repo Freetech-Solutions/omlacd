@@ -475,3 +475,24 @@ def compute_bot_agent_durations(
     else:
         agent_sec = max(0.0, float(duracion_llamada))
     return (0.0, agent_sec)
+
+
+def is_shortcall_duration(
+    agent_duration: float,
+    bot_duration: float = 0.0,
+    *,
+    is_voicebot: bool = False,
+    threshold_sec: Optional[float] = None,
+) -> bool:
+    """
+    True si el tiempo de conversación con agente/bot es menor al umbral SHORTCALL.
+
+    - Humano (o humano tras handoff): usa agent_duration.
+    - Solo voicebot: usa bot_duration (agent_duration=0 no dispara shortcall).
+    - Umbral: settings.SHORTCALL_DURATION_THRESHOLD_SEC si threshold_sec es None.
+    """
+    if threshold_sec is None:
+        from config import settings
+        threshold_sec = float(getattr(settings, "SHORTCALL_DURATION_THRESHOLD_SEC", 5))
+    talk = float(bot_duration) if is_voicebot else float(agent_duration)
+    return talk < float(threshold_sec)

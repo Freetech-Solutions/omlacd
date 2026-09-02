@@ -830,9 +830,9 @@ class LegacyEventForwarder:
     ) -> None:
         """
         Envía a process-event un evento Dial con dialstatus=EXIT_SHORTCALL para que el dialer
-        trate la llamada contestada y colgada en <5s como fallo de marcado
-        (set_contact_status, decrement, send-reports, final_status=2). Usado cuando
-        ChannelDestroyed con state=Up y duración < umbral.
+        trate la llamada con agente (o voicebot) y talk < SHORTCALL_DURATION_THRESHOLD_SEC
+        como fallo de marcado (set_contact_status, decrement, send-reports, final_status=2).
+        Usado desde ProgressiveCampaignHandler cuando hubo bridge ACD–agente.
         """
         self._submit_dial_status(
             "EXIT_SHORTCALL", campaign_id, contact_id, number, callid=callid
