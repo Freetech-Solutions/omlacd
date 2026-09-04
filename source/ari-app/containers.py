@@ -21,6 +21,7 @@ from transfer import TransferManager
 from router import AcDRouter
 from infrastructure.command_listener import CommandListener
 from infrastructure.gearman_listener import GearmanListener
+from infrastructure.async_gearman_publisher import AsyncGearmanPublisher
 from constants import CallType
 from services.command_dispatcher import CommandDispatcher
 from services.legacy_forwarder import LegacyEventForwarder
@@ -87,7 +88,17 @@ class ACDContainer(containers.DeclarativeContainer):
         redis_client=redis_client_base  # CallRegistry usa el cliente base directamente
     )
 
-    reporter = providers.Singleton(ACDReporter)
+    gearman_publisher = providers.Singleton(
+        AsyncGearmanPublisher,
+        gearman_servers=config.GEARMAN_SERVERS,
+        maxsize=config.GEARMAN_OUTBOUND_QUEUE_MAX,
+        submit_retries=config.GEARMAN_OUTBOUND_SUBMIT_RETRIES,
+    )
+
+    reporter = providers.Singleton(
+        ACDReporter,
+        gearman_client=gearman_publisher,
+    )
 
     # ARI Client Base (sin circuit breaker, para uso interno)
     ari_client_base = providers.Singleton(
@@ -139,6 +150,7 @@ class ACDContainer(containers.DeclarativeContainer):
         LegacyEventForwarder,
         pending_dial_store=pending_dial_store,
         reporter=reporter,
+        gearman_client=gearman_publisher,
     )
 
     # Call Service (definido antes de dialing_service y distribution_service)

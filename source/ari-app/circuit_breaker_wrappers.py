@@ -265,6 +265,10 @@ class GearmanWithCircuitBreaker:
             CircuitBreakerError: Si el circuit breaker está abierto
             Exception: Si hay un error al enviar el job
         """
+        if background:
+            # En background nunca se debe esperar WORK_COMPLETE.
+            wait_until_complete = False
+
         def _submit():
             return self._client.submit_job(
                 task,
