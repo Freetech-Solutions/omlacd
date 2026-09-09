@@ -266,6 +266,8 @@ class ARIApp:
             'REDIS_URL': settings_obj.REDIS_URL,
             'GEARMAN_SERVERS': settings_obj.GEARMAN_SERVERS,
             'GEARMAN_TASK_NAME': settings_obj.GEARMAN_TASK_NAME,
+            'GEARMAN_OUTBOUND_QUEUE_MAX': settings_obj.GEARMAN_OUTBOUND_QUEUE_MAX,
+            'GEARMAN_OUTBOUND_SUBMIT_RETRIES': settings_obj.GEARMAN_OUTBOUND_SUBMIT_RETRIES,
             'OMNILEADS_HOSTNAME': settings_obj.OMNILEADS_HOSTNAME,
             'OMNILEADS_PROTOCOL': settings_obj.OMNILEADS_PROTOCOL,
             'NODE_ID': settings_obj.NODE_ID,
@@ -649,6 +651,11 @@ class ARIApp:
                     metrics_stats = self.metrics.get_stats()
                     cb_stats = self.circuit_breaker.get_stats()
                     queue_current = self.event_queue.qsize()
+                    outbound_queue_current = 0
+                    try:
+                        outbound_queue_current = self.container.gearman_publisher().qsize()
+                    except Exception:
+                        outbound_queue_current = 0
                     
                     self.prometheus_metrics.update_queue_size(
                         current=queue_current,
@@ -665,7 +672,8 @@ class ARIApp:
                             f"Tasa de descarte: {metrics_stats['drop_rate']:.2f}%. "
                             f"Circuit breaker: {cb_stats['state']} "
                             f"(tasa: {cb_stats['drop_rate']:.2f}%). "
-                            f"Cola pendiente: {queue_current}"
+                            f"Cola pendiente: {queue_current}. "
+                            f"Cola outbound Gearman: {outbound_queue_current}"
                         )
                         
                         if metrics_stats['events_dropped'] > 0:
@@ -679,6 +687,18 @@ class ARIApp:
                                 f"Tasa de descarte: {cb_stats['drop_rate']:.2f}% "
                                 f"({cb_stats['dropped_in_window']}/{cb_stats['events_in_window']} eventos). "
                                 f"Revisar procesamiento o circuit breaker."
+                            )
+
+                        if (
+                            metrics_stats['events_received'] > 0
+                            and metrics_stats['events_processed'] == 0
+                            and queue_current > 0
+                        ):
+                            logger.critical(
+                                "🚨 ALERTA CRÍTICA: EventLoop sin progreso en el intervalo "
+                                "(received>0, processed=0, queue_current=%s). "
+                                "Posible bloqueo en procesamiento o I/O externo.",
+                                queue_current,
                             )
                 except Exception as e:
                     logger.error(f"❌ Error en monitor de métricas: {e}", exc_info=True)
@@ -808,6 +828,10 @@ class ARIApp:
                     )
             except Exception as e:
                 logger.warning("Shutdown: no se pudo vaciar pending_dial metadata: %s", e)
+            try:
+                self.container.gearman_publisher().stop(timeout=5.0)
+            except Exception as e:
+                logger.warning("Shutdown: no se pudo detener gearman_publisher: %s", e)
 
         if hasattr(self, 'container') and self.container:
             logger.info("🧹 Liberando recursos del contenedor...")

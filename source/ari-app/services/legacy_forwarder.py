@@ -30,14 +30,19 @@ class LegacyEventForwarder:
         self,
         pending_dial_store: Optional["PendingDialMetadataStore"] = None,
         reporter: Optional[Any] = None,
+        gearman_client: Optional[Any] = None,
     ):
         self.logger = logging.getLogger(__name__)
-        self.client = None
+        self.client = gearman_client
+        self._injected_client = gearman_client is not None
         self.pending_dial_store = pending_dial_store
         self.reporter = reporter
-        self._connect()
+        if not self.client:
+            self._connect()
 
     def _connect(self):
+        if self._injected_client:
+            return
         try:
             self.client = gearman.GearmanClient(settings.GEARMAN_SERVERS)
             self.logger.info(f"LegacyEventForwarder: Connected to {settings.GEARMAN_SERVERS}")
@@ -65,7 +70,12 @@ class LegacyEventForwarder:
         last_error = None
         for attempt in range(1, _PROCESS_EVENT_RETRIES + 1):
             try:
-                self.client.submit_job("process-event", payload_bytes, background=True)
+                self.client.submit_job(
+                    "process-event",
+                    payload_bytes,
+                    background=True,
+                    wait_until_complete=False,
+                )
                 return True
             except Exception as e:
                 last_error = e

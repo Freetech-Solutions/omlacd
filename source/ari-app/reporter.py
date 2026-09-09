@@ -4,6 +4,7 @@ import gearman
 import os
 from datetime import datetime
 from decimal import Decimal
+from typing import Any, Optional
 
 from config import settings
 
@@ -11,15 +12,19 @@ logger = logging.getLogger(__name__)
 
 
 class ACDReporter:
-    def __init__(self):
+    def __init__(self, gearman_client: Optional[Any] = None):
         self.gearman_servers = list(settings.GEARMAN_SERVERS)
-        self.gm_client = None
+        self.gm_client = gearman_client
+        self._injected_client = gearman_client is not None
         # Leer tenant_id y node_id de variables de entorno
         self.tenant_id = os.getenv("TENANT_ID")
         self.node_id = os.getenv("NODE_ID")
-        self._connect()
+        if not self.gm_client:
+            self._connect()
 
     def _connect(self):
+        if self._injected_client:
+            return
         try:
             self.gm_client = gearman.GearmanClient(self.gearman_servers)
             logger.info(f"Reporter conectado a Gearman: {self.gearman_servers}")

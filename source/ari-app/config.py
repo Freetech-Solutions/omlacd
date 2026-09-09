@@ -106,6 +106,16 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("GEARMAN_SERVERS", "GEARMAN_JOB_SERVERS"),
     )
     GEARMAN_TASK_NAME: str = Field(default="acd-call-processor", description="Nombre de la tarea Gearman")
+    GEARMAN_OUTBOUND_QUEUE_MAX: int = Field(
+        default=5000,
+        ge=1,
+        description="Tamaño máximo de cola outbound asíncrona hacia Gearman",
+    )
+    GEARMAN_OUTBOUND_SUBMIT_RETRIES: int = Field(
+        default=3,
+        ge=1,
+        description="Cantidad de reintentos de submit por job en publisher Gearman asíncrono",
+    )
     OMNILEADS_HOSTNAME: str = Field(default="nginx", description="Hostname del servidor Django/OMniLeads")
     OMNILEADS_PROTOCOL: str = Field(default="https", description="Protocolo para Django (http/https)")
     OMNILEADS_VERIFY_SSL: bool = Field(
