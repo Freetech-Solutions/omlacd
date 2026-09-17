@@ -200,8 +200,17 @@ class Settings(BaseSettings):
     )
 
     # Prometheus (métricas)
-    PROMETHEUS_METRICS_PORT: int = Field(default=7088, ge=1, le=65535, description="Puerto del servidor HTTP de métricas Prometheus")
-    PROMETHEUS_METRICS_ADDR: str = Field(default="0.0.0.0", description="Dirección de bind del servidor de métricas Prometheus")
+    PROMETHEUS_METRICS_PORT: int = Field(
+        default=7088,
+        ge=1,
+        le=65535,
+        description="Puerto del servidor HTTP de métricas Prometheus (env: PROMETHEUS_METRICS_PORT)",
+    )
+    PROMETHEUS_METRICS_ADDR: str = Field(
+        default="0.0.0.0",
+        description="Dirección de bind del servidor de métricas Prometheus (env: ACD_HTTP_BIND_ADDR)",
+        validation_alias=AliasChoices('ACD_HTTP_BIND_ADDR', 'PROMETHEUS_METRICS_ADDR'),
+    )
 
     # -------------------------------------------------------------------------
     # Validadores: aceptar aliases de env y normalizar valores

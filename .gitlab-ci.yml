@@ -27,6 +27,10 @@ variables:
   # y este script creará/resolverá el producto y el engagement "Continuous Security" automáticamente.
   DEFECTDOJO_PRODUCT_NAME: "OMniACD"
   OWASP_PROJECT_NAME: "OMniACD"
+  # SonarQube: solo código ARI; exclusiones default del template (OWASP HTML, htmlcov, .sonar).
+  SONAR_PROJECT_KEY: "omnileads-acd"
+  SONAR_PROJECT_NAME: "OMniLeads ACD"
+  SONAR_SOURCES: "source/ari-app"
   # DefectDojo con certificado interno/auto-firmado (override en CI/CD si usan CA pública).
   DEFECTDOJO_INSECURE: "true"
   # Sin variables → sonarqube, build, security_scan y security_report (+ gitleaks/owasp en security).
@@ -85,8 +89,10 @@ stages:
     - if: '$FULL != "true" && $BUILD != "true" && ($CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "develop-3.0" || $CI_COMMIT_BRANCH == "master-2.0" || $CI_COMMIT_BRANCH == "master-3.0" || $CI_COMMIT_BRANCH =~ /^master-.*$/ || $CI_COMMIT_BRANCH =~ /^develop-.*$/)'
 
 # Job SonarQube centralizado en omnileads/devsecops (templates/sonarqube.yml).
+# needs: [] (heredado del template): no bajar artifacts de OWASP/gitleaks al workspace de Sonar.
 sonarqube_scan:
   stage: sonarqube
+  needs: []
   <<: *sonar-rules
 
 sonarqube_defectdojo_upload:
