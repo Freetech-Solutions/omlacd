@@ -86,6 +86,9 @@ class CallContext(BaseModel):
     distribution_campaign_id: Optional[int] = None
 
     phone_number: Optional[str] = None
+    # OUTR elegida por patrón global cuando la campaña no tiene OUTR fija.
+    # La usa get_trunk_callerid para el CALLERID de la troncal en el reporte.
+    effective_route_id: Optional[str] = None
     tel_dialed: Optional[str] = None  # Inbound: número marcado (destino de la llamada)
     command_id: Optional[str] = None  # ID del comando que generó esta llamada (para idempotencia)
     call_type: Optional[int] = 0

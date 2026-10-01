@@ -373,6 +373,7 @@ class ManualCallHandler(BaseHandler):
                 id_camp=int(call_data['id_camp']) if call_data['id_camp'] else None,
                 id_customer=int(call_data['id_customer']) if call_data['id_customer'] else None,
                 phone_number=call_data['tel_customer'],
+                effective_route_id=call_data.get('effective_route_id') or None,
                 call_type=call_data.get('call_type', 1),  # Tipo de llamada (1=Manual por defecto)
                 command_id=call_data.get('command_id'),  # ID del comando para idempotencia
                 bridge_created_ts=datetime.now().isoformat()  # Registrar timestamp de creación del bridge
@@ -414,18 +415,25 @@ class ManualCallHandler(BaseHandler):
             route_validator,
         )
 
+        metadata = {
+            'id_camp': call_data['id_camp'],
+            'id_customer': call_data['id_customer'],
+            'tel_customer': call_data['tel_customer'],
+            'id_agent': call_data['id_agent'],
+            'channel_type': ChannelType.TO_PSTN.value,
+            'bridge_id': bridge_id,
+            'call_type': call_data['call_type'],
+        }
+        # Sin esto, get_trunk_callerid solo mira OML:CAMP OUTR/OUTCID. Si la
+        # campaña no tiene OUTR fija, la ruta matcheada por patrón se pierde y
+        # el From del INVITE cae al número marcado en vez del CALLERID de la troncal.
+        if call_data.get('effective_route_id'):
+            metadata['effective_route_id'] = call_data['effective_route_id']
+
         pstn_channel_id = self.call_service.dial_pstn(
             number=number_to_dial,
             related_call_id=call_id,
-            metadata={
-                'id_camp': call_data['id_camp'],
-                'id_customer': call_data['id_customer'],
-                'tel_customer': call_data['tel_customer'],
-                'id_agent': call_data['id_agent'],
-                'channel_type': ChannelType.TO_PSTN.value,
-                'bridge_id': bridge_id,
-                'call_type': call_data['call_type']
-            },
+            metadata=metadata,
             external_sip_trunk=args_dict.get('external_sip_trunk'),
             timeout=timeout_value
         )

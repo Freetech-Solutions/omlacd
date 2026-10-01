@@ -1,4 +1,8 @@
-FROM --platform=linux/arm64 docker.io/freetechsolutions/asterisk:20260803-49ced01b AS run
+# Base publicada por asterisk_builder (freetechsolutions/asterisk o omnileads/asterisk_base_img).
+# Sin --platform: en multi-arch (ARM64=true) buildx toma la variante amd64/arm64 del manifest.
+# Override local/CI: --build-arg ASTERISK_BASE_IMG=docker.io/.../asterisk:<tag>
+ARG ASTERISK_BASE_IMG=freetechsolutions/asterisk:20260929-8374f164
+FROM ${ASTERISK_BASE_IMG} AS run
 
 ENV LANG=en_US.utf8
 ENV NOTVISIBLE="in users profile"
