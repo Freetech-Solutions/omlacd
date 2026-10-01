@@ -53,28 +53,22 @@ def test_agent_lock_ttl_uses_ring_timeout_plus_margin(mock_redis):
 
 
 def test_reserve_agent_uses_dynamic_ttl(mock_redis, agent_status_service):
-    mock_redis.set.return_value = True
     with patch("services.distribution_service.settings") as mock_settings:
         mock_settings.AGENT_RESERVATION_MARGIN_SEC = 10
         svc = _build_distribution_service(mock_redis, agent_status_service)
-        agent_status_service.try_transition_status = MagicMock(return_value=True)
+        agent_status_service.try_reserve_for_distribution = MagicMock(return_value=True)
 
         lock_key = svc._reserve_agent(42, ring_timeout=30, call_id="call-1", cas_ready=True)
 
         assert lock_key == RedisKeys.agent_lock("42")
-        mock_redis.set.assert_called_once_with(
-            RedisKeys.agent_lock("42"),
-            "call-1",
-            nx=True,
-            ex=40,
+        agent_status_service.try_reserve_for_distribution.assert_called_once_with(
+            42, "call-1", 40
         )
-        agent_status_service.try_transition_status.assert_called_once_with(
-            42, AgentStatus.READY, AgentStatus.DIAL_CALL
-        )
+        mock_redis.set.assert_not_called()
 
 
 def test_reserve_with_cas_skips_non_ready_agent(mock_redis, agent_status_service):
-    agent_status_service.try_transition_status = MagicMock(return_value=False)
+    agent_status_service.try_reserve_for_distribution = MagicMock(return_value=False)
     svc = _build_distribution_service(mock_redis, agent_status_service)
 
     lock_key = svc._reserve_agent(42, ring_timeout=30, call_id="call-1", cas_ready=True)
@@ -83,45 +77,34 @@ def test_reserve_with_cas_skips_non_ready_agent(mock_redis, agent_status_service
     mock_redis.set.assert_not_called()
 
 
-def test_reserve_rollback_on_lock_contention(mock_redis, agent_status_service):
-    mock_redis.set.return_value = False
-    agent_status_service.try_transition_status = MagicMock(side_effect=[True, True])
-    svc = _build_distribution_service(mock_redis, agent_status_service)
-
-    lock_key = svc._reserve_agent(42, ring_timeout=30, call_id="call-1", cas_ready=True)
-
-    assert lock_key is None
-    assert agent_status_service.try_transition_status.call_count == 2
-    agent_status_service.try_transition_status.assert_any_call(
-        42, AgentStatus.READY, AgentStatus.DIAL_CALL
-    )
-    agent_status_service.try_transition_status.assert_any_call(
-        42, AgentStatus.DIAL_CALL, AgentStatus.READY
-    )
-
-
 def test_release_on_ring_timeout_restores_ready(mock_redis, agent_status_service):
-    agent_status_service.try_transition_status = MagicMock(return_value=True)
+    agent_status_service.release_distribution_reservation = MagicMock(return_value=True)
     svc = _build_distribution_service(mock_redis, agent_status_service)
     lock_key = RedisKeys.agent_lock("42")
 
-    svc._release_agent_reservation(42, lock_key, restore_ready=True)
-
-    mock_redis.delete.assert_called_once_with(lock_key)
-    agent_status_service.try_transition_status.assert_called_once_with(
-        42, AgentStatus.DIAL_CALL, AgentStatus.READY
+    svc._release_agent_reservation(
+        42, "call-1", lock_key, restore_ready=True, use_status_reservation=True
     )
+
+    agent_status_service.release_distribution_reservation.assert_called_once_with(
+        42, "call-1", restore_ready=True
+    )
+    mock_redis.delete.assert_not_called()
 
 
 def test_no_rollback_on_successful_answer_release(mock_redis, agent_status_service):
-    agent_status_service.try_transition_status = MagicMock(return_value=True)
+    agent_status_service.release_distribution_reservation = MagicMock(return_value=True)
     svc = _build_distribution_service(mock_redis, agent_status_service)
     lock_key = RedisKeys.agent_lock("42")
 
-    svc._release_agent_reservation(42, lock_key, restore_ready=False)
+    svc._release_agent_reservation(
+        42, "call-1", lock_key, restore_ready=False, use_status_reservation=True
+    )
 
-    mock_redis.delete.assert_called_once_with(lock_key)
-    agent_status_service.try_transition_status.assert_not_called()
+    agent_status_service.release_distribution_reservation.assert_called_once_with(
+        42, "call-1", restore_ready=False
+    )
+    mock_redis.delete.assert_not_called()
 
 
 def test_try_transition_status_lua_success(mock_redis, agent_status_service):
@@ -151,9 +134,8 @@ def test_try_transition_status_lua_failure(mock_redis, agent_status_service):
 
 def test_distribution_loop_skips_dial_when_cas_fails(mock_redis, agent_status_service):
     """Si CAS falla, no debe originarse llamada al agente."""
-    mock_redis.set.return_value = True
     mock_redis.smembers.return_value = [b"1"]
-    agent_status_service.try_transition_status = MagicMock(return_value=False)
+    agent_status_service.try_reserve_for_distribution = MagicMock(return_value=False)
 
     svc = _build_distribution_service(mock_redis, agent_status_service)
     ctx = MagicMock()
@@ -193,20 +175,39 @@ def test_distribution_loop_skips_dial_when_cas_fails(mock_redis, agent_status_se
     svc.call_service.dial_agent_with_headers.assert_not_called()
 
 
-def test_handle_agent_answer_releases_lock_without_restore_ready(
+def test_handle_agent_answer_keeps_lock_and_marks_accepted(
     mock_redis, agent_status_service
 ):
+    """Tras contestar, no se libera lock/lease; se marca distribution_answer_accepted."""
+    from contextlib import contextmanager
+
     agent_status_service.try_transition_status = MagicMock(return_value=True)
     svc = _build_distribution_service(mock_redis, agent_status_service)
     channel_id = "agent-ch-1"
+    ctx = MagicMock()
+    ctx.agent_id = None
+    ctx.is_voicebot = False
+    ctx.id_camp = 10
+    ctx.distribution_campaign_id = None
+
+    @contextmanager
+    def _lock(_call_id):
+        yield
+
+    svc.state_store.lock.side_effect = _lock
+    svc.state_store.get.return_value = ctx
+    mock_redis.get.return_value = "call-1"
+
     with svc._dialing_lock:
         svc._active_attempts["call-1"] = channel_id
         svc._active_attempt_agents["call-1"] = 42
 
     assert svc.handle_agent_answer("call-1", channel_id) is True
 
-    mock_redis.delete.assert_called_once_with(RedisKeys.agent_lock("42"))
+    mock_redis.delete.assert_not_called()
     agent_status_service.try_transition_status.assert_not_called()
+    assert ctx.distribution_answer_accepted is True
+    assert mock_redis.expire.call_count == 2
 
 
 def test_handle_agent_answer_no_op_when_channel_mismatch(mock_redis, agent_status_service):
@@ -223,7 +224,7 @@ def test_handle_agent_answer_no_op_when_channel_mismatch(mock_redis, agent_statu
 def test_handle_channel_failure_releases_lock_with_restore_ready(
     mock_redis, agent_status_service
 ):
-    agent_status_service.try_transition_status = MagicMock(return_value=True)
+    agent_status_service.release_distribution_reservation = MagicMock(return_value=True)
     svc = _build_distribution_service(mock_redis, agent_status_service)
     channel_id = "agent-ch-1"
     with svc._dialing_lock:
@@ -232,7 +233,7 @@ def test_handle_channel_failure_releases_lock_with_restore_ready(
 
     assert svc.handle_channel_failure("call-1", channel_id) is True
 
-    mock_redis.delete.assert_called_once_with(RedisKeys.agent_lock("42"))
-    agent_status_service.try_transition_status.assert_called_once_with(
-        42, AgentStatus.DIAL_CALL, AgentStatus.READY
+    agent_status_service.release_distribution_reservation.assert_called_once_with(
+        42, "call-1", restore_ready=True
     )
+    mock_redis.delete.assert_not_called()

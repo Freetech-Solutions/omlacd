@@ -1096,6 +1096,13 @@ class ProgressiveCampaignHandler(BaseHandler):
             with self.state_store.lock(call_id):
                 peek = self.state_store.get(call_id)
                 if not peek:
+                    if agent_id_str and self.agent_status_service:
+                        try:
+                            self.agent_status_service.release_distribution_reservation(
+                                int(agent_id_str), call_id, restore_ready=True
+                            )
+                        except (ValueError, TypeError):
+                            pass
                     return
                 bridge_id = peek.bridge_id
 
@@ -1104,11 +1111,19 @@ class ProgressiveCampaignHandler(BaseHandler):
                     "ProgressiveCampaignHandler.on_agent_stasis_start: sin bridge_id call_id=%s",
                     call_id,
                 )
+                reserved_agent_id: Optional[int] = None
                 with self.state_store.lock(call_id):
                     fc = self.state_store.get(call_id)
-                    if fc and fc.agent_attempt_channel == channel_id:
-                        fc.agent_attempt_channel = None
+                    if fc:
+                        reserved_agent_id = getattr(fc, "agent_id", None)
+                        fc.distribution_answer_accepted = False
+                        if fc.agent_attempt_channel == channel_id:
+                            fc.agent_attempt_channel = None
                         self.state_store.register_unsafe(call_id, fc)
+                if reserved_agent_id is not None and self.agent_status_service:
+                    self.agent_status_service.release_distribution_reservation(
+                        reserved_agent_id, call_id, restore_ready=True
+                    )
                 try:
                     self.ari_client.hangup_channel(channel_id)
                 except Exception:
@@ -1146,6 +1161,7 @@ class ProgressiveCampaignHandler(BaseHandler):
                         except (ValueError, TypeError):
                             pass
                 else:
+                    fresh.distribution_answer_accepted = False
                     if fresh.agent_attempt_channel == channel_id:
                         fresh.agent_attempt_channel = None
                 self.state_store.register_unsafe(call_id, fresh)
@@ -1156,6 +1172,10 @@ class ProgressiveCampaignHandler(BaseHandler):
                 phone_number = getattr(fresh, "phone_number", None)
 
             if not bridge_ok:
+                if agent_id_for_event is not None and self.agent_status_service:
+                    self.agent_status_service.release_distribution_reservation(
+                        agent_id_for_event, call_id, restore_ready=True
+                    )
                 try:
                     self.ari_client.hangup_channel(channel_id)
                 except Exception:
@@ -1172,14 +1192,47 @@ class ProgressiveCampaignHandler(BaseHandler):
                             campaign_id=id_camp,
                             contact_number=phone_number,
                         )
+                        with self.state_store.lock(call_id):
+                            vb_ctx = self.state_store.get(call_id)
+                            if vb_ctx:
+                                vb_ctx.distribution_answer_accepted = False
+                                self.state_store.register_unsafe(call_id, vb_ctx)
                     else:
-                        self.agent_status_service.set_oncall(
+                        confirmed = self.agent_status_service.try_confirm_distribution_oncall(
                             agent_id=agent_id_for_event,
                             call_id=call_id,
                             bridge_id=bridge_id,
                             campaign_id=id_camp,
                             contact_number=phone_number,
                         )
+                        if confirmed:
+                            with self.state_store.lock(call_id):
+                                ok_ctx = self.state_store.get(call_id)
+                                if ok_ctx:
+                                    ok_ctx.distribution_answer_accepted = False
+                                    self.state_store.register_unsafe(call_id, ok_ctx)
+                        else:
+                            logger.warning(
+                                "ProgressiveCampaignHandler.on_agent_stasis_start: confirmación "
+                                "ONCALL rechazada para agente %s call_id=%s; liberando reserva",
+                                agent_id_for_event,
+                                call_id,
+                            )
+                            with self.state_store.lock(call_id):
+                                fail_ctx = self.state_store.get(call_id)
+                                if fail_ctx:
+                                    fail_ctx.distribution_answer_accepted = False
+                                    if fail_ctx.agent_connected_channel == channel_id:
+                                        fail_ctx.agent_connected_channel = None
+                                    self.state_store.register_unsafe(call_id, fail_ctx)
+                            self.agent_status_service.release_distribution_reservation(
+                                agent_id_for_event, call_id, restore_ready=True
+                            )
+                            try:
+                                self.ari_client.hangup_channel(channel_id)
+                            except Exception:
+                                pass
+                            return
                 except Exception:
                     logger.exception(
                         "ProgressiveCampaignHandler.on_agent_stasis_start: error actualizando estado ONCALL "

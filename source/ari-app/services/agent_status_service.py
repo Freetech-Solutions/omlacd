@@ -102,6 +102,41 @@ redis.call('HDEL', KEYS[1], 'CALLID')
 return 1
 """
 
+# Confirma ONCALL solo si STATUS=DIALING y CALLID coincide; libera lock/lease de esa call_id.
+_CONFIRM_DISTRIBUTION_ONCALL_SCRIPT = """
+local current = redis.call('HGET', KEYS[1], 'STATUS')
+if current ~= ARGV[1] then
+    return 0
+end
+local callid = redis.call('HGET', KEYS[1], 'CALLID')
+if not callid or callid ~= ARGV[2] then
+    return 0
+end
+redis.call('HSET', KEYS[1],
+    'STATUS', ARGV[3],
+    'TIMESTAMP', ARGV[4],
+    'CALLID', ARGV[2],
+    'BRIDGE_ID', ARGV[5],
+    'NODE_ID', ARGV[8]
+)
+if ARGV[6] ~= '' then
+    redis.call('HSET', KEYS[1], 'CAMPAIGN', ARGV[6])
+end
+if ARGV[7] ~= '' then
+    redis.call('HSET', KEYS[1], 'CONTACT_NUMBER', ARGV[7])
+end
+redis.call('HDEL', KEYS[1], 'AGENT_CHANNEL_ID', 'PSTN_CHANNEL_ID')
+local lock_val = redis.call('GET', KEYS[2])
+if lock_val and lock_val == ARGV[2] then
+    redis.call('DEL', KEYS[2])
+end
+local lease_val = redis.call('GET', KEYS[3])
+if lease_val and lease_val == ARGV[2] then
+    redis.call('DEL', KEYS[3])
+end
+return 1
+"""
+
 
 class AgentStatusService:
     """
@@ -466,6 +501,85 @@ class AgentStatusService:
             call_data["contact_number"] = contact_number
         
         return self.set_status(agent_id, AgentStatus.ONCALL, call_data)
+
+    def try_confirm_distribution_oncall(
+        self,
+        agent_id: Any,
+        call_id: str,
+        bridge_id: str,
+        campaign_id: Optional[Any] = None,
+        contact_number: Optional[str] = None,
+        node_id: Optional[str] = None,
+    ) -> bool:
+        """
+        Transición atómica DIALING→ONCALL solo si STATUS=DIALING y CALLID==call_id.
+        Libera lock/lease de distribución pertenecientes a call_id.
+        No pisa el estado si otra reserva ya tomó al agente.
+        """
+        if not agent_id or not call_id or not bridge_id:
+            self.logger.warning(
+                "try_confirm_distribution_oncall: agent_id, call_id o bridge_id vacío"
+            )
+            return False
+
+        if not self.redis_client:
+            self.logger.error(
+                "try_confirm_distribution_oncall: redis_client no disponible para agente %s",
+                agent_id,
+            )
+            return False
+
+        if node_id is None:
+            node_id = getattr(settings, "NODE_ID", "acd-server01")
+
+        try:
+            agent_key = self._get_agent_key(agent_id)
+            lock_key = RedisKeys.agent_lock(str(agent_id))
+            lease_key = RedisKeys.agent_reservation_lease(str(agent_id))
+            current_timestamp = str(int(datetime.now().timestamp()))
+            campaign_str = "" if campaign_id is None else str(campaign_id)
+            contact_str = contact_number or ""
+            result = self.redis_client.eval(
+                _CONFIRM_DISTRIBUTION_ONCALL_SCRIPT,
+                3,
+                agent_key,
+                lock_key,
+                lease_key,
+                AgentStatus.DIAL_CALL.value,
+                str(call_id),
+                AgentStatus.ONCALL.value,
+                current_timestamp,
+                str(bridge_id),
+                campaign_str,
+                contact_str,
+                str(node_id),
+            )
+            if result:
+                self.logger.info(
+                    "try_confirm_distribution_oncall: agente %s confirmado ONCALL "
+                    "para call_id=%s bridge=%s",
+                    agent_id,
+                    call_id,
+                    bridge_id,
+                )
+                publish_agent_to_streams(self.redis_client, agent_id)
+            else:
+                self.logger.warning(
+                    "try_confirm_distribution_oncall: rechazo para agente %s call_id=%s "
+                    "(STATUS/CALLID no coinciden)",
+                    agent_id,
+                    call_id,
+                )
+            return bool(result)
+        except Exception as e:
+            self.logger.error(
+                "try_confirm_distribution_oncall: error confirmando agente %s call_id=%s: %s",
+                agent_id,
+                call_id,
+                e,
+                exc_info=True,
+            )
+            return False
 
     def register_voicebot_active_call(
         self,

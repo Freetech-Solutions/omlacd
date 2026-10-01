@@ -18,14 +18,20 @@ def queue_timeout_should_suppress_cleanup(ctx: CallContext) -> bool:
     """
     True si _on_queue_timeout no debe ejecutar cleanup destructivo (hangup PSTN/agente, bridge, etc.).
 
-    No basta con ``active_agent_channel`` (``agent_connected_channel``): Redis migrado desde el
-    modelo legacy o estados inconsistentes pueden tener un id en ``agent_connected_channel``
-    sin que la llamada esté realmente atendida en este runtime. En flujos inbound/progressive/voicebot
-    habituales, ``agent_answered_ts`` se persiste en el mismo ``register`` que la consolidación
-    tras ``add_channel_to_bridge`` OK.
+    También inhibe si ``distribution_answer_accepted`` está seteado: el agente ya contestó
+    (handle_agent_answer) pero aún puede no haber consolidado el bridge ni escrito
+    ``agent_answered_ts``. En ese intervalo el timeout no debe cortar la llamada.
 
-    Se exigen ambas señales: pierna consolidada en el modelo y timestamp de contestación del agente.
+    Sin ese flag, no basta con ``active_agent_channel`` (``agent_connected_channel``): Redis
+    migrado desde el modelo legacy o estados inconsistentes pueden tener un id en
+    ``agent_connected_channel`` sin que la llamada esté realmente atendida. En flujos
+    inbound/progressive/voicebot habituales, ``agent_answered_ts`` se persiste en el mismo
+    ``register`` que la consolidación tras ``add_channel_to_bridge`` OK.
+
+    Se exigen ambas señales (pierna consolidada + timestamp) o la contestación ya aceptada.
     """
+    if getattr(ctx, "distribution_answer_accepted", False):
+        return True
     if not active_agent_channel(ctx):
         return False
     return bool(getattr(ctx, "agent_answered_ts", None))
