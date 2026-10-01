@@ -14,6 +14,10 @@ import redis
 
 from config import settings
 from constants import AgentStatus, RedisKeys
+from services.supervision_fanout import (
+    publish_agent_to_streams,
+    publish_voicebot_active_calls_change,
+)
 
 _TRANSITION_STATUS_SCRIPT = """
 local current = redis.call('HGET', KEYS[1], 'STATUS')
@@ -192,6 +196,7 @@ class AgentStatusService:
                 f"AgentStatusService.set_status: Estado de agente {agent_id} "
                 f"actualizado a {status.value} en Redis"
             )
+            publish_agent_to_streams(self.redis_client, agent_id)
             return True
             
         except Exception as e:
@@ -236,6 +241,8 @@ class AgentStatusService:
                 to_status.value,
                 current_timestamp,
             )
+            if result:
+                publish_agent_to_streams(self.redis_client, agent_id)
             return bool(result)
         except Exception as e:
             self.logger.error(
@@ -288,6 +295,8 @@ class AgentStatusService:
                 str(call_id),
                 str(int(ttl_sec)),
             )
+            if result:
+                publish_agent_to_streams(self.redis_client, agent_id)
             return bool(result)
         except Exception as e:
             self.logger.error(
@@ -338,6 +347,8 @@ class AgentStatusService:
                 current_timestamp,
                 "1" if restore_ready else "0",
             )
+            if result and restore_ready:
+                publish_agent_to_streams(self.redis_client, agent_id)
             return bool(result)
         except Exception as e:
             self.logger.error(
@@ -374,6 +385,8 @@ class AgentStatusService:
                 AgentStatus.READY.value,
                 current_timestamp,
             )
+            if result:
+                publish_agent_to_streams(self.redis_client, agent_id)
             return bool(result)
         except Exception as e:
             self.logger.debug(
@@ -530,6 +543,7 @@ class AgentStatusService:
                 call_data["contact_number"] = contact_number
 
             self.set_status(agent_id, AgentStatus.ONCALL, call_data)
+            publish_voicebot_active_calls_change(self.redis_client, agent_id)
             self.logger.info(
                 "register_voicebot_active_call: agente %s call_id=%s campaña=%s",
                 agent_id,
@@ -583,6 +597,7 @@ class AgentStatusService:
             else:
                 self._sync_agent_legacy_from_active_calls(agent_id, remaining)
 
+            publish_voicebot_active_calls_change(self.redis_client, agent_id)
             self.logger.info(
                 "unregister_voicebot_active_call: agente %s call_id=%s (restantes=%s)",
                 agent_id,
@@ -760,6 +775,7 @@ class AgentStatusService:
                 f"set_postcall_and_clear_fields: Agente {agent_id} transicionado a POSTCALL "
                 f"y campos de llamada limpiados"
             )
+            publish_agent_to_streams(self.redis_client, agent_id)
             return True
             
         except Exception as e:
