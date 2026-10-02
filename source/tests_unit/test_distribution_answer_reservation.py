@@ -219,3 +219,146 @@ class TestTryConfirmDistributionOncall:
         assert ok is False
         publish.assert_not_called()
         redis_client.hset.assert_not_called()
+
+
+class TestDeferDequeueAndRedistribute:
+    def _make_service(self, state_store, redis_client=None):
+        return DistributionService(
+            ari_client=MagicMock(),
+            state_store=state_store,
+            call_service=MagicMock(),
+            queue_strategy_engine=MagicMock(),
+            redis_client=redis_client or MagicMock(),
+            reporter=MagicMock(),
+            agent_status_service=MagicMock(),
+        )
+
+    def test_handle_agent_answer_does_not_dequeue_or_update_stats(self):
+        ctx = _ctx(agent_attempt_channel="agent-ch-1", agent_id=42)
+        state_store = MagicMock()
+        state_store.get.return_value = ctx
+
+        @contextmanager
+        def _lock(_call_id):
+            yield
+
+        state_store.lock.side_effect = _lock
+
+        redis_client = MagicMock()
+        redis_client.get.return_value = "call-1"
+        svc = self._make_service(state_store, redis_client)
+        svc._active_attempts["call-1"] = "agent-ch-1"
+        svc._active_attempt_agents["call-1"] = 42
+
+        with patch.object(svc, "_dequeue_waiting") as dequeue_mock:
+            assert svc.handle_agent_answer("call-1", "agent-ch-1") is True
+            dequeue_mock.assert_not_called()
+
+        svc.queue_strategy_engine.update_stats_after_call.assert_not_called()
+        assert ctx.distribution_answer_accepted is True
+
+    def test_redistribute_restarts_with_remaining_timeout(self):
+        from datetime import datetime, timedelta
+
+        started = (datetime.now() - timedelta(seconds=40)).isoformat()
+        ctx = _ctx(
+            distribution_strategy="rrmemory",
+            distribution_ring_timeout=15,
+            distribution_queue_timeout_sec=120.0,
+            distribution_started_at_ts=started,
+            distribution_metadata={"id_camp": 10, "phone": "54911"},
+            distribution_uniqueid="uid-1",
+            distribution_answer_accepted=True,
+            agent_id=42,
+        )
+        state_store = MagicMock()
+        state_store.get.return_value = ctx
+
+        @contextmanager
+        def _lock(_call_id):
+            yield
+
+        state_store.lock.side_effect = _lock
+
+        svc = self._make_service(state_store)
+        svc._is_caller_channel_alive = MagicMock(return_value=True)
+
+        with patch.object(svc, "start_distribution") as start_mock:
+            ok = svc.redistribute_after_failed_consolidation(
+                "call-1",
+                pstn_channel_id="pstn-1",
+                on_queue_timeout_callback=MagicMock(),
+            )
+
+        assert ok is True
+        assert ctx.distribution_answer_accepted is False
+        start_mock.assert_called_once()
+        kwargs = start_mock.call_args.kwargs
+        assert kwargs["call_id"] == "call-1"
+        assert kwargs["campaign_id"] == "10"
+        assert kwargs["bridge_id"] == "bridge-1"
+        assert kwargs["strategy"] == "rrmemory"
+        assert kwargs["ring_timeout"] == 15
+        assert kwargs["queue_timeout_sec"] == pytest.approx(80.0, abs=2.0)
+        assert kwargs["pstn_channel_id"] == "pstn-1"
+        assert kwargs["uniqueid"] == "uid-1"
+
+    def test_redistribute_noop_when_already_connected(self):
+        ctx = _ctx(agent_connected_channel="agent-ch-connected")
+        state_store = MagicMock()
+        state_store.get.return_value = ctx
+
+        @contextmanager
+        def _lock(_call_id):
+            yield
+
+        state_store.lock.side_effect = _lock
+
+        svc = self._make_service(state_store)
+        with patch.object(svc, "start_distribution") as start_mock:
+            assert svc.redistribute_after_failed_consolidation("call-1") is False
+            start_mock.assert_not_called()
+
+    def test_inbound_bridge_fail_invokes_redistribute(self):
+        from handlers.inbound import InboundCallHandler
+
+        ctx = _ctx(agent_attempt_channel="agent-ch-1", agent_id=42)
+        state_store = MagicMock()
+        state_store.get.return_value = ctx
+
+        @contextmanager
+        def _lock(_call_id):
+            yield
+
+        state_store.lock.side_effect = _lock
+
+        dist = MagicMock()
+        dist.handle_agent_answer.return_value = True
+        agent_status = MagicMock()
+
+        handler = InboundCallHandler(
+            ari_client=MagicMock(),
+            state_store=state_store,
+            reporter=None,
+            call_service=MagicMock(),
+            queue_strategy_engine=MagicMock(),
+            redis_client=MagicMock(),
+            distribution_service=dist,
+            agent_status_service=agent_status,
+        )
+        handler.call_service.add_channel_to_bridge.side_effect = RuntimeError("bridge fail")
+        handler._extract_agent_id_from_agent_channel = MagicMock(return_value="42")
+
+        event = MagicMock()
+        event.channel.id = "agent-ch-1"
+        handler.on_agent_stasis_start(event, {"callid": "call-1"})
+
+        agent_status.release_distribution_reservation.assert_called_once_with(
+            42, "call-1", restore_ready=True
+        )
+        dist.redistribute_after_failed_consolidation.assert_called_once()
+        redistrib_kwargs = dist.redistribute_after_failed_consolidation.call_args
+        assert redistrib_kwargs.args[0] == "call-1"
+        assert redistrib_kwargs.kwargs["pstn_channel_id"] == "pstn-1"
+        handler.ari_client.hangup_channel.assert_called_with("agent-ch-1")
+        dist.finalize_waiting_after_oncall.assert_not_called()

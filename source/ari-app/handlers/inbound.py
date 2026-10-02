@@ -880,8 +880,12 @@ class InboundCallHandler(BaseHandler):
                 return
 
             # Cancelar timer de timeout de cola: handle_agent_answer ya detiene el loop pero no el Timer.
+            # No dequeue aún: la salida del ZSET es tras ONCALL (o redistribute si falla).
             self.distribution_service.stop_distribution(
-                call_id, cancel_timer=True, hangup_agent_channel=False
+                call_id,
+                cancel_timer=True,
+                hangup_agent_channel=False,
+                dequeue_waiting=False,
             )
 
             logger.info(
@@ -917,10 +921,12 @@ class InboundCallHandler(BaseHandler):
                     call_id,
                 )
                 reserved_agent_id: Optional[int] = None
+                pstn_for_redistribute: Optional[str] = None
                 with self.state_store.lock(call_id):
                     fc = self.state_store.get(call_id)
                     if fc:
                         reserved_agent_id = getattr(fc, "agent_id", None)
+                        pstn_for_redistribute = getattr(fc, "pstn_channel", None)
                         fc.distribution_answer_accepted = False
                         if fc.agent_attempt_channel == channel_id:
                             fc.agent_attempt_channel = None
@@ -933,6 +939,11 @@ class InboundCallHandler(BaseHandler):
                     self.ari_client.hangup_channel(channel_id)
                 except Exception:
                     pass
+                self.distribution_service.redistribute_after_failed_consolidation(
+                    call_id,
+                    pstn_channel_id=pstn_for_redistribute,
+                    on_queue_timeout_callback=lambda cid, ch: self._mark_pstn_hangup_by_app(ch),
+                )
                 return
 
             bridge_ok = False
@@ -956,6 +967,7 @@ class InboundCallHandler(BaseHandler):
             id_camp: Optional[int] = None
             agent_id_for_event: Optional[int] = None
             phone_number: Optional[str] = None
+            pstn_for_redistribute: Optional[str] = None
 
             with self.state_store.lock(call_id):
                 fresh_ctx = self.state_store.get(call_id)
@@ -991,6 +1003,7 @@ class InboundCallHandler(BaseHandler):
                 agent_id_for_event = getattr(fresh_ctx, "agent_id", None)
                 is_voicebot_for_event = getattr(fresh_ctx, "is_voicebot", False)
                 phone_number = getattr(fresh_ctx, "phone_number", None)
+                pstn_for_redistribute = getattr(fresh_ctx, "pstn_channel", None)
 
             if not bridge_ok:
                 if agent_id_for_event is not None and self.agent_status_service:
@@ -1001,6 +1014,11 @@ class InboundCallHandler(BaseHandler):
                     self.ari_client.hangup_channel(channel_id)
                 except Exception:
                     pass
+                self.distribution_service.redistribute_after_failed_consolidation(
+                    call_id,
+                    pstn_channel_id=pstn_for_redistribute,
+                    on_queue_timeout_callback=lambda cid, ch: self._mark_pstn_hangup_by_app(ch),
+                )
                 return
 
             if self.agent_status_service and agent_id_for_event and bridge_id:
@@ -1018,6 +1036,9 @@ class InboundCallHandler(BaseHandler):
                             if vb_ctx:
                                 vb_ctx.distribution_answer_accepted = False
                                 self.state_store.register_unsafe(call_id, vb_ctx)
+                        self.distribution_service.finalize_waiting_after_oncall(
+                            call_id, agent_id=agent_id_for_event
+                        )
                     else:
                         confirmed = self.agent_status_service.try_confirm_distribution_oncall(
                             agent_id=agent_id_for_event,
@@ -1032,6 +1053,9 @@ class InboundCallHandler(BaseHandler):
                                 if ok_ctx:
                                     ok_ctx.distribution_answer_accepted = False
                                     self.state_store.register_unsafe(call_id, ok_ctx)
+                            self.distribution_service.finalize_waiting_after_oncall(
+                                call_id, agent_id=agent_id_for_event
+                            )
                         else:
                             logger.warning(
                                 "InboundCallHandler.on_agent_stasis_start: confirmación ONCALL "
@@ -1053,6 +1077,11 @@ class InboundCallHandler(BaseHandler):
                                 self.ari_client.hangup_channel(channel_id)
                             except Exception:
                                 pass
+                            self.distribution_service.redistribute_after_failed_consolidation(
+                                call_id,
+                                pstn_channel_id=pstn_for_redistribute,
+                                on_queue_timeout_callback=lambda cid, ch: self._mark_pstn_hangup_by_app(ch),
+                            )
                             return
                 except Exception:
                     logger.exception(

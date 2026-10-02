@@ -141,6 +141,13 @@ class CallContext(BaseModel):
     # True desde handle_agent_answer hasta ONCALL confirmado o fallo de bridge; inhibe timeout de cola
     # y mantiene la reserva DIALING+lock hasta try_confirm_distribution_oncall.
     distribution_answer_accepted: bool = False
+    # Params para reiniciar distribución si falla consolidación post-answer
+    distribution_strategy: Optional[str] = None
+    distribution_ring_timeout: Optional[int] = None
+    distribution_queue_timeout_sec: Optional[float] = None
+    distribution_started_at_ts: Optional[str] = None
+    distribution_metadata: Optional[Dict[str, Any]] = None
+    distribution_uniqueid: Optional[str] = None
 
     @model_validator(mode="before")
     @classmethod

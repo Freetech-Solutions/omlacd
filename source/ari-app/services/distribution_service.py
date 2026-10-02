@@ -341,6 +341,37 @@ class DistributionService:
         stop_event.clear()
         attempt_finished.clear()
         self._enqueue_waiting(campaign_id, call_id)
+        meta = distribution_metadata or {}
+        try:
+            with self.state_store.lock(call_id):
+                ctx = self.state_store.get(call_id)
+                if ctx:
+                    ctx.distribution_strategy = strategy
+                    ctx.distribution_ring_timeout = int(ring_timeout)
+                    # Solo fijar timeout/started en el primer start; redistribute actualiza started
+                    # pero preserva el original vía distribution_queue_timeout_sec si ya existe.
+                    if getattr(ctx, "distribution_queue_timeout_sec", None) is None:
+                        ctx.distribution_queue_timeout_sec = float(queue_timeout_sec)
+                    if getattr(ctx, "distribution_started_at_ts", None) is None:
+                        ctx.distribution_started_at_ts = datetime.now().isoformat()
+                    ctx.distribution_metadata = dict(meta) if meta else None
+                    ctx.distribution_uniqueid = uniqueid or call_id
+                    if getattr(ctx, "queue_timeout_seconds", None) is None:
+                        try:
+                            ctx.queue_timeout_seconds = int(
+                                getattr(ctx, "distribution_queue_timeout_sec", None)
+                                or queue_timeout_sec
+                            )
+                        except (TypeError, ValueError):
+                            pass
+                    self.state_store.register_unsafe(call_id, ctx)
+        except Exception:
+            logger.exception(
+                "DistributionService.start_distribution: error persistiendo params "
+                "call_id=%s campaign_id=%s",
+                call_id,
+                campaign_id,
+            )
         if on_queue_timeout_callback is not None:
             with self._on_queue_timeout_callbacks_lock:
                 self._on_queue_timeout_callbacks[call_id] = on_queue_timeout_callback
@@ -360,7 +391,6 @@ class DistributionService:
             self._queue_timers[call_id] = timer
         timer.start()
 
-        meta = distribution_metadata or {}
         threading.Thread(
             target=self._run_distribution_loop,
             args=(call_id, campaign_id, bridge_id, meta, strategy, ring_timeout),
@@ -766,24 +796,28 @@ class DistributionService:
         *,
         cancel_timer: bool = True,
         hangup_agent_channel: bool = True,
+        dequeue_waiting: bool = True,
     ) -> None:
         """
         Detiene el loop de distribución y opcionalmente cancela el timer y cuelga el agente en intento.
         No marca call_ended ni unregister; eso queda para el handler.
+
+        dequeue_waiting=False en el path post-answer: la salida del ZSET ocurre solo tras
+        ONCALL confirmado (finalize_waiting_after_oncall) o en abandono/timeout.
         """
         stop_event, attempt_finished = self._get_or_create_call_events(call_id)
         stop_event.set()
         attempt_finished.set()
 
-        # Sacar de waiting si aún está (answer / hangup / stop explícito)
-        camp = None
-        try:
-            ctx = self.state_store.get(call_id)
-            if ctx is not None:
-                camp = effective_queue_campaign_id(ctx)
-        except Exception:
+        if dequeue_waiting:
             camp = None
-        self._dequeue_waiting(str(camp) if camp is not None else None, call_id)
+            try:
+                ctx = self.state_store.get(call_id)
+                if ctx is not None:
+                    camp = effective_queue_campaign_id(ctx)
+            except Exception:
+                camp = None
+            self._dequeue_waiting(str(camp) if camp is not None else None, call_id)
 
         if cancel_timer:
             with self._call_events_lock:
@@ -872,35 +906,167 @@ class DistributionService:
             )
             self._renew_agent_reservation_ttl(answered_agent_id, call_id, renew_ttl)
 
-            # Sale de la fila de espera: libera el head para la siguiente llamada
-            try:
-                ctx_wait = self.state_store.get(call_id)
-                camp_wait = effective_queue_campaign_id(ctx_wait) if ctx_wait else None
-            except Exception:
-                camp_wait = None
-            self._dequeue_waiting(str(camp_wait) if camp_wait is not None else None, call_id)
+            # No dequeue ni stats aquí: solo tras ONCALL confirmado.
+            # Si falla el bridge, redistribute_after_failed_consolidation reinicia la cola.
             if self._offer_coordinator:
                 self._offer_coordinator.release_if_mine(answered_agent_id, call_id)
-
-            try:
-                context = self.state_store.get(call_id)
-                q_camp = effective_queue_campaign_id(context) if context else None
-                if context and not getattr(context, "is_voicebot", False) and q_camp is not None:
-                    self.queue_strategy_engine.update_stats_after_call(
-                        agent_id=int(answered_agent_id),
-                        queue_name=str(q_camp),
-                    )
-            except Exception:
-                logger.exception(
-                    "DistributionService.handle_agent_answer: error actualizando métricas de distribución "
-                    "para call_id=%s, agent_id=%s",
-                    call_id,
-                    answered_agent_id,
-                )
 
         stop_event, attempt_finished = self._get_or_create_call_events(call_id)
         stop_event.set()
         attempt_finished.set()
+        return True
+
+    def finalize_waiting_after_oncall(self, call_id: str, agent_id: Optional[int] = None) -> None:
+        """
+        Sale del ZSET de espera y actualiza stats de estrategia tras ONCALL confirmado.
+        Idempotente si ya se hizo dequeue.
+        """
+        try:
+            context = self.state_store.get(call_id)
+            q_camp = effective_queue_campaign_id(context) if context else None
+        except Exception:
+            context = None
+            q_camp = None
+        self._dequeue_waiting(str(q_camp) if q_camp is not None else None, call_id)
+        if (
+            agent_id is not None
+            and context is not None
+            and not getattr(context, "is_voicebot", False)
+            and q_camp is not None
+        ):
+            try:
+                self.queue_strategy_engine.update_stats_after_call(
+                    agent_id=int(agent_id),
+                    queue_name=str(q_camp),
+                )
+            except Exception:
+                logger.exception(
+                    "finalize_waiting_after_oncall: error stats call_id=%s agent_id=%s",
+                    call_id,
+                    agent_id,
+                )
+
+    def redistribute_after_failed_consolidation(
+        self,
+        call_id: str,
+        *,
+        pstn_channel_id: Optional[str] = None,
+        on_queue_timeout_callback: OnQueueTimeoutCallback = None,
+    ) -> bool:
+        """
+        Tras fallo de bridge / ONCALL post-answer: limpia flags, asegura waiting ZSET
+        y reinicia start_distribution con el tiempo de cola restante.
+        """
+        try:
+            with self.state_store.lock(call_id):
+                context = self.state_store.get(call_id)
+                if not context:
+                    logger.info(
+                        "redistribute_after_failed_consolidation: sin contexto call_id=%s",
+                        call_id,
+                    )
+                    return False
+                if getattr(context, "call_ended", False):
+                    return False
+                if getattr(context, "is_voicebot", False):
+                    return False
+                if active_agent_channel(context):
+                    # Ya consolidado; no redistribuir
+                    return False
+
+                context.distribution_answer_accepted = False
+                context.agent_attempt_channel = None
+                if getattr(context, "agent_connected_channel", None):
+                    context.agent_connected_channel = None
+                self.state_store.register_unsafe(call_id, context)
+
+                campaign_id = effective_queue_campaign_id(context)
+                bridge_id = getattr(context, "bridge_id", None)
+                strategy = getattr(context, "distribution_strategy", None) or "fewestcalls"
+                ring_timeout = int(getattr(context, "distribution_ring_timeout", None) or 45)
+                meta = getattr(context, "distribution_metadata", None) or {}
+                uniqueid = getattr(context, "distribution_uniqueid", None) or call_id
+                original_timeout = getattr(context, "distribution_queue_timeout_sec", None)
+                if original_timeout is None:
+                    original_timeout = getattr(context, "queue_timeout_seconds", None) or 3600
+                original_timeout = float(original_timeout)
+                started_ts = getattr(context, "distribution_started_at_ts", None)
+                pstn = pstn_channel_id or getattr(context, "pstn_channel", None)
+        except Exception:
+            logger.exception(
+                "redistribute_after_failed_consolidation: error leyendo contexto call_id=%s",
+                call_id,
+            )
+            return False
+
+        if not campaign_id or not bridge_id:
+            logger.warning(
+                "redistribute_after_failed_consolidation: faltan campaign/bridge call_id=%s "
+                "campaign=%s bridge=%s",
+                call_id,
+                campaign_id,
+                bridge_id,
+            )
+            return False
+
+        if pstn and not self._is_caller_channel_alive(pstn):
+            logger.info(
+                "redistribute_after_failed_consolidation: PSTN muerto call_id=%s channel=%s",
+                call_id,
+                pstn,
+            )
+            return False
+
+        # Cancelar timer residual sin sacar del ZSET (answer path / campaign)
+        with self._call_events_lock:
+            old_timer = self._queue_timers.pop(call_id, None)
+        if old_timer:
+            try:
+                old_timer.cancel()
+            except Exception:
+                pass
+
+        # Asegurar ZSET (preservar score si ya existe)
+        if self._queue_weight_enabled() and self._waiting_inventory:
+            existing = self._waiting_inventory.get_enqueued_at_ms(str(campaign_id), call_id)
+            if existing is None:
+                with self._waiting_enqueued_at_lock:
+                    cached = self._waiting_enqueued_at.get(call_id)
+                self._waiting_inventory.enqueue(
+                    str(campaign_id), call_id, enqueued_at_ms=cached
+                )
+                if cached is not None:
+                    with self._waiting_enqueued_at_lock:
+                        self._waiting_enqueued_at[call_id] = cached
+
+        remaining = original_timeout
+        if started_ts:
+            try:
+                started = datetime.fromisoformat(started_ts)
+                elapsed = (datetime.now() - started).total_seconds()
+                remaining = max(1.0, original_timeout - elapsed)
+            except Exception:
+                remaining = max(1.0, original_timeout)
+
+        logger.info(
+            "redistribute_after_failed_consolidation: reiniciando distribución call_id=%s "
+            "campaign=%s remaining_timeout=%.1fs",
+            call_id,
+            campaign_id,
+            remaining,
+        )
+        self.start_distribution(
+            call_id=call_id,
+            campaign_id=str(campaign_id),
+            bridge_id=str(bridge_id),
+            strategy=str(strategy),
+            ring_timeout=ring_timeout,
+            queue_timeout_sec=remaining,
+            pstn_channel_id=pstn,
+            uniqueid=uniqueid,
+            distribution_metadata=meta if isinstance(meta, dict) else {},
+            on_queue_timeout_callback=on_queue_timeout_callback,
+        )
         return True
 
     def handle_channel_failure(self, call_id: str, channel_id: str) -> bool:
