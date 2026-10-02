@@ -20,7 +20,11 @@ from config import settings
 from constants import HangupCause, RedisKeys
 from queue_events import QueueEventManager
 from services.call_manager import CallActionService
+from services.campaign_config import get_campaign_config_with_defaults
 from services.queue_strategy import AgentProfile, QueueStrategyEngine
+from services.routing.call_priority import compute_call_priority
+from services.routing.offer_coordinator import OfferCoordinator
+from services.routing.waiting_inventory import WaitingInventory
 from state import CallContext, CallRegistry
 from state_helpers import (
     active_agent_channel,
@@ -83,6 +87,44 @@ class DistributionService:
         # waiter (race comando Redis vs evento ARI): call_id -> monotonic ts. Se consumen
         # al registrar el waiter y se purgan por TTL (VOICEBOT_TRANSFER_PENDING_CMD_TTL_SEC).
         self._voicebot_transfer_pending: Dict[str, float] = {}
+        # Fairness: enqueued_at_ms por call_id (caché local del ZSET)
+        self._waiting_enqueued_at: Dict[str, float] = {}
+        self._waiting_enqueued_at_lock = threading.Lock()
+        self._waiting_inventory = WaitingInventory(redis_client) if redis_client else None
+        self._offer_coordinator = OfferCoordinator(redis_client) if redis_client else None
+
+    def _queue_weight_enabled(self) -> bool:
+        return bool(getattr(settings, "ACD_QUEUE_WEIGHT_ENABLED", True))
+
+    def _enqueue_waiting(self, campaign_id: str, call_id: str) -> None:
+        if not self._queue_weight_enabled() or not self._waiting_inventory:
+            return
+        score = self._waiting_inventory.enqueue(campaign_id, call_id)
+        with self._waiting_enqueued_at_lock:
+            self._waiting_enqueued_at[call_id] = score
+
+    def _dequeue_waiting(self, campaign_id: Optional[str], call_id: str) -> None:
+        if not self._waiting_inventory:
+            with self._waiting_enqueued_at_lock:
+                self._waiting_enqueued_at.pop(call_id, None)
+            return
+        if campaign_id is not None and str(campaign_id).strip() != "":
+            self._waiting_inventory.dequeue(str(campaign_id), call_id)
+        with self._waiting_enqueued_at_lock:
+            self._waiting_enqueued_at.pop(call_id, None)
+
+    def _get_enqueued_at_ms(self, campaign_id: str, call_id: str) -> float:
+        with self._waiting_enqueued_at_lock:
+            cached = self._waiting_enqueued_at.get(call_id)
+        if cached is not None:
+            return cached
+        if self._waiting_inventory:
+            score = self._waiting_inventory.get_enqueued_at_ms(campaign_id, call_id)
+            if score is not None:
+                with self._waiting_enqueued_at_lock:
+                    self._waiting_enqueued_at[call_id] = score
+                return score
+        return time.time() * 1000.0
 
     def _purge_voicebot_transfer_pending_locked(self) -> None:
         """Elimina comandos pendientes expirados. Llamar con _voicebot_transfer_waiters_lock tomado."""
@@ -246,22 +288,25 @@ class DistributionService:
         use_status_reservation: bool = False,
     ) -> None:
         """Libera reserva de agente (lock/lease + opcional DIALING→READY)."""
-        if use_status_reservation and self.agent_status_service:
-            self.agent_status_service.release_distribution_reservation(
-                agent_id, call_id, restore_ready=restore_ready
-            )
-            return
-
         try:
-            current = self.redis_client.get(lock_key)
-            if current is None or str(current) == str(call_id):
-                self.redis_client.delete(lock_key)
-        except Exception as e:
-            logger.debug(
-                "DistributionService._release_agent_reservation: error borrando %s: %s",
-                lock_key,
-                e,
-            )
+            if use_status_reservation and self.agent_status_service:
+                self.agent_status_service.release_distribution_reservation(
+                    agent_id, call_id, restore_ready=restore_ready
+                )
+            else:
+                try:
+                    current = self.redis_client.get(lock_key)
+                    if current is None or str(current) == str(call_id):
+                        self.redis_client.delete(lock_key)
+                except Exception as e:
+                    logger.debug(
+                        "DistributionService._release_agent_reservation: error borrando %s: %s",
+                        lock_key,
+                        e,
+                    )
+        finally:
+            if self._offer_coordinator:
+                self._offer_coordinator.release_if_mine(agent_id, call_id)
 
     def start_distribution(
         self,
@@ -295,6 +340,7 @@ class DistributionService:
         stop_event, attempt_finished = self._get_or_create_call_events(call_id)
         stop_event.clear()
         attempt_finished.clear()
+        self._enqueue_waiting(campaign_id, call_id)
         if on_queue_timeout_callback is not None:
             with self._on_queue_timeout_callbacks_lock:
                 self._on_queue_timeout_callbacks[call_id] = on_queue_timeout_callback
@@ -729,6 +775,16 @@ class DistributionService:
         stop_event.set()
         attempt_finished.set()
 
+        # Sacar de waiting si aún está (answer / hangup / stop explícito)
+        camp = None
+        try:
+            ctx = self.state_store.get(call_id)
+            if ctx is not None:
+                camp = effective_queue_campaign_id(ctx)
+        except Exception:
+            camp = None
+        self._dequeue_waiting(str(camp) if camp is not None else None, call_id)
+
         if cancel_timer:
             with self._call_events_lock:
                 timer = self._queue_timers.pop(call_id, None)
@@ -816,6 +872,16 @@ class DistributionService:
             )
             self._renew_agent_reservation_ttl(answered_agent_id, call_id, renew_ttl)
 
+            # Sale de la fila de espera: libera el head para la siguiente llamada
+            try:
+                ctx_wait = self.state_store.get(call_id)
+                camp_wait = effective_queue_campaign_id(ctx_wait) if ctx_wait else None
+            except Exception:
+                camp_wait = None
+            self._dequeue_waiting(str(camp_wait) if camp_wait is not None else None, call_id)
+            if self._offer_coordinator:
+                self._offer_coordinator.release_if_mine(answered_agent_id, call_id)
+
             try:
                 context = self.state_store.get(call_id)
                 q_camp = effective_queue_campaign_id(context) if context else None
@@ -891,6 +957,13 @@ class DistributionService:
             stop_event, attempt_finished = self._get_or_create_call_events(call_id)
             last_agents_fetch_time = 0.0
             cached_member_ids: List[int] = []
+            campaign_weight = 0
+            try:
+                camp_cfg = get_campaign_config_with_defaults(self.redis_client, str(id_camp))
+                campaign_weight = int(camp_cfg.get("weight") or 0)
+            except Exception:
+                campaign_weight = 0
+            weight_routing = self._queue_weight_enabled()
 
             try:
                 while not stop_event.is_set():
@@ -915,6 +988,12 @@ class DistributionService:
                                 context.agent_connected_channel,
                             )
                             return
+
+                        if weight_routing and self._waiting_inventory:
+                            if not self._waiting_inventory.is_queue_head(str(id_camp), call_id):
+                                if stop_event.wait(0.3):
+                                    break
+                                continue
 
                         now = time.monotonic()
                         if last_agents_fetch_time > 0 and (
@@ -1006,10 +1085,30 @@ class DistributionService:
                                 "agent_id": candidate.agent_id,
                             }
 
+                            if weight_routing and self._offer_coordinator:
+                                enqueued_at_ms = self._get_enqueued_at_ms(str(id_camp), call_id)
+                                wait_sec = max(
+                                    0.0, (time.time() * 1000.0 - enqueued_at_ms) / 1000.0
+                                )
+                                priority = compute_call_priority(campaign_weight, wait_sec)
+                                offer_ttl = self._agent_lock_ttl(ring_timeout)
+                                if not self._offer_coordinator.try_claim(
+                                    candidate.agent_id,
+                                    call_id,
+                                    priority,
+                                    enqueued_at_ms,
+                                    offer_ttl,
+                                ):
+                                    continue
+
                             lock_key = self._reserve_agent(
                                 candidate.agent_id, ring_timeout, call_id, cas_ready=True
                             )
                             if not lock_key:
+                                if weight_routing and self._offer_coordinator:
+                                    self._offer_coordinator.release_if_mine(
+                                        candidate.agent_id, call_id
+                                    )
                                 continue
 
                             pre_generated_channel_id = str(uuid.uuid4())
@@ -1237,6 +1336,7 @@ class DistributionService:
                 with self._on_queue_timeout_callbacks_lock:
                     self._on_queue_timeout_callbacks.pop(call_id, None)
                 return
+            self._dequeue_waiting(str(id_camp), call_id)
             context_for_report = context
 
         # Callback (p. ej. EXIT_TIMEOUT al dialer) solo si vamos a cortar de verdad.
