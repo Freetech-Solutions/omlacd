@@ -1079,6 +1079,13 @@ class ProgressiveCampaignHandler(BaseHandler):
                 return
             if not self.distribution_service.handle_agent_answer(call_id, channel_id):
                 return
+            # Parar loop + timer; no dequeue hasta ONCALL / redistribute
+            self.distribution_service.stop_distribution(
+                call_id,
+                cancel_timer=True,
+                hangup_agent_channel=False,
+                dequeue_waiting=False,
+            )
             logger.info(
                 "[Progressive] Agente contestó: canal %s para call_id=%s",
                 channel_id,
@@ -1112,10 +1119,12 @@ class ProgressiveCampaignHandler(BaseHandler):
                     call_id,
                 )
                 reserved_agent_id: Optional[int] = None
+                pstn_for_redistribute: Optional[str] = None
                 with self.state_store.lock(call_id):
                     fc = self.state_store.get(call_id)
                     if fc:
                         reserved_agent_id = getattr(fc, "agent_id", None)
+                        pstn_for_redistribute = getattr(fc, "pstn_channel", None)
                         fc.distribution_answer_accepted = False
                         if fc.agent_attempt_channel == channel_id:
                             fc.agent_attempt_channel = None
@@ -1128,6 +1137,11 @@ class ProgressiveCampaignHandler(BaseHandler):
                     self.ari_client.hangup_channel(channel_id)
                 except Exception:
                     pass
+                self.distribution_service.redistribute_after_failed_consolidation(
+                    call_id,
+                    pstn_channel_id=pstn_for_redistribute,
+                    on_queue_timeout_callback=self._on_queue_timeout_for_dialer,
+                )
                 return
 
             bridge_ok = False
@@ -1141,6 +1155,7 @@ class ProgressiveCampaignHandler(BaseHandler):
             id_camp: Optional[int] = None
             agent_id_for_event: Optional[int] = None
             phone_number: Optional[str] = None
+            pstn_for_redistribute: Optional[str] = None
             with self.state_store.lock(call_id):
                 fresh = self.state_store.get(call_id)
                 if not fresh:
@@ -1170,6 +1185,7 @@ class ProgressiveCampaignHandler(BaseHandler):
                 is_voicebot_for_event = getattr(fresh, "is_voicebot", False)
                 queue_uniqueid = fresh.uniqueid_pstn or call_id
                 phone_number = getattr(fresh, "phone_number", None)
+                pstn_for_redistribute = getattr(fresh, "pstn_channel", None)
 
             if not bridge_ok:
                 if agent_id_for_event is not None and self.agent_status_service:
@@ -1180,6 +1196,11 @@ class ProgressiveCampaignHandler(BaseHandler):
                     self.ari_client.hangup_channel(channel_id)
                 except Exception:
                     pass
+                self.distribution_service.redistribute_after_failed_consolidation(
+                    call_id,
+                    pstn_channel_id=pstn_for_redistribute,
+                    on_queue_timeout_callback=self._on_queue_timeout_for_dialer,
+                )
                 return
 
             if self.agent_status_service and agent_id_for_event and bridge_id:
@@ -1197,6 +1218,9 @@ class ProgressiveCampaignHandler(BaseHandler):
                             if vb_ctx:
                                 vb_ctx.distribution_answer_accepted = False
                                 self.state_store.register_unsafe(call_id, vb_ctx)
+                        self.distribution_service.finalize_waiting_after_oncall(
+                            call_id, agent_id=agent_id_for_event
+                        )
                     else:
                         confirmed = self.agent_status_service.try_confirm_distribution_oncall(
                             agent_id=agent_id_for_event,
@@ -1211,6 +1235,9 @@ class ProgressiveCampaignHandler(BaseHandler):
                                 if ok_ctx:
                                     ok_ctx.distribution_answer_accepted = False
                                     self.state_store.register_unsafe(call_id, ok_ctx)
+                            self.distribution_service.finalize_waiting_after_oncall(
+                                call_id, agent_id=agent_id_for_event
+                            )
                         else:
                             logger.warning(
                                 "ProgressiveCampaignHandler.on_agent_stasis_start: confirmación "
@@ -1232,6 +1259,11 @@ class ProgressiveCampaignHandler(BaseHandler):
                                 self.ari_client.hangup_channel(channel_id)
                             except Exception:
                                 pass
+                            self.distribution_service.redistribute_after_failed_consolidation(
+                                call_id,
+                                pstn_channel_id=pstn_for_redistribute,
+                                on_queue_timeout_callback=self._on_queue_timeout_for_dialer,
+                            )
                             return
                 except Exception:
                     logger.exception(
