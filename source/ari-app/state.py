@@ -138,6 +138,9 @@ class CallContext(BaseModel):
     call_ended: bool = False  # Flag para evitar procesar el evento de finalización múltiples veces
     # Inbound: True si el agente colgó primero (on_hangup_request); usado en on_pstn_stasis_end para reportar quien_corto=1
     inbound_agent_hung_up_first: bool = False
+    # True desde handle_agent_answer hasta ONCALL confirmado o fallo de bridge; inhibe timeout de cola
+    # y mantiene la reserva DIALING+lock hasta try_confirm_distribution_oncall.
+    distribution_answer_accepted: bool = False
 
     @model_validator(mode="before")
     @classmethod

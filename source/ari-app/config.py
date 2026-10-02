@@ -183,6 +183,15 @@ class Settings(BaseSettings):
         ge=0,
         description="Segundos extra sobre ring_timeout para el TTL del lock acd:lock:agent durante el ring",
     )
+    # Piso de TTL al renovar lock/lease tras handle_agent_answer (ventana hasta ONCALL/bridge)
+    AGENT_ANSWER_RESERVATION_TTL_SEC: int = Field(
+        default=30,
+        ge=5,
+        description=(
+            "TTL mínimo en segundos al renovar lock/lease del agente tras contestación aceptada, "
+            "antes de confirmar ONCALL o fallar el bridge"
+        ),
+    )
     # TTL de espera del comando Redis tras REFER desde voicebot antes de iniciar distribución
     VOICEBOT_TRANSFER_WAIT_TTL_SEC: int = Field(
         default=120,

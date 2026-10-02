@@ -752,13 +752,37 @@ class DistributionService:
                         call_id,
                     )
 
+    def _renew_agent_reservation_ttl(self, agent_id: int, call_id: str, ttl_sec: int) -> None:
+        """
+        Renueva el TTL de lock y lease si aún pertenecen a call_id.
+        Evita que un answer al final del ring deje vencer la reserva antes del ONCALL.
+        """
+        if ttl_sec <= 0:
+            return
+        agent_id_str = str(agent_id)
+        for key in (
+            RedisKeys.agent_lock(agent_id_str),
+            RedisKeys.agent_reservation_lease(agent_id_str),
+        ):
+            try:
+                current = self.redis_client.get(key)
+                if current is not None and str(current) == str(call_id):
+                    self.redis_client.expire(key, int(ttl_sec))
+            except Exception as e:
+                logger.debug(
+                    "DistributionService._renew_agent_reservation_ttl: error renovando %s: %s",
+                    key,
+                    e,
+                )
+
     def handle_agent_answer(self, call_id: str, channel_id: str) -> bool:
         """
         Señaliza que el agente contestó para este intento. Retorna True si channel_id
         era el agente actual en intento; False si no (el handler no debe seguir con bridge/MOH).
 
-        Libera el lock Redis acd:lock:agent:{id} y lease sin revertir DIALING→READY;
-        el handler invocante debe pasar el agente a ONCALL vía AgentStatusService.
+        Mantiene lock/lease y STATUS=DIALING hasta try_confirm_distribution_oncall (o release
+        con restore_ready si el bridge falla). Marca distribution_answer_accepted para que
+        el timeout de cola no corte la llamada en esa ventana.
         """
         answered_agent_id: Optional[int] = None
         with self._dialing_lock:
@@ -770,13 +794,28 @@ class DistributionService:
                 return False
 
         if answered_agent_id is not None:
-            self._release_agent_reservation(
-                answered_agent_id,
-                call_id,
-                RedisKeys.agent_lock(str(answered_agent_id)),
-                restore_ready=False,
-                use_status_reservation=True,
+            try:
+                with self.state_store.lock(call_id):
+                    context = self.state_store.get(call_id)
+                    if context:
+                        context.distribution_answer_accepted = True
+                        if getattr(context, "agent_id", None) is None:
+                            context.agent_id = int(answered_agent_id)
+                        self.state_store.register_unsafe(call_id, context)
+            except Exception:
+                logger.exception(
+                    "DistributionService.handle_agent_answer: error marcando "
+                    "distribution_answer_accepted call_id=%s agent_id=%s",
+                    call_id,
+                    answered_agent_id,
+                )
+
+            renew_ttl = max(
+                int(getattr(settings, "AGENT_ANSWER_RESERVATION_TTL_SEC", 30) or 30),
+                30,
             )
+            self._renew_agent_reservation_ttl(answered_agent_id, call_id, renew_ttl)
+
             try:
                 context = self.state_store.get(call_id)
                 q_camp = effective_queue_campaign_id(context) if context else None
@@ -1027,15 +1066,18 @@ class DistributionService:
                             answered_or_failed = attempt_finished.wait(timeout=ring_timeout)
 
                             if stop_event.is_set():
+                                # Si handle_agent_answer ya consumió el slot, la reserva
+                                # queda hasta try_confirm_distribution_oncall (no liberar aquí).
                                 with self._dialing_lock:
                                     still_attempting = call_id in self._active_attempt_agents
-                                self._release_agent_reservation(
-                                    candidate.agent_id,
-                                    call_id,
-                                    lock_key,
-                                    restore_ready=still_attempting,
-                                    use_status_reservation=True,
-                                )
+                                if still_attempting:
+                                    self._release_agent_reservation(
+                                        candidate.agent_id,
+                                        call_id,
+                                        lock_key,
+                                        restore_ready=True,
+                                        use_status_reservation=True,
+                                    )
                                 return
 
                             if not answered_or_failed:
@@ -1154,23 +1196,15 @@ class DistributionService:
         """
         Maneja timeout de cola: señaliza stop, cancela timer, marca call_ended,
         notifica QueueEventManager y reporter, cuelga agente actual y PSTN, destruye bridge, unregister.
+
+        Si la contestación ya fue aceptada (distribution_answer_accepted) o la llamada
+        ya está consolidada, no ejecuta callback (p. ej. EXIT_TIMEOUT al dialer) ni cleanup.
         """
         logger.info(
             "DistributionService._on_queue_timeout: Timeout de cola para call_id=%s, campaña=%s",
             call_id,
             id_camp,
         )
-
-        with self._on_queue_timeout_callbacks_lock:
-            cb = self._on_queue_timeout_callbacks.pop(call_id, None)
-        if cb is not None and pstn_channel_id:
-            try:
-                cb(call_id, pstn_channel_id)
-            except Exception:
-                logger.exception(
-                    "DistributionService._on_queue_timeout: error en callback para call_id=%s",
-                    call_id,
-                )
 
         stop_event, attempt_finished = self._get_or_create_call_events(call_id)
         stop_event.set()
@@ -1188,19 +1222,52 @@ class DistributionService:
                     "_on_queue_timeout: contexto inexistente para call_id=%s, nada que hacer",
                     call_id,
                 )
+                with self._on_queue_timeout_callbacks_lock:
+                    self._on_queue_timeout_callbacks.pop(call_id, None)
                 return
             if queue_timeout_should_suppress_cleanup(context):
                 logger.info(
-                    "_on_queue_timeout: llamada %s ya atendida (connected=%s, agent_answered_ts set), ignorando timeout",
+                    "_on_queue_timeout: llamada %s ya atendida o contestación aceptada "
+                    "(connected=%s, answer_accepted=%s), ignorando timeout",
                     call_id,
                     context.agent_connected_channel,
+                    getattr(context, "distribution_answer_accepted", False),
                 )
+                with self._on_queue_timeout_callbacks_lock:
+                    self._on_queue_timeout_callbacks.pop(call_id, None)
                 return
             context_for_report = context
+
+        # Callback (p. ej. EXIT_TIMEOUT al dialer) solo si vamos a cortar de verdad.
+        with self._on_queue_timeout_callbacks_lock:
+            cb = self._on_queue_timeout_callbacks.pop(call_id, None)
+        if cb is not None and pstn_channel_id:
+            try:
+                cb(call_id, pstn_channel_id)
+            except Exception:
+                logger.exception(
+                    "DistributionService._on_queue_timeout: error en callback para call_id=%s",
+                    call_id,
+                )
 
         with self._dialing_lock:
             current_agent_channel = self._active_attempts.pop(call_id, None)
             timeout_agent_id = self._active_attempt_agents.pop(call_id, None)
+
+        # Contestación pudo llegar tras el check anterior.
+        with self.state_store.lock(call_id):
+            mid_ctx = self.state_store.get(call_id)
+            if mid_ctx and queue_timeout_should_suppress_cleanup(mid_ctx):
+                logger.info(
+                    "_on_queue_timeout: contestación aceptada antes de mark_call_ended "
+                    "call_id=%s; omitiendo cleanup destructivo",
+                    call_id,
+                )
+                if current_agent_channel and timeout_agent_id is not None:
+                    with self._dialing_lock:
+                        self._active_attempts.setdefault(call_id, current_agent_channel)
+                        self._active_attempt_agents.setdefault(call_id, timeout_agent_id)
+                return
 
         if timeout_agent_id is not None:
             self._release_agent_reservation(
@@ -1332,6 +1399,17 @@ class DistributionService:
                     current_agent_channel,
                     call_id,
                 )
+
+        # Revalidar antes de colgar PSTN: la contestación pudo llegar entre el check y aquí.
+        with self.state_store.lock(call_id):
+            late_ctx = self.state_store.get(call_id)
+            if late_ctx and queue_timeout_should_suppress_cleanup(late_ctx):
+                logger.info(
+                    "_on_queue_timeout: contestación aceptada antes de hangup PSTN call_id=%s, "
+                    "omitendo hangup PSTN/bridge/unregister",
+                    call_id,
+                )
+                return
 
         if pstn_channel_id:
             try:
