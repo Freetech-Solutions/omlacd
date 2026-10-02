@@ -26,6 +26,7 @@ DEFAULT_CAMPAIGN_CFG = {
     "amd": False,
     "voicebot": False,
     "voicebot_strategy": "random",
+    "weight": 0,
 }
 
 
@@ -128,6 +129,14 @@ def fetch_campaign_cfg_from_redis(
     else:
         voicebot_strategy = "random"
 
+    weight_raw = normalized.get("weight")
+    try:
+        weight = int(weight_raw) if weight_raw is not None and str(weight_raw).strip() != "" else 0
+    except Exception:
+        weight = 0
+    if weight < 0:
+        weight = 0
+
     return {
         "moh_sound": moh_sound,
         "max_wait_time": max_wait_time,
@@ -139,6 +148,7 @@ def fetch_campaign_cfg_from_redis(
         "amd": amd,
         "voicebot": voicebot,
         "voicebot_strategy": voicebot_strategy,
+        "weight": weight,
     }
 
 

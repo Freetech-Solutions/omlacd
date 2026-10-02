@@ -192,6 +192,36 @@ class Settings(BaseSettings):
             "antes de confirmar ONCALL o fallar el bridge"
         ),
     )
+    # Fairness cross-queue: weight de cola + envejecimiento
+    ACD_QUEUE_WEIGHT_ENABLED: bool = Field(
+        default=True,
+        description=(
+            "Si true, usa waiting ZSET + CallPriority (weight+age) y offer gate por agente "
+            "antes de reservar. Si false, comportamiento legacy (CAS por hilo)."
+        ),
+    )
+    ACD_CALL_PRIORITY_TAU_SEC: float = Field(
+        default=40.0,
+        gt=0,
+        description="Tau (segundos) del envejecimiento en CallPriority: age=1-exp(-wait/tau)",
+    )
+    ACD_WEIGHT_NORM_MAX: float = Field(
+        default=10.0,
+        gt=0,
+        description="Tope para normalizar Queue.weight en CallPriority (clamp 0..max / max)",
+    )
+    ACD_CALL_PRIORITY_W_WEIGHT: float = Field(
+        default=0.6,
+        ge=0,
+        le=1,
+        description="Peso del término weight_norm en CallPriority",
+    )
+    ACD_CALL_PRIORITY_W_AGE: float = Field(
+        default=0.4,
+        ge=0,
+        le=1,
+        description="Peso del término age en CallPriority",
+    )
     # TTL de espera del comando Redis tras REFER desde voicebot antes de iniciar distribución
     VOICEBOT_TRANSFER_WAIT_TTL_SEC: int = Field(
         default=120,

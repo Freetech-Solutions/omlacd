@@ -208,6 +208,17 @@ class RedisKeys:
         return f"OML:CAMP:{campaign_id}:MEMBER-PENALTY"
 
     @staticmethod
+    def campaign_waiting(campaign_id: str) -> str:
+        """Llamadas en espera de despacho (ZSET call_id → enqueued_at_ms)."""
+        return f"acd:queue:{campaign_id}:waiting"
+
+    @staticmethod
+    def offer_best_agent(agent_id) -> str:
+        """Offer gate: llamada con mayor CallPriority reclamando al agente."""
+        aid = agent_id if isinstance(agent_id, str) else str(agent_id)
+        return f"acd:offer:best:{aid}"
+
+    @staticmethod
     def voicebot_calls(campaign_id: str, agent_id) -> str:
         """
         Contador de llamadas voicebot activas por (campaña, agente voicebot).
