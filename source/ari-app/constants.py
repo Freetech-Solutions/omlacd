@@ -203,6 +203,11 @@ class RedisKeys:
         return f"OML:CAMPAIGN-AGENTS:{campaign_id}"
 
     @staticmethod
+    def campaign_member_penalty(campaign_id: str) -> str:
+        """Penalty por membresía campaña×agente (hash agent_id → penalty)."""
+        return f"OML:CAMP:{campaign_id}:MEMBER-PENALTY"
+
+    @staticmethod
     def voicebot_calls(campaign_id: str, agent_id) -> str:
         """
         Contador de llamadas voicebot activas por (campaña, agente voicebot).

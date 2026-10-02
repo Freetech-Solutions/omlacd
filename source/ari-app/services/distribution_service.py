@@ -959,6 +959,7 @@ class DistributionService:
                                     queue_name=str(id_camp),
                                     member_ids=member_ids,
                                     strategy=strategy,
+                                    campaign_id=str(id_camp),
                                 )
                             )
                         except Exception as e:
