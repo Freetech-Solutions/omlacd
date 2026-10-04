@@ -213,6 +213,16 @@ class RedisKeys:
         return f"acd:queue:{campaign_id}:waiting"
 
     @staticmethod
+    def campaign_waiting_scan_pattern() -> str:
+        """SCAN pattern para ZSETs waiting (no incluye alive keys)."""
+        return "acd:queue:*:waiting"
+
+    @staticmethod
+    def waiting_alive(call_id: str) -> str:
+        """Heartbeat de membresía en waiting ZSET (TTL refrescado por el loop)."""
+        return f"acd:queue:waiting:alive:{call_id}"
+
+    @staticmethod
     def offer_best_agent(agent_id) -> str:
         """Offer gate: llamada con mayor CallPriority reclamando al agente."""
         aid = agent_id if isinstance(agent_id, str) else str(agent_id)

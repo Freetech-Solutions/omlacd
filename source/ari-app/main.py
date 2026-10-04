@@ -358,6 +358,17 @@ class ARIApp:
             
             self.router = self.container.router()
             logger.info("✅ AcDRouter inicializado")
+
+            try:
+                purged = self.container.distribution_service().purge_stale_waiting_inventory()
+                logger.info(
+                    "✅ Waiting inventory purge al arranque: %s member(s) stale removidos",
+                    purged,
+                )
+            except Exception:
+                logger.exception(
+                    "⚠️ Error en purge_stale_waiting_inventory al arranque (continuando)"
+                )
             
             self.command_listener = self.container.command_listener()
             self.command_listener.start()

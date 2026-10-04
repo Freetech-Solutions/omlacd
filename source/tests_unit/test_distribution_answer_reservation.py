@@ -107,21 +107,12 @@ class TestHandleAgentAnswer:
         assert svc.handle_agent_answer("call-1", "other-ch") is False
         assert "call-1" in svc._active_attempts
 
-
-class TestOnQueueTimeout:
-    def _make_service(self, state_store):
-        return DistributionService(
-            ari_client=MagicMock(),
-            state_store=state_store,
-            call_service=MagicMock(),
-            queue_strategy_engine=MagicMock(),
-            redis_client=MagicMock(),
-            reporter=MagicMock(),
-            agent_status_service=MagicMock(),
+    def test_idempotent_when_answer_already_accepted_for_channel(self):
+        ctx = _ctx(
+            agent_attempt_channel="agent-ch-1",
+            distribution_answer_accepted=True,
+            agent_id=42,
         )
-
-    def test_skips_callback_and_hangup_when_answer_accepted(self):
-        ctx = _ctx(distribution_answer_accepted=True)
         state_store = MagicMock()
         state_store.get.return_value = ctx
 
@@ -130,6 +121,41 @@ class TestOnQueueTimeout:
             yield
 
         state_store.lock.side_effect = _lock
+
+        redis_client = MagicMock()
+        svc = self._make_service(state_store, redis_client)
+        # Slot ya consumido (p.ej. recover/timeout restore+accept).
+        assert "call-1" not in svc._active_attempts
+
+        assert svc.handle_agent_answer("call-1", "agent-ch-1") is True
+        assert svc.handle_agent_answer("call-1", "other-ch") is False
+
+
+class TestOnQueueTimeout:
+    def _make_service(self, state_store, ari_client=None):
+        return DistributionService(
+            ari_client=ari_client or MagicMock(),
+            state_store=state_store,
+            call_service=MagicMock(),
+            queue_strategy_engine=MagicMock(),
+            redis_client=MagicMock(),
+            reporter=MagicMock(),
+            agent_status_service=MagicMock(),
+        )
+
+    def _lock_store(self, state_store, ctx):
+        state_store.get.return_value = ctx
+
+        @contextmanager
+        def _lock(_call_id):
+            yield
+
+        state_store.lock.side_effect = _lock
+
+    def test_skips_callback_and_hangup_when_answer_accepted(self):
+        ctx = _ctx(distribution_answer_accepted=True)
+        state_store = MagicMock()
+        self._lock_store(state_store, ctx)
 
         svc = self._make_service(state_store)
         cb = MagicMock()
@@ -147,25 +173,73 @@ class TestOnQueueTimeout:
         cb.assert_not_called()
         svc.ari_client.hangup_channel.assert_not_called()
         state_store.unregister.assert_not_called()
+        state_store.mark_call_ended_atomic.assert_not_called()
 
     def test_hangs_up_when_still_waiting_in_queue(self):
         ctx = _ctx(agent_attempt_channel="attempt-1")
         state_store = MagicMock()
-        state_store.get.return_value = ctx
+        self._lock_store(state_store, ctx)
         state_store.mark_call_ended_atomic.return_value = True
 
-        @contextmanager
-        def _lock(_call_id):
-            yield
-
-        state_store.lock.side_effect = _lock
-
-        svc = self._make_service(state_store)
+        ari = MagicMock()
+        ari.get_channel_details.return_value = {"state": "Ringing"}
+        svc = self._make_service(state_store, ari)
         cb = MagicMock()
         with svc._on_queue_timeout_callbacks_lock:
             svc._on_queue_timeout_callbacks["call-1"] = cb
         svc._active_attempts["call-1"] = "attempt-1"
         svc._active_attempt_agents["call-1"] = 7
+
+        with patch.object(svc, "_release_agent_reservation") as release_mock:
+            with patch.object(svc, "_dequeue_waiting") as dequeue_mock:
+                svc._on_queue_timeout(
+                    call_id="call-1",
+                    pstn_channel_id="pstn-1",
+                    bridge_id="bridge-1",
+                    id_camp="10",
+                    uniqueid="uid-1",
+                )
+
+        # Callback solo en fase commit (tras claim).
+        cb.assert_called_once_with("call-1", "pstn-1")
+        dequeue_mock.assert_called_once()
+        release_mock.assert_called_once()
+        state_store.mark_call_ended_atomic.assert_called_once_with("call-1")
+        hangup_ids = [c.args[0] for c in ari.hangup_channel.call_args_list]
+        assert "attempt-1" in hangup_ids
+        assert "pstn-1" in hangup_ids
+        state_store.unregister.assert_called_once_with("call-1")
+        assert "call-1" not in svc._active_attempts
+
+    def test_answer_wins_slot_timeout_aborts_before_commit(self):
+        """handle_agent_answer toma el slot antes del claim → timeout no marca/callback/hangup."""
+        ctx = _ctx(agent_attempt_channel="agent-ch-1")
+        state_store = MagicMock()
+        self._lock_store(state_store, ctx)
+        redis_client = MagicMock()
+        redis_client.get.return_value = "call-1"
+
+        ari = MagicMock()
+        ari.get_channel_details.return_value = {"state": "Ringing"}
+        svc = DistributionService(
+            ari_client=ari,
+            state_store=state_store,
+            call_service=MagicMock(),
+            queue_strategy_engine=MagicMock(),
+            redis_client=redis_client,
+            reporter=MagicMock(),
+            agent_status_service=MagicMock(),
+        )
+        svc._active_attempts["call-1"] = "agent-ch-1"
+        svc._active_attempt_agents["call-1"] = 42
+
+        cb = MagicMock()
+        with svc._on_queue_timeout_callbacks_lock:
+            svc._on_queue_timeout_callbacks["call-1"] = cb
+
+        assert svc.handle_agent_answer("call-1", "agent-ch-1") is True
+        assert ctx.distribution_answer_accepted is True
+        assert "call-1" not in svc._active_attempts
 
         svc._on_queue_timeout(
             call_id="call-1",
@@ -175,8 +249,119 @@ class TestOnQueueTimeout:
             uniqueid="uid-1",
         )
 
-        cb.assert_called_once_with("call-1", "pstn-1")
-        assert svc.ari_client.hangup_channel.call_count >= 1
+        cb.assert_not_called()
+        state_store.mark_call_ended_atomic.assert_not_called()
+        ari.hangup_channel.assert_not_called()
+        state_store.unregister.assert_not_called()
+
+    def test_timeout_wins_slot_late_answer_rejected(self):
+        """Timeout claim con canal no-Up → mark+hangup+callback; answer posterior False."""
+        ctx = _ctx(agent_attempt_channel="attempt-1")
+        state_store = MagicMock()
+        self._lock_store(state_store, ctx)
+        state_store.mark_call_ended_atomic.return_value = True
+
+        ari = MagicMock()
+        ari.get_channel_details.return_value = {"state": "Ringing"}
+        svc = self._make_service(state_store, ari)
+        cb = MagicMock()
+        with svc._on_queue_timeout_callbacks_lock:
+            svc._on_queue_timeout_callbacks["call-1"] = cb
+        svc._active_attempts["call-1"] = "attempt-1"
+        svc._active_attempt_agents["call-1"] = 7
+
+        with patch.object(svc, "_release_agent_reservation"):
+            with patch.object(svc, "_dequeue_waiting"):
+                svc._on_queue_timeout(
+                    call_id="call-1",
+                    pstn_channel_id="pstn-1",
+                    bridge_id="bridge-1",
+                    id_camp="10",
+                    uniqueid="uid-1",
+                )
+
+        cb.assert_called_once()
+        state_store.mark_call_ended_atomic.assert_called_once()
+        hangup_ids = [c.args[0] for c in ari.hangup_channel.call_args_list]
+        assert "pstn-1" in hangup_ids
+        assert "attempt-1" in hangup_ids
+
+        # Slot ya reclamado por timeout: answer no puede marcar accepted.
+        assert svc.handle_agent_answer("call-1", "attempt-1") is False
+
+    def test_up_between_peek_and_claim_restores_and_recovers(self):
+        """Canal pasa a Up entre peek y claim → restore + recover; no mark/TIMEOUT."""
+        ctx = _ctx(agent_attempt_channel="attempt-1")
+        state_store = MagicMock()
+        self._lock_store(state_store, ctx)
+
+        ari = MagicMock()
+        redis_client = MagicMock()
+        redis_client.get.return_value = "call-1"
+        svc = DistributionService(
+            ari_client=ari,
+            state_store=state_store,
+            call_service=MagicMock(),
+            queue_strategy_engine=MagicMock(),
+            redis_client=redis_client,
+            reporter=MagicMock(),
+            agent_status_service=MagicMock(),
+        )
+        svc._active_attempts["call-1"] = "attempt-1"
+        svc._active_attempt_agents["call-1"] = 7
+        svc._active_attempt_loop_gens["call-1"] = 3
+
+        cb = MagicMock()
+        with svc._on_queue_timeout_callbacks_lock:
+            svc._on_queue_timeout_callbacks["call-1"] = cb
+
+        # peek → no Up; post-claim → Up (recover usa _is_channel_up otra vez).
+        with patch.object(svc, "_is_channel_up", side_effect=[False, True, True]):
+            with patch.object(svc, "stop_distribution") as stop_mock:
+                svc._on_queue_timeout(
+                    call_id="call-1",
+                    pstn_channel_id="pstn-1",
+                    bridge_id="bridge-1",
+                    id_camp="10",
+                    uniqueid="uid-1",
+                )
+
+        stop_mock.assert_called_once()
+        cb.assert_not_called()
+        state_store.mark_call_ended_atomic.assert_not_called()
+        ari.hangup_channel.assert_not_called()
+        assert ctx.distribution_answer_accepted is True
+        # Recover consumió el slot restaurado (answer posee el intento).
+        assert "call-1" not in svc._active_attempts
+
+    def test_commit_always_hangs_up_pstn_after_mark(self):
+        """Tras mark no hay abort tardío: hangup PSTN siempre en path commit."""
+        ctx = _ctx(agent_attempt_channel="attempt-1")
+        state_store = MagicMock()
+        self._lock_store(state_store, ctx)
+        state_store.mark_call_ended_atomic.return_value = True
+
+        ari = MagicMock()
+        ari.get_channel_details.return_value = None
+        svc = self._make_service(state_store, ari)
+        with svc._on_queue_timeout_callbacks_lock:
+            svc._on_queue_timeout_callbacks["call-1"] = MagicMock()
+        svc._active_attempts["call-1"] = "attempt-1"
+        svc._active_attempt_agents["call-1"] = 7
+
+        with patch.object(svc, "_release_agent_reservation"):
+            with patch.object(svc, "_dequeue_waiting"):
+                svc._on_queue_timeout(
+                    call_id="call-1",
+                    pstn_channel_id="pstn-1",
+                    bridge_id="bridge-1",
+                    id_camp="10",
+                    uniqueid="uid-1",
+                )
+
+        state_store.mark_call_ended_atomic.assert_called_once()
+        hangup_ids = [c.args[0] for c in ari.hangup_channel.call_args_list]
+        assert "pstn-1" in hangup_ids
         state_store.unregister.assert_called_once_with("call-1")
 
 
@@ -199,6 +384,11 @@ class TestTryConfirmDistributionOncall:
 
         assert ok is True
         redis_client.eval.assert_called_once()
+        eval_args = redis_client.eval.call_args[0]
+        # ARGV tras numkeys+keys: DIALING, call_id, ONCALL, ..., RINGING
+        assert "DIALING" in eval_args
+        assert "RINGING" in eval_args
+        assert "call-1" in eval_args
         redis_client.hset.assert_not_called()
         publish.assert_called_once()
 
@@ -219,6 +409,13 @@ class TestTryConfirmDistributionOncall:
         assert ok is False
         publish.assert_not_called()
         redis_client.hset.assert_not_called()
+
+    def test_confirm_script_accepts_ringing_status(self):
+        """Lua: STATUS=RINGING + CALLID ok → ONCALL (simula eventRinging de Django)."""
+        from services.agent_status_service import _CONFIRM_DISTRIBUTION_ONCALL_SCRIPT
+
+        assert "ARGV[9]" in _CONFIRM_DISTRIBUTION_ONCALL_SCRIPT
+        assert "current ~= ARGV[1] and current ~= ARGV[9]" in _CONFIRM_DISTRIBUTION_ONCALL_SCRIPT
 
 
 class TestDeferDequeueAndRedistribute:
@@ -362,3 +559,166 @@ class TestDeferDequeueAndRedistribute:
         assert redistrib_kwargs.kwargs["pstn_channel_id"] == "pstn-1"
         handler.ari_client.hangup_channel.assert_called_with("agent-ch-1")
         dist.finalize_waiting_after_oncall.assert_not_called()
+
+
+class TestChannelUpRecover:
+    def _make_service(self, state_store, ari_client=None):
+        return DistributionService(
+            ari_client=ari_client or MagicMock(),
+            state_store=state_store,
+            call_service=MagicMock(),
+            queue_strategy_engine=MagicMock(),
+            redis_client=MagicMock(),
+            reporter=MagicMock(),
+            agent_status_service=MagicMock(),
+        )
+
+    def _lock_store(self, state_store, ctx):
+        state_store.get.return_value = ctx
+
+        @contextmanager
+        def _lock(_call_id):
+            yield
+
+        state_store.lock.side_effect = _lock
+
+    def test_is_channel_up_true_only_for_up(self):
+        state_store = MagicMock()
+        ari = MagicMock()
+        svc = self._make_service(state_store, ari)
+
+        ari.get_channel_details.return_value = {"state": "Up"}
+        assert svc._is_channel_up("ch-1") is True
+
+        ari.get_channel_details.return_value = {"state": "Ringing"}
+        assert svc._is_channel_up("ch-1") is False
+
+        ari.get_channel_details.return_value = None
+        assert svc._is_channel_up("ch-1") is False
+
+    def test_recover_answer_if_channel_up_accepts_and_stops(self):
+        ctx = _ctx(agent_attempt_channel="agent-ch-1")
+        state_store = MagicMock()
+        self._lock_store(state_store, ctx)
+        ari = MagicMock()
+        ari.get_channel_details.return_value = {"state": "Up"}
+        svc = self._make_service(state_store, ari)
+        svc._active_attempts["call-1"] = "agent-ch-1"
+        svc._active_attempt_agents["call-1"] = 42
+
+        with patch.object(svc, "stop_distribution") as stop_mock:
+            assert svc._recover_answer_if_channel_up("call-1", "agent-ch-1") is True
+            stop_mock.assert_called_once_with(
+                "call-1",
+                cancel_timer=True,
+                hangup_agent_channel=False,
+                dequeue_waiting=False,
+            )
+
+        assert ctx.distribution_answer_accepted is True
+        assert ctx.agent_id == 42
+        ari.hangup_channel.assert_not_called()
+
+    def test_recover_false_when_ringing(self):
+        state_store = MagicMock()
+        ari = MagicMock()
+        ari.get_channel_details.return_value = {"state": "Ringing"}
+        svc = self._make_service(state_store, ari)
+        svc._active_attempts["call-1"] = "agent-ch-1"
+
+        with patch.object(svc, "handle_agent_answer") as answer_mock:
+            assert svc._recover_answer_if_channel_up("call-1", "agent-ch-1") is False
+            answer_mock.assert_not_called()
+
+    def test_queue_timeout_skips_when_attempt_channel_up(self):
+        ctx = _ctx(agent_attempt_channel="attempt-1")
+        state_store = MagicMock()
+        self._lock_store(state_store, ctx)
+        ari = MagicMock()
+        ari.get_channel_details.return_value = {"state": "Up"}
+        svc = self._make_service(state_store, ari)
+        svc._active_attempts["call-1"] = "attempt-1"
+        svc._active_attempt_agents["call-1"] = 7
+
+        cb = MagicMock()
+        with svc._on_queue_timeout_callbacks_lock:
+            svc._on_queue_timeout_callbacks["call-1"] = cb
+
+        svc._on_queue_timeout(
+            call_id="call-1",
+            pstn_channel_id="pstn-1",
+            bridge_id="bridge-1",
+            id_camp="10",
+            uniqueid="uid-1",
+        )
+
+        cb.assert_not_called()
+        state_store.mark_call_ended_atomic.assert_not_called()
+        ari.hangup_channel.assert_not_called()
+        assert ctx.distribution_answer_accepted is True
+
+    def test_is_answer_already_accepted_for_channel(self):
+        ctx = _ctx(
+            agent_attempt_channel="agent-ch-1",
+            distribution_answer_accepted=True,
+        )
+        state_store = MagicMock()
+        self._lock_store(state_store, ctx)
+        svc = self._make_service(state_store)
+
+        assert svc.is_answer_already_accepted_for_channel("call-1", "agent-ch-1") is True
+        assert svc.is_answer_already_accepted_for_channel("call-1", "other") is False
+
+
+class TestLateStasisStartAfterRecover:
+    def test_inbound_consolidates_when_answer_already_accepted(self):
+        from handlers.inbound import InboundCallHandler
+
+        ctx = _ctx(
+            agent_attempt_channel="agent-ch-1",
+            agent_id=42,
+            distribution_answer_accepted=True,
+            bridge_id="bridge-1",
+        )
+        state_store = MagicMock()
+        state_store.get.return_value = ctx
+
+        @contextmanager
+        def _lock(_call_id):
+            yield
+
+        state_store.lock.side_effect = _lock
+
+        dist = MagicMock()
+        dist.handle_agent_answer.return_value = False
+        dist.is_answer_already_accepted_for_channel.return_value = True
+        agent_status = MagicMock()
+        agent_status.try_confirm_distribution_oncall.return_value = True
+
+        handler = InboundCallHandler(
+            ari_client=MagicMock(),
+            state_store=state_store,
+            reporter=None,
+            call_service=MagicMock(),
+            queue_strategy_engine=MagicMock(),
+            redis_client=MagicMock(),
+            distribution_service=dist,
+            agent_status_service=agent_status,
+            queue_event_manager=MagicMock(),
+        )
+        handler.call_service.add_channel_to_bridge.return_value = True
+        handler.call_service.stop_moh_on_bridge = MagicMock()
+        handler._extract_agent_id_from_agent_channel = MagicMock(
+            side_effect=AssertionError("no debe pedir agent_id a ARI si está en contexto")
+        )
+
+        event = MagicMock()
+        event.channel.id = "agent-ch-1"
+        handler.on_agent_stasis_start(event, {"callid": "call-1"})
+
+        dist.stop_distribution.assert_called()
+        handler.call_service.add_channel_to_bridge.assert_called_once_with(
+            "bridge-1", "agent-ch-1"
+        )
+        agent_status.try_confirm_distribution_oncall.assert_called()
+        handler._extract_agent_id_from_agent_channel.assert_not_called()

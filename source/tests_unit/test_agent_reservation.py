@@ -237,3 +237,44 @@ def test_handle_channel_failure_releases_lock_with_restore_ready(
         42, "call-1", restore_ready=True
     )
     mock_redis.delete.assert_not_called()
+
+
+def test_claim_and_reserve_wrapper_publishes_on_success(mock_redis, agent_status_service):
+    agent_status_service._offer_coordinator = MagicMock()
+    agent_status_service._offer_coordinator.try_claim_and_reserve.return_value = True
+
+    with patch(
+        "services.agent_status_service.publish_agent_to_streams"
+    ) as publish:
+        ok = agent_status_service.try_claim_and_reserve_for_distribution(
+            agent_id=5,
+            call_id="call-1",
+            ttl_sec=40,
+            priority=0.5,
+            enqueued_at_ms=1000.0,
+        )
+
+    assert ok is True
+    agent_status_service._offer_coordinator.try_claim_and_reserve.assert_called_once_with(
+        5, "call-1", 0.5, 1000.0, 40
+    )
+    publish.assert_called_once()
+
+
+def test_claim_and_reserve_wrapper_no_publish_on_failure(mock_redis, agent_status_service):
+    agent_status_service._offer_coordinator = MagicMock()
+    agent_status_service._offer_coordinator.try_claim_and_reserve.return_value = False
+
+    with patch(
+        "services.agent_status_service.publish_agent_to_streams"
+    ) as publish:
+        ok = agent_status_service.try_claim_and_reserve_for_distribution(
+            agent_id=5,
+            call_id="call-1",
+            ttl_sec=40,
+            priority=0.5,
+            enqueued_at_ms=1000.0,
+        )
+
+    assert ok is False
+    publish.assert_not_called()

@@ -200,6 +200,15 @@ class Settings(BaseSettings):
             "antes de reservar. Si false, comportamiento legacy (CAS por hilo)."
         ),
     )
+    ACD_WAITING_ALIVE_TTL_SEC: int = Field(
+        default=90,
+        ge=15,
+        le=600,
+        description=(
+            "TTL del heartbeat acd:queue:waiting:alive:{call_id}. El loop lo refresca; "
+            "tras crash de acd-app, heads huérfanos dejan de bloquear en ≤ este TTL."
+        ),
+    )
     ACD_CALL_PRIORITY_TAU_SEC: float = Field(
         default=40.0,
         gt=0,

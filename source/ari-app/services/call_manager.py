@@ -689,6 +689,9 @@ class CallActionService:
         
         call_type = str(metadata.get('call_type', CallType.MANUAL_ID))  # Default: "1" para manual
         agent_id = str(metadata.get('agent_id', metadata.get('id_agent', '')))
+        # Origin SIP para el softphone: inbound → "IN" (ringing); no forzar MANUAL
+        # (MANUAL implica click2call → auto-attend siempre).
+        origin = metadata.get("origin")
         
         # CallerId pierna agente: phone_number o tel_customer (ANI en SIP INVITE)
         caller_id = phone_number or ''
@@ -701,7 +704,7 @@ class CallActionService:
             phone_number=phone_number,
             call_type=call_type,
             agent_id=agent_id,
-            origin="MANUAL"
+            origin=origin,
         )
         
         # Construir appArgs reutilizando helper común. Excluimos claves que ya están

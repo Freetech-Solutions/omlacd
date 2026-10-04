@@ -165,7 +165,8 @@ class InMemoryReservationRedis:
 
     def _release(self, keys: list, args: list) -> int:
         agent_key, lock_key, lease_key = keys
-        call_id, dialing_status, ready_status, timestamp, restore_flag = args
+        call_id, dialing_status, ready_status, timestamp, restore_flag = args[:5]
+        ringing_status = args[5] if len(args) > 5 else "RINGING"
         with self._lock:
             lock_val = self.strings.get(lock_key)
             lease_val = self.strings.get(lease_key)
@@ -179,7 +180,7 @@ class InMemoryReservationRedis:
                 del self.strings[lease_key]
             if restore_flag == "1":
                 data = self.hashes.get(agent_key, {})
-                if data.get("STATUS") == dialing_status:
+                if data.get("STATUS") in (dialing_status, ringing_status):
                     callid = data.get("CALLID")
                     if not callid or callid == call_id:
                         data["STATUS"] = ready_status
@@ -189,9 +190,11 @@ class InMemoryReservationRedis:
 
     def _revert_stale(self, keys: list, args: list) -> int:
         agent_key, lock_key, lease_key = keys
-        dialing_status, ready_status, timestamp = args
+        dialing_status, ready_status, timestamp = args[:3]
+        ringing_status = args[3] if len(args) > 3 else "RINGING"
         with self._lock:
-            if self.hashes.get(agent_key, {}).get("STATUS") != dialing_status:
+            status = self.hashes.get(agent_key, {}).get("STATUS")
+            if status not in (dialing_status, ringing_status):
                 return 0
             if lock_key in self.strings or lease_key in self.strings:
                 return 0
@@ -286,6 +289,34 @@ class TestAgentStatusServiceReservation(unittest.TestCase):
             AgentStatus.READY.value,
         )
         self.assertIsNone(self.redis.hget(self.agent_key, "CALLID"))
+
+    def test_release_restore_ready_from_ringing(self):
+        """Softphone/Django pisa DIALING→RINGING; release debe volver a READY."""
+        self.service.try_reserve_for_distribution(self.agent_id, self.call_id, 25)
+        self.redis.hset(self.agent_key, mapping={"STATUS": "RINGING"})
+        self.service.release_distribution_reservation(
+            self.agent_id, self.call_id, restore_ready=True
+        )
+        self.assertEqual(
+            self.redis.hget(self.agent_key, "STATUS"),
+            AgentStatus.READY.value,
+        )
+        self.assertIsNone(self.redis.get(RedisKeys.agent_lock(str(self.agent_id))))
+        self.assertIsNone(
+            self.redis.get(RedisKeys.agent_reservation_lease(str(self.agent_id)))
+        )
+
+    def test_revert_stale_ringing_when_no_lock_or_lease(self):
+        self.redis.hset(
+            self.agent_key,
+            mapping={"STATUS": "RINGING", "CALLID": "old-call"},
+        )
+        ok = self.service.revert_stale_dialing(self.agent_id)
+        self.assertTrue(ok)
+        self.assertEqual(
+            self.redis.hget(self.agent_key, "STATUS"),
+            AgentStatus.READY.value,
+        )
 
 
 class TestDistributionServiceReservation(unittest.TestCase):

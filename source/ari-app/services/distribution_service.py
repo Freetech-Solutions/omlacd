@@ -75,6 +75,10 @@ class DistributionService:
         self._queue_timers: Dict[str, threading.Timer] = {}
         self._active_attempts: Dict[str, Optional[str]] = {}
         self._active_attempt_agents: Dict[str, Optional[int]] = {}
+        # Generación del loop de distribución por call_id: evita que el finally de un
+        # loop viejo (tras redistribute/restart) limpie el intento/eventos del nuevo.
+        self._loop_generation: Dict[str, int] = {}
+        self._active_attempt_loop_gens: Dict[str, int] = {}
         self._voicebot_attempt_agent_id: Dict[str, int] = {}
         self._dialing_lock = threading.Lock()
         # Callbacks opcionales por call_id para notificar "timeout de cola iniciado por app"
@@ -96,22 +100,155 @@ class DistributionService:
     def _queue_weight_enabled(self) -> bool:
         return bool(getattr(settings, "ACD_QUEUE_WEIGHT_ENABLED", True))
 
+    def _waiting_alive_ttl_sec(self) -> int:
+        try:
+            return int(getattr(settings, "ACD_WAITING_ALIVE_TTL_SEC", 90) or 90)
+        except (TypeError, ValueError):
+            return 90
+
+    def _touch_waiting_alive(self, call_id: str) -> None:
+        if not self._waiting_inventory:
+            return
+        self._waiting_inventory.touch_alive(call_id, self._waiting_alive_ttl_sec())
+
     def _enqueue_waiting(self, campaign_id: str, call_id: str) -> None:
         if not self._queue_weight_enabled() or not self._waiting_inventory:
             return
         score = self._waiting_inventory.enqueue(campaign_id, call_id)
         with self._waiting_enqueued_at_lock:
             self._waiting_enqueued_at[call_id] = score
+        self._touch_waiting_alive(call_id)
 
-    def _dequeue_waiting(self, campaign_id: Optional[str], call_id: str) -> None:
+    def _dequeue_waiting(
+        self,
+        campaign_id: Optional[str],
+        call_id: str,
+        *,
+        clear_enqueued_cache: bool = True,
+    ) -> None:
         if not self._waiting_inventory:
-            with self._waiting_enqueued_at_lock:
-                self._waiting_enqueued_at.pop(call_id, None)
+            if clear_enqueued_cache:
+                with self._waiting_enqueued_at_lock:
+                    self._waiting_enqueued_at.pop(call_id, None)
             return
         if campaign_id is not None and str(campaign_id).strip() != "":
             self._waiting_inventory.dequeue(str(campaign_id), call_id)
-        with self._waiting_enqueued_at_lock:
-            self._waiting_enqueued_at.pop(call_id, None)
+        else:
+            self._waiting_inventory.clear_alive(call_id)
+        if clear_enqueued_cache:
+            with self._waiting_enqueued_at_lock:
+                self._waiting_enqueued_at.pop(call_id, None)
+
+    def _can_offer_from_waiting(
+        self, campaign_id: str, call_id: str, context: Any
+    ) -> bool:
+        """
+        True si la llamada puede originar: es head efectivo del ZSET (purga huérfanos
+        sin heartbeat) o ya está en offering.
+        """
+        if context is not None and getattr(context, "distribution_offering", False):
+            return True
+        if not self._waiting_inventory:
+            return True
+        return bool(self._waiting_inventory.is_queue_head(str(campaign_id), call_id))
+
+    def purge_stale_waiting_inventory(self) -> int:
+        """
+        Al arranque: elimina members del ZSET waiting sin heartbeat alive, o con
+        call_state local en este NODE_ID (este proceso no reanudará esos loops).
+        Retorna cantidad de members removidos.
+        """
+        if not self._waiting_inventory or not self.redis_client:
+            return 0
+        removed = 0
+        pattern = RedisKeys.campaign_waiting_scan_pattern()
+        node_id = str(getattr(settings, "NODE_ID", "") or "")
+        try:
+            cursor = 0
+            while True:
+                cursor, keys = self.redis_client.scan(
+                    cursor=cursor, match=pattern, count=50
+                )
+                for raw_key in keys or []:
+                    zkey = (
+                        raw_key.decode("utf-8")
+                        if isinstance(raw_key, bytes)
+                        else str(raw_key)
+                    )
+                    if not zkey.endswith(":waiting") or ":waiting:alive:" in zkey:
+                        continue
+                    try:
+                        members = self.redis_client.zrange(zkey, 0, -1)
+                    except Exception:
+                        continue
+                    for raw_m in members or []:
+                        call_id = (
+                            raw_m.decode("utf-8")
+                            if isinstance(raw_m, bytes)
+                            else str(raw_m)
+                        )
+                        alive = self._waiting_inventory.is_alive(call_id)
+                        local_state = False
+                        if node_id:
+                            try:
+                                local_state = bool(
+                                    self.redis_client.exists(
+                                        RedisKeys.call_state(node_id, call_id)
+                                    )
+                                )
+                            except Exception:
+                                local_state = False
+                        if alive and not local_state:
+                            continue
+                        try:
+                            self.redis_client.zrem(zkey, call_id)
+                            removed += 1
+                        except Exception:
+                            pass
+                        self._waiting_inventory.clear_alive(call_id)
+                        logger.info(
+                            "purge_stale_waiting_inventory: removed call_id=%s "
+                            "from %s (alive=%s local_state=%s)",
+                            call_id,
+                            zkey,
+                            alive,
+                            local_state,
+                        )
+                if cursor == 0:
+                    break
+        except Exception:
+            logger.exception(
+                "purge_stale_waiting_inventory: error escaneando waiting ZSETs"
+            )
+        if removed:
+            logger.info(
+                "purge_stale_waiting_inventory: removed %s stale waiting member(s)",
+                removed,
+            )
+        return removed
+
+    def _mark_offering_and_dequeue(self, campaign_id: str, call_id: str) -> None:
+        """
+        Tras claim/reserva exitoso: marca offering y saca del ZSET waiting,
+        conservando enqueued_at en caché para priority/redistribute.
+        """
+        try:
+            with self.state_store.lock(call_id):
+                ctx = self.state_store.get(call_id)
+                if ctx is not None:
+                    if not getattr(ctx, "distribution_offering", False):
+                        ctx.distribution_offering = True
+                        self.state_store.register_unsafe(call_id, ctx)
+        except Exception:
+            logger.exception(
+                "DistributionService._mark_offering_and_dequeue: error marcando "
+                "offering call_id=%s campaign=%s",
+                call_id,
+                campaign_id,
+            )
+        self._dequeue_waiting(
+            str(campaign_id), call_id, clear_enqueued_cache=False
+        )
 
     def _get_enqueued_at_ms(self, campaign_id: str, call_id: str) -> float:
         with self._waiting_enqueued_at_lock:
@@ -206,6 +343,47 @@ class DistributionService:
         with self._call_events_lock:
             self._call_events.pop(call_id, None)
 
+    def _bump_loop_generation(self, call_id: str) -> int:
+        """Invalida loops previos y retorna la nueva generación para call_id."""
+        with self._call_events_lock:
+            gen = int(self._loop_generation.get(call_id, 0)) + 1
+            self._loop_generation[call_id] = gen
+            return gen
+
+    def _is_current_loop(self, call_id: str, loop_gen: int) -> bool:
+        with self._call_events_lock:
+            return int(self._loop_generation.get(call_id, 0)) == int(loop_gen)
+
+    def _clear_loop_generation_if_current(self, call_id: str, loop_gen: int) -> None:
+        with self._call_events_lock:
+            if int(self._loop_generation.get(call_id, 0)) == int(loop_gen):
+                self._loop_generation.pop(call_id, None)
+
+    def _pop_active_attempt_if_loop(
+        self, call_id: str, loop_gen: int
+    ) -> Tuple[Optional[str], Optional[int]]:
+        """
+        Pop del intento activo solo si pertenece a loop_gen.
+        Evita que un finally obsoleto cuelgue/libere el intento del loop nuevo.
+        """
+        with self._dialing_lock:
+            if int(self._active_attempt_loop_gens.get(call_id, -1)) != int(loop_gen):
+                return None, None
+            agent_ch = self._active_attempts.pop(call_id, None)
+            attempt_agent_id = self._active_attempt_agents.pop(call_id, None)
+            self._active_attempt_loop_gens.pop(call_id, None)
+            return agent_ch, attempt_agent_id
+
+    def _clear_attempt_if_loop(self, call_id: str, loop_gen: int) -> bool:
+        """Limpia intento activo si pertenece a loop_gen. Retorna True si era nuestro."""
+        with self._dialing_lock:
+            if int(self._active_attempt_loop_gens.get(call_id, -1)) != int(loop_gen):
+                return False
+            self._active_attempts.pop(call_id, None)
+            self._active_attempt_agents.pop(call_id, None)
+            self._active_attempt_loop_gens.pop(call_id, None)
+            return True
+
     def _is_caller_channel_alive(self, caller_channel_id: Optional[str]) -> bool:
         """
         Verifica si el canal PSTN (caller) sigue vivo en Asterisk antes de originar al agente.
@@ -228,6 +406,153 @@ class DistributionService:
                 e,
             )
             return True
+
+    def _is_channel_up(self, channel_id: Optional[str]) -> bool:
+        """
+        True solo si el canal existe en Asterisk y state == Up.
+        404/None/otros estados → False. Error de red → False (preferir reoffer a no colgar un Down).
+        """
+        if not channel_id or not str(channel_id).strip():
+            return False
+        try:
+            details = self.ari_client.get_channel_details(channel_id)
+            if not isinstance(details, dict):
+                return False
+            return details.get("state") == "Up"
+        except Exception as e:
+            logger.warning(
+                "DistributionService._is_channel_up: error comprobando canal %s: %s; asumiendo no Up",
+                channel_id,
+                e,
+            )
+            return False
+
+    def _recover_answer_if_channel_up(
+        self, call_id: str, agent_channel_id: Optional[str]
+    ) -> bool:
+        """
+        Si el canal de agente ya está Up (StasisStart atrasado en el event worker),
+        acepta la contestación sin colgar: handle_agent_answer + stop_distribution.
+        Retorna True si se recuperó la respuesta.
+        """
+        if not agent_channel_id or not self._is_channel_up(agent_channel_id):
+            return False
+        logger.warning(
+            "DistributionService: ring/queue wait venció pero canal %s está Up "
+            "para call_id=%s (posible lag del event worker); tratando como answer",
+            agent_channel_id,
+            call_id,
+        )
+        if not self.handle_agent_answer(call_id, agent_channel_id):
+            # Slot ya consumido o carrera; si sigue Up, no colgar y dejar flag
+            # para que StasisStart tardío consolide.
+            if not self._is_channel_up(agent_channel_id):
+                return False
+            logger.info(
+                "DistributionService: handle_agent_answer rechazó canal %s pero sigue Up "
+                "call_id=%s; omitiendo hangup",
+                agent_channel_id,
+                call_id,
+            )
+            try:
+                with self.state_store.lock(call_id):
+                    ctx = self.state_store.get(call_id)
+                    if ctx and getattr(ctx, "agent_attempt_channel", None) == agent_channel_id:
+                        ctx.distribution_answer_accepted = True
+                        self.state_store.register_unsafe(call_id, ctx)
+            except Exception:
+                logger.exception(
+                    "DistributionService._recover_answer_if_channel_up: error marcando "
+                    "answer_accepted call_id=%s",
+                    call_id,
+                )
+            self.stop_distribution(
+                call_id,
+                cancel_timer=True,
+                hangup_agent_channel=False,
+                dequeue_waiting=False,
+            )
+            return True
+        self.stop_distribution(
+            call_id,
+            cancel_timer=True,
+            hangup_agent_channel=False,
+            dequeue_waiting=False,
+        )
+        return True
+
+    def is_answer_already_accepted_for_channel(
+        self, call_id: str, channel_id: str
+    ) -> bool:
+        """
+        True si el loop ya marcó distribution_answer_accepted para este canal
+        (StasisStart tardío tras recover por canal Up).
+        """
+        try:
+            with self.state_store.lock(call_id):
+                ctx = self.state_store.get(call_id)
+                if not ctx:
+                    return False
+                if not getattr(ctx, "distribution_answer_accepted", False):
+                    return False
+                return getattr(ctx, "agent_attempt_channel", None) == channel_id
+        except Exception:
+            logger.exception(
+                "is_answer_already_accepted_for_channel: error call_id=%s channel=%s",
+                call_id,
+                channel_id,
+            )
+            return False
+
+    def _claim_attempt_for_timeout(
+        self, call_id: str
+    ) -> Optional[Tuple[str, Optional[int], Optional[int]]]:
+        """
+        Toma ownership exclusivo del intento activo para cleanup de timeout.
+        Bajo _dialing_lock: pop de attempts/agents/loop_gens.
+        Retorna (channel_id, agent_id, loop_gen) o None si no hay intento
+        (p.ej. handle_agent_answer ya ganó el slot).
+        """
+        with self._dialing_lock:
+            channel_id = self._active_attempts.pop(call_id, None)
+            if channel_id is None:
+                return None
+            agent_id = self._active_attempt_agents.pop(call_id, None)
+            loop_gen = self._active_attempt_loop_gens.pop(call_id, None)
+            return (str(channel_id), agent_id, loop_gen)
+
+    def _restore_attempt_slot(
+        self,
+        call_id: str,
+        channel_id: str,
+        agent_id: Optional[int],
+        loop_gen: Optional[int],
+    ) -> None:
+        """Devuelve el slot de intento si el timeout aborta tras claim (answer ganó)."""
+        with self._dialing_lock:
+            self._active_attempts.setdefault(call_id, channel_id)
+            if agent_id is not None:
+                self._active_attempt_agents.setdefault(call_id, agent_id)
+            if loop_gen is not None:
+                self._active_attempt_loop_gens.setdefault(call_id, loop_gen)
+
+    def _queue_timeout_should_abort(self, call_id: str) -> bool:
+        """True si hay answer aceptado / llamada consolidada (no seguir con timeout)."""
+        try:
+            with self.state_store.lock(call_id):
+                ctx = self.state_store.get(call_id)
+                if not ctx:
+                    return True
+                return queue_timeout_should_suppress_cleanup(ctx)
+        except Exception:
+            logger.exception(
+                "_queue_timeout_should_abort: error call_id=%s", call_id
+            )
+            return False
+
+    def _discard_queue_timeout_callback(self, call_id: str) -> None:
+        with self._on_queue_timeout_callbacks_lock:
+            self._on_queue_timeout_callbacks.pop(call_id, None)
 
     def _agent_lock_ttl(self, ring_timeout: int) -> int:
         """TTL del lock de agente: ring_timeout + margen configurable."""
@@ -337,7 +662,10 @@ class DistributionService:
             distribution_metadata: Dict para dial_agent_with_headers (id_customer, id_camp, etc.).
             on_queue_timeout_callback: Invocado al dispararse el timeout (call_id, pstn_channel_id).
         """
+        loop_gen = self._bump_loop_generation(call_id)
         stop_event, attempt_finished = self._get_or_create_call_events(call_id)
+        # Despierta loop previo (si hay) y deja stop limpio para el nuevo.
+        stop_event.set()
         stop_event.clear()
         attempt_finished.clear()
         self._enqueue_waiting(campaign_id, call_id)
@@ -348,6 +676,12 @@ class DistributionService:
                 if ctx:
                     ctx.distribution_strategy = strategy
                     ctx.distribution_ring_timeout = int(ring_timeout)
+                    # Cola operativa del ZSET/loop (REFER, blind_to_campaign, etc.).
+                    # No tocar id_camp (atribución CDR/BI).
+                    try:
+                        ctx.distribution_campaign_id = int(campaign_id)
+                    except (TypeError, ValueError):
+                        pass
                     # Solo fijar timeout/started en el primer start; redistribute actualiza started
                     # pero preserva el original vía distribution_queue_timeout_sec si ya existe.
                     if getattr(ctx, "distribution_queue_timeout_sec", None) is None:
@@ -394,7 +728,7 @@ class DistributionService:
         threading.Thread(
             target=self._run_distribution_loop,
             args=(call_id, campaign_id, bridge_id, meta, strategy, ring_timeout),
-            kwargs={"caller_channel_id": pstn_channel_id},
+            kwargs={"caller_channel_id": pstn_channel_id, "loop_gen": loop_gen},
             daemon=True,
         ).start()
 
@@ -690,6 +1024,10 @@ class DistributionService:
                                 return
 
                             if not answered_or_failed:
+                                if self._recover_answer_if_channel_up(
+                                    call_id, agent_channel_id
+                                ):
+                                    return
                                 try:
                                     self.ari_client.hangup_channel(agent_channel_id)
                                 except Exception:
@@ -831,7 +1169,16 @@ class DistributionService:
         if hangup_agent_channel:
             with self._dialing_lock:
                 agent_ch = self._active_attempts.pop(call_id, None)
-                self._active_attempt_agents.pop(call_id, None)
+                attempt_agent_id = self._active_attempt_agents.pop(call_id, None)
+                self._active_attempt_loop_gens.pop(call_id, None)
+            if attempt_agent_id is not None:
+                self._release_agent_reservation(
+                    int(attempt_agent_id),
+                    call_id,
+                    RedisKeys.agent_lock(str(attempt_agent_id)),
+                    restore_ready=True,
+                    use_status_reservation=True,
+                )
             if agent_ch:
                 try:
                     self.ari_client.hangup_channel(agent_ch)
@@ -873,15 +1220,27 @@ class DistributionService:
         Mantiene lock/lease y STATUS=DIALING hasta try_confirm_distribution_oncall (o release
         con restore_ready si el bridge falla). Marca distribution_answer_accepted para que
         el timeout de cola no corte la llamada en esa ventana.
+
+        Idempotente: si el slot ya se consumió pero distribution_answer_accepted y
+        agent_attempt_channel coinciden, retorna True (StasisStart tardío / recover Up).
         """
         answered_agent_id: Optional[int] = None
+        claimed_slot = False
         with self._dialing_lock:
             current = self._active_attempts.get(call_id)
             if current is not None and channel_id == current:
                 self._active_attempts.pop(call_id, None)
                 answered_agent_id = self._active_attempt_agents.pop(call_id, None)
-            else:
-                return False
+                self._active_attempt_loop_gens.pop(call_id, None)
+                claimed_slot = True
+
+        if not claimed_slot:
+            if self.is_answer_already_accepted_for_channel(call_id, channel_id):
+                stop_event, attempt_finished = self._get_or_create_call_events(call_id)
+                stop_event.set()
+                attempt_finished.set()
+                return True
+            return False
 
         if answered_agent_id is not None:
             try:
@@ -975,6 +1334,7 @@ class DistributionService:
                     return False
 
                 context.distribution_answer_accepted = False
+                context.distribution_offering = False
                 context.agent_attempt_channel = None
                 if getattr(context, "agent_connected_channel", None):
                     context.agent_connected_channel = None
@@ -1083,6 +1443,8 @@ class DistributionService:
             if current is None or channel_id != current:
                 return False
             failed_agent_id = self._active_attempt_agents.pop(call_id, None)
+            self._active_attempts.pop(call_id, None)
+            self._active_attempt_loop_gens.pop(call_id, None)
 
         if failed_agent_id is not None:
             self._release_agent_reservation(
@@ -1107,6 +1469,7 @@ class DistributionService:
         ring_timeout: int,
         *,
         caller_channel_id: Optional[str] = None,
+        loop_gen: int = 0,
     ) -> None:
         """
         Loop de distribución: busca candidatos, origina hacia agentes, espera respuesta
@@ -1114,10 +1477,12 @@ class DistributionService:
         """
         try:
             logger.info(
-                "[DistributionService] Loop iniciado para call_id=%s, campaña=%s, strategy=%s",
+                "[DistributionService] Loop iniciado para call_id=%s, campaña=%s, "
+                "strategy=%s, gen=%s",
                 call_id,
                 id_camp,
                 strategy,
+                loop_gen,
             )
 
             stop_event, attempt_finished = self._get_or_create_call_events(call_id)
@@ -1133,6 +1498,13 @@ class DistributionService:
 
             try:
                 while not stop_event.is_set():
+                    if not self._is_current_loop(call_id, loop_gen):
+                        logger.info(
+                            "DistributionLoop: generación obsoleta call_id=%s gen=%s, saliendo",
+                            call_id,
+                            loop_gen,
+                        )
+                        break
                     try:
                         context = self.state_store.get(call_id)
                         if not context:
@@ -1156,7 +1528,11 @@ class DistributionService:
                             return
 
                         if weight_routing and self._waiting_inventory:
-                            if not self._waiting_inventory.is_queue_head(str(id_camp), call_id):
+                            if not getattr(context, "distribution_offering", False):
+                                self._touch_waiting_alive(call_id)
+                            if not self._can_offer_from_waiting(
+                                str(id_camp), call_id, context
+                            ):
                                 if stop_event.wait(0.3):
                                     break
                                 continue
@@ -1251,36 +1627,45 @@ class DistributionService:
                                 "agent_id": candidate.agent_id,
                             }
 
-                            if weight_routing and self._offer_coordinator:
+                            if weight_routing:
                                 enqueued_at_ms = self._get_enqueued_at_ms(str(id_camp), call_id)
                                 wait_sec = max(
                                     0.0, (time.time() * 1000.0 - enqueued_at_ms) / 1000.0
                                 )
                                 priority = compute_call_priority(campaign_weight, wait_sec)
                                 offer_ttl = self._agent_lock_ttl(ring_timeout)
-                                if not self._offer_coordinator.try_claim(
+                                if not self.agent_status_service:
+                                    logger.warning(
+                                        "DistributionLoop: weight routing sin agent_status_service, "
+                                        "skip agente %s call_id=%s",
+                                        candidate.agent_id,
+                                        call_id,
+                                    )
+                                    continue
+                                if not self.agent_status_service.try_claim_and_reserve_for_distribution(
                                     candidate.agent_id,
                                     call_id,
+                                    offer_ttl,
                                     priority,
                                     enqueued_at_ms,
-                                    offer_ttl,
                                 ):
                                     continue
+                                lock_key = RedisKeys.agent_lock(str(candidate.agent_id))
+                            else:
+                                lock_key = self._reserve_agent(
+                                    candidate.agent_id, ring_timeout, call_id, cas_ready=True
+                                )
+                                if not lock_key:
+                                    continue
 
-                            lock_key = self._reserve_agent(
-                                candidate.agent_id, ring_timeout, call_id, cas_ready=True
-                            )
-                            if not lock_key:
-                                if weight_routing and self._offer_coordinator:
-                                    self._offer_coordinator.release_if_mine(
-                                        candidate.agent_id, call_id
-                                    )
-                                continue
+                            if weight_routing:
+                                self._mark_offering_and_dequeue(str(id_camp), call_id)
 
                             pre_generated_channel_id = str(uuid.uuid4())
                             with self._dialing_lock:
                                 self._active_attempts[call_id] = pre_generated_channel_id
                                 self._active_attempt_agents[call_id] = candidate.agent_id
+                                self._active_attempt_loop_gens[call_id] = loop_gen
 
                             try:
                                 agent_channel_id = self.call_service.dial_agent_with_headers(
@@ -1298,29 +1683,27 @@ class DistributionService:
                                     e,
                                     exc_info=True,
                                 )
-                                with self._dialing_lock:
-                                    self._active_attempts.pop(call_id, None)
-                                    self._active_attempt_agents.pop(call_id, None)
-                                self._release_agent_reservation(
-                                    candidate.agent_id,
-                                    call_id,
-                                    lock_key,
-                                    restore_ready=True,
-                                    use_status_reservation=True,
-                                )
+                                owned = self._clear_attempt_if_loop(call_id, loop_gen)
+                                if owned:
+                                    self._release_agent_reservation(
+                                        candidate.agent_id,
+                                        call_id,
+                                        lock_key,
+                                        restore_ready=True,
+                                        use_status_reservation=True,
+                                    )
                                 continue
 
                             if not agent_channel_id:
-                                with self._dialing_lock:
-                                    self._active_attempts.pop(call_id, None)
-                                    self._active_attempt_agents.pop(call_id, None)
-                                self._release_agent_reservation(
-                                    candidate.agent_id,
-                                    call_id,
-                                    lock_key,
-                                    restore_ready=True,
-                                    use_status_reservation=True,
-                                )
+                                owned = self._clear_attempt_if_loop(call_id, loop_gen)
+                                if owned:
+                                    self._release_agent_reservation(
+                                        candidate.agent_id,
+                                        call_id,
+                                        lock_key,
+                                        restore_ready=True,
+                                        use_status_reservation=True,
+                                    )
                                 continue
 
                             with self.state_store.lock(call_id):
@@ -1331,12 +1714,13 @@ class DistributionService:
 
                             answered_or_failed = attempt_finished.wait(timeout=ring_timeout)
 
-                            if stop_event.is_set():
+                            if stop_event.is_set() or not self._is_current_loop(
+                                call_id, loop_gen
+                            ):
                                 # Si handle_agent_answer ya consumió el slot, la reserva
                                 # queda hasta try_confirm_distribution_oncall (no liberar aquí).
-                                with self._dialing_lock:
-                                    still_attempting = call_id in self._active_attempt_agents
-                                if still_attempting:
+                                owned = self._clear_attempt_if_loop(call_id, loop_gen)
+                                if owned:
                                     self._release_agent_reservation(
                                         candidate.agent_id,
                                         call_id,
@@ -1347,13 +1731,40 @@ class DistributionService:
                                 return
 
                             if not answered_or_failed:
+                                if self._recover_answer_if_channel_up(
+                                    call_id, agent_channel_id
+                                ):
+                                    return
                                 try:
                                     self.ari_client.hangup_channel(agent_channel_id)
                                 except Exception:
                                     pass
-                                with self._dialing_lock:
-                                    self._active_attempts.pop(call_id, None)
-                                    self._active_attempt_agents.pop(call_id, None)
+                                owned = self._clear_attempt_if_loop(call_id, loop_gen)
+                                if owned:
+                                    with self.state_store.lock(call_id):
+                                        ctx = self.state_store.get(call_id)
+                                        if ctx:
+                                            ctx.agent_attempt_channel = None
+                                            self.state_store.register_unsafe(call_id, ctx)
+                                    self._release_agent_reservation(
+                                        candidate.agent_id,
+                                        call_id,
+                                        lock_key,
+                                        restore_ready=True,
+                                        use_status_reservation=True,
+                                    )
+                                continue
+
+                            logger.info(
+                                "DistributionLoop: intento hacia agente %s falló por evento ARI, siguiente candidato",
+                                candidate.agent_id,
+                            )
+                            try:
+                                self.ari_client.hangup_channel(agent_channel_id)
+                            except Exception:
+                                pass
+                            owned = self._clear_attempt_if_loop(call_id, loop_gen)
+                            if owned:
                                 with self.state_store.lock(call_id):
                                     ctx = self.state_store.get(call_id)
                                     if ctx:
@@ -1366,31 +1777,6 @@ class DistributionService:
                                     restore_ready=True,
                                     use_status_reservation=True,
                                 )
-                                continue
-
-                            logger.info(
-                                "DistributionLoop: intento hacia agente %s falló por evento ARI, siguiente candidato",
-                                candidate.agent_id,
-                            )
-                            try:
-                                self.ari_client.hangup_channel(agent_channel_id)
-                            except Exception:
-                                pass
-                            with self._dialing_lock:
-                                self._active_attempts.pop(call_id, None)
-                                self._active_attempt_agents.pop(call_id, None)
-                            with self.state_store.lock(call_id):
-                                ctx = self.state_store.get(call_id)
-                                if ctx:
-                                    ctx.agent_attempt_channel = None
-                                    self.state_store.register_unsafe(call_id, ctx)
-                            self._release_agent_reservation(
-                                candidate.agent_id,
-                                call_id,
-                                lock_key,
-                                restore_ready=True,
-                                use_status_reservation=True,
-                            )
 
                         if stop_event.wait(1.0):
                             break
@@ -1404,9 +1790,9 @@ class DistributionService:
                         if stop_event.wait(1.0):
                             break
             finally:
-                with self._dialing_lock:
-                    agent_ch = self._active_attempts.pop(call_id, None)
-                    attempt_agent_id = self._active_attempt_agents.pop(call_id, None)
+                agent_ch, attempt_agent_id = self._pop_active_attempt_if_loop(
+                    call_id, loop_gen
+                )
                 if agent_ch:
                     try:
                         self.ari_client.hangup_channel(agent_ch)
@@ -1446,10 +1832,23 @@ class DistributionService:
             except Exception:
                 pass
         finally:
-            self._remove_call_events(call_id)
-            with self._on_queue_timeout_callbacks_lock:
-                self._on_queue_timeout_callbacks.pop(call_id, None)
-            logger.info("Distribution loop finalized for call_id=%s", call_id)
+            if self._is_current_loop(call_id, loop_gen):
+                self._remove_call_events(call_id)
+                self._clear_loop_generation_if_current(call_id, loop_gen)
+                with self._on_queue_timeout_callbacks_lock:
+                    self._on_queue_timeout_callbacks.pop(call_id, None)
+                logger.info(
+                    "Distribution loop finalized for call_id=%s gen=%s",
+                    call_id,
+                    loop_gen,
+                )
+            else:
+                logger.info(
+                    "Distribution loop finalized (obsoleto, skip cleanup) "
+                    "call_id=%s gen=%s",
+                    call_id,
+                    loop_gen,
+                )
 
     def _on_queue_timeout(
         self,
@@ -1460,11 +1859,11 @@ class DistributionService:
         uniqueid: str,
     ) -> None:
         """
-        Maneja timeout de cola: señaliza stop, cancela timer, marca call_ended,
-        notifica QueueEventManager y reporter, cuelga agente actual y PSTN, destruye bridge, unregister.
+        Maneja timeout de cola en dos fases: claim del intento y luego commit
+        destructivo (dequeue, callback, mark, report, hangups).
 
-        Si la contestación ya fue aceptada (distribution_answer_accepted) o la llamada
-        ya está consolidada, no ejecuta callback (p. ej. EXIT_TIMEOUT al dialer) ni cleanup.
+        Si la contestación ya fue aceptada o el canal de intento está Up, aborta
+        antes de mark/report (un solo closer: answer o timeout completo).
         """
         logger.info(
             "DistributionService._on_queue_timeout: Timeout de cola para call_id=%s, campaña=%s",
@@ -1479,8 +1878,7 @@ class DistributionService:
         with self._call_events_lock:
             self._queue_timers.pop(call_id, None)
 
-        context_for_report: Optional[CallContext] = None
-        current_agent_channel: Optional[str] = None
+        # --- Early abort (antes de claim) ---
         with self.state_store.lock(call_id):
             context = self.state_store.get(call_id)
             if not context:
@@ -1488,8 +1886,7 @@ class DistributionService:
                     "_on_queue_timeout: contexto inexistente para call_id=%s, nada que hacer",
                     call_id,
                 )
-                with self._on_queue_timeout_callbacks_lock:
-                    self._on_queue_timeout_callbacks.pop(call_id, None)
+                self._discard_queue_timeout_callback(call_id)
                 return
             if queue_timeout_should_suppress_cleanup(context):
                 logger.info(
@@ -1499,13 +1896,96 @@ class DistributionService:
                     context.agent_connected_channel,
                     getattr(context, "distribution_answer_accepted", False),
                 )
-                with self._on_queue_timeout_callbacks_lock:
-                    self._on_queue_timeout_callbacks.pop(call_id, None)
+                self._discard_queue_timeout_callback(call_id)
+                return
+
+        with self._dialing_lock:
+            peek_agent_channel = self._active_attempts.get(call_id)
+        if peek_agent_channel and self._is_channel_up(peek_agent_channel):
+            logger.warning(
+                "_on_queue_timeout: canal de intento %s está Up para call_id=%s; "
+                "omitiendo cleanup destructivo (lag de eventos)",
+                peek_agent_channel,
+                call_id,
+            )
+            self._recover_answer_if_channel_up(call_id, peek_agent_channel)
+            self._discard_queue_timeout_callback(call_id)
+            return
+
+        if self._queue_timeout_should_abort(call_id):
+            self._discard_queue_timeout_callback(call_id)
+            return
+
+        # --- Fase claim ---
+        claimed = self._claim_attempt_for_timeout(call_id)
+        current_agent_channel: Optional[str] = None
+        timeout_agent_id: Optional[int] = None
+        timeout_loop_gen: Optional[int] = None
+
+        if claimed is not None:
+            current_agent_channel, timeout_agent_id, timeout_loop_gen = claimed
+            # Up entre peek y claim: restaurar y tratar como answer.
+            if self._is_channel_up(current_agent_channel):
+                logger.warning(
+                    "_on_queue_timeout: canal %s Up tras claim call_id=%s; "
+                    "restaurando slot y recuperando answer",
+                    current_agent_channel,
+                    call_id,
+                )
+                self._restore_attempt_slot(
+                    call_id, current_agent_channel, timeout_agent_id, timeout_loop_gen
+                )
+                self._recover_answer_if_channel_up(call_id, current_agent_channel)
+                self._discard_queue_timeout_callback(call_id)
+                return
+            if self._queue_timeout_should_abort(call_id):
+                logger.info(
+                    "_on_queue_timeout: contestación aceptada tras claim call_id=%s; "
+                    "restaurando slot",
+                    call_id,
+                )
+                self._restore_attempt_slot(
+                    call_id, current_agent_channel, timeout_agent_id, timeout_loop_gen
+                )
+                self._discard_queue_timeout_callback(call_id)
+                return
+        else:
+            # Slot vacío: answer pudo ganar; no destruir si suppress.
+            if self._queue_timeout_should_abort(call_id):
+                logger.info(
+                    "_on_queue_timeout: sin intento activo y answer aceptada call_id=%s; abort",
+                    call_id,
+                )
+                self._discard_queue_timeout_callback(call_id)
+                return
+
+        # --- Fase commit (timeout gana) ---
+        context_for_report: Optional[CallContext] = None
+        with self.state_store.lock(call_id):
+            context = self.state_store.get(call_id)
+            if not context:
+                self._discard_queue_timeout_callback(call_id)
+                return
+            if queue_timeout_should_suppress_cleanup(context):
+                # Carrera tardía post-claim; restaurar slot (reserva aún no liberada).
+                if current_agent_channel is not None:
+                    self._restore_attempt_slot(
+                        call_id, current_agent_channel, timeout_agent_id, timeout_loop_gen
+                    )
+                self._discard_queue_timeout_callback(call_id)
                 return
             self._dequeue_waiting(str(id_camp), call_id)
             context_for_report = context
 
-        # Callback (p. ej. EXIT_TIMEOUT al dialer) solo si vamos a cortar de verdad.
+        if timeout_agent_id is not None:
+            self._release_agent_reservation(
+                timeout_agent_id,
+                call_id,
+                RedisKeys.agent_lock(str(timeout_agent_id)),
+                restore_ready=True,
+                use_status_reservation=True,
+            )
+
         with self._on_queue_timeout_callbacks_lock:
             cb = self._on_queue_timeout_callbacks.pop(call_id, None)
         if cb is not None and pstn_channel_id:
@@ -1516,34 +1996,6 @@ class DistributionService:
                     "DistributionService._on_queue_timeout: error en callback para call_id=%s",
                     call_id,
                 )
-
-        with self._dialing_lock:
-            current_agent_channel = self._active_attempts.pop(call_id, None)
-            timeout_agent_id = self._active_attempt_agents.pop(call_id, None)
-
-        # Contestación pudo llegar tras el check anterior.
-        with self.state_store.lock(call_id):
-            mid_ctx = self.state_store.get(call_id)
-            if mid_ctx and queue_timeout_should_suppress_cleanup(mid_ctx):
-                logger.info(
-                    "_on_queue_timeout: contestación aceptada antes de mark_call_ended "
-                    "call_id=%s; omitiendo cleanup destructivo",
-                    call_id,
-                )
-                if current_agent_channel and timeout_agent_id is not None:
-                    with self._dialing_lock:
-                        self._active_attempts.setdefault(call_id, current_agent_channel)
-                        self._active_attempt_agents.setdefault(call_id, timeout_agent_id)
-                return
-
-        if timeout_agent_id is not None:
-            self._release_agent_reservation(
-                timeout_agent_id,
-                call_id,
-                RedisKeys.agent_lock(str(timeout_agent_id)),
-                restore_ready=True,
-                use_status_reservation=True,
-            )
 
         try:
             mark_result = self.state_store.mark_call_ended_atomic(call_id)
@@ -1667,17 +2119,7 @@ class DistributionService:
                     call_id,
                 )
 
-        # Revalidar antes de colgar PSTN: la contestación pudo llegar entre el check y aquí.
-        with self.state_store.lock(call_id):
-            late_ctx = self.state_store.get(call_id)
-            if late_ctx and queue_timeout_should_suppress_cleanup(late_ctx):
-                logger.info(
-                    "_on_queue_timeout: contestación aceptada antes de hangup PSTN call_id=%s, "
-                    "omitendo hangup PSTN/bridge/unregister",
-                    call_id,
-                )
-                return
-
+        # Tras mark no abortamos: completar hangup PSTN/bridge/unregister (evitar TIMEOUT huérfano).
         if pstn_channel_id:
             try:
                 self.ari_client.hangup_channel(pstn_channel_id)

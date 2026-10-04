@@ -1077,8 +1077,20 @@ class ProgressiveCampaignHandler(BaseHandler):
                     channel_id,
                 )
                 return
-            if not self.distribution_service.handle_agent_answer(call_id, channel_id):
-                return
+            answer_accepted = self.distribution_service.handle_agent_answer(
+                call_id, channel_id
+            )
+            if not answer_accepted:
+                if not self.distribution_service.is_answer_already_accepted_for_channel(
+                    call_id, channel_id
+                ):
+                    return
+                logger.info(
+                    "ProgressiveCampaignHandler.on_agent_stasis_start: StasisStart tardío "
+                    "call_id=%s channel=%s (answer ya aceptada por recover Up)",
+                    call_id,
+                    channel_id,
+                )
             # Parar loop + timer; no dequeue hasta ONCALL / redistribute
             self.distribution_service.stop_distribution(
                 call_id,
@@ -1091,18 +1103,14 @@ class ProgressiveCampaignHandler(BaseHandler):
                 channel_id,
                 call_id,
             )
-            with self.state_store.lock(call_id):
-                ctx = self.state_store.get(call_id)
-                is_voicebot = getattr(ctx, "is_voicebot", False) if ctx else False
-            if is_voicebot:
-                agent_id_str = None
-            else:
-                agent_id_str = self._extract_agent_id_from_agent_channel(channel_id, event)
-
+            agent_id_str: Optional[str] = None
             bridge_id: Optional[str] = None
             with self.state_store.lock(call_id):
                 peek = self.state_store.get(call_id)
                 if not peek:
+                    agent_id_str = self._extract_agent_id_from_agent_channel(
+                        channel_id, event
+                    )
                     if agent_id_str and self.agent_status_service:
                         try:
                             self.agent_status_service.release_distribution_reservation(
@@ -1112,6 +1120,12 @@ class ProgressiveCampaignHandler(BaseHandler):
                             pass
                     return
                 bridge_id = peek.bridge_id
+                is_voicebot = bool(getattr(peek, "is_voicebot", False))
+                if not is_voicebot and getattr(peek, "agent_id", None) is not None:
+                    agent_id_str = str(peek.agent_id)
+
+            if not is_voicebot and not agent_id_str:
+                agent_id_str = self._extract_agent_id_from_agent_channel(channel_id, event)
 
             if not bridge_id:
                 logger.warning(

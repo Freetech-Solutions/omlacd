@@ -35,6 +35,11 @@ When deploying versions that include RouteValidator fallback routing (campaign w
 
 Run the usual Django/Asterisk sync step that triggers `regenerar_familys_rutas()` before restarting ACD workers. Without this refresh, the fallback still works via `SCAN` as a compatibility mode, but route selection order may be stale until families are regenerated.
 
+### Inbound regression checklist
+
+After fairness / distribution changes, run the manual sanity check in
+[docs/inbound-sanity-check.md](docs/inbound-sanity-check.md) (signaling, Redis, Postgres, transfers).
+
 ## Versioning
 
 *   The component version is tracked with git `tags`.

@@ -141,6 +141,9 @@ class CallContext(BaseModel):
     # True desde handle_agent_answer hasta ONCALL confirmado o fallo de bridge; inhibe timeout de cola
     # y mantiene la reserva DIALING+lock hasta try_confirm_distribution_oncall.
     distribution_answer_accepted: bool = False
+    # True tras el primer claim/reserva exitoso: sale del ZSET waiting pero sigue pudiendo
+    # ofertar (evita HOL mientras suena / prueba el siguiente agente).
+    distribution_offering: bool = False
     # Params para reiniciar distribución si falla consolidación post-answer
     distribution_strategy: Optional[str] = None
     distribution_ring_timeout: Optional[int] = None

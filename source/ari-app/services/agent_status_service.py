@@ -14,6 +14,7 @@ import redis
 
 from config import settings
 from constants import AgentStatus, RedisKeys
+from services.routing.offer_coordinator import OfferCoordinator
 from services.supervision_fanout import (
     publish_agent_to_streams,
     publish_voicebot_active_calls_change,
@@ -75,7 +76,8 @@ if lease_val == ARGV[1] then
 end
 if ARGV[5] == '1' then
     local current = redis.call('HGET', KEYS[1], 'STATUS')
-    if current == ARGV[2] then
+    -- ARGV[2]=DIALING ARGV[6]=RINGING (softphone); ambos vuelven a READY
+    if current == ARGV[2] or current == ARGV[6] then
         local callid = redis.call('HGET', KEYS[1], 'CALLID')
         if not callid or callid == '' or callid == ARGV[1] then
             redis.call('HSET', KEYS[1], 'STATUS', ARGV[3], 'TIMESTAMP', ARGV[4])
@@ -88,7 +90,8 @@ return 1
 
 _REVERT_STALE_DIALING_SCRIPT = """
 local current = redis.call('HGET', KEYS[1], 'STATUS')
-if current ~= ARGV[1] then
+-- ARGV[1]=DIALING ARGV[4]=RINGING
+if current ~= ARGV[1] and current ~= ARGV[4] then
     return 0
 end
 if redis.call('EXISTS', KEYS[2]) == 1 then
@@ -102,10 +105,13 @@ redis.call('HDEL', KEYS[1], 'CALLID')
 return 1
 """
 
-# Confirma ONCALL solo si STATUS=DIALING y CALLID coincide; libera lock/lease de esa call_id.
+# Confirma ONCALL si CALLID coincide y STATUS es DIALING (reserva ACD) o RINGING
+# (softphone/Django via api_make_ringing pisa DIALING→RINGING al mostrar el modal).
+# ARGV[1]=DIALING ARGV[2]=call_id ARGV[3]=ONCALL ARGV[4]=ts ARGV[5]=bridge
+# ARGV[6]=campaign ARGV[7]=contact ARGV[8]=node ARGV[9]=RINGING
 _CONFIRM_DISTRIBUTION_ONCALL_SCRIPT = """
 local current = redis.call('HGET', KEYS[1], 'STATUS')
-if current ~= ARGV[1] then
+if current ~= ARGV[1] and current ~= ARGV[9] then
     return 0
 end
 local callid = redis.call('HGET', KEYS[1], 'CALLID')
@@ -137,6 +143,9 @@ end
 return 1
 """
 
+# Estado UI del softphone (Django api_make_ringing); no está en AgentStatus del ACD.
+_AGENT_STATUS_RINGING = "RINGING"
+
 
 class AgentStatusService:
     """
@@ -150,12 +159,15 @@ class AgentStatusService:
     def __init__(self, redis_client: Optional[redis.Redis] = None):
         """
         Inicializa el servicio de estado de agentes.
-        
+
         Args:
             redis_client: Cliente Redis inyectado (opcional)
         """
         self.redis_client = redis_client
         self.logger = logging.getLogger(__name__)
+        self._offer_coordinator = (
+            OfferCoordinator(redis_client) if redis_client is not None else None
+        )
     
     def _get_agent_key(self, agent_id: Any) -> str:
         """
@@ -343,6 +355,53 @@ class AgentStatusService:
             )
             return False
 
+    def try_claim_and_reserve_for_distribution(
+        self,
+        agent_id: Any,
+        call_id: str,
+        ttl_sec: int,
+        priority: float,
+        enqueued_at_ms: float,
+    ) -> bool:
+        """
+        Offer claim + READY→DIALING + lock/lease atómicos (weight routing).
+        No pisa el offer si el agente no está READY o ya tiene lock/lease.
+        """
+        if not agent_id or not call_id:
+            self.logger.warning(
+                "try_claim_and_reserve_for_distribution: agent_id o call_id vacío"
+            )
+            return False
+
+        if not self.redis_client or self._offer_coordinator is None:
+            self.logger.error(
+                "try_claim_and_reserve_for_distribution: redis/coordinator no disponible "
+                "para agente %s",
+                agent_id,
+            )
+            return False
+
+        try:
+            ok = self._offer_coordinator.try_claim_and_reserve(
+                int(agent_id),
+                str(call_id),
+                float(priority),
+                float(enqueued_at_ms),
+                int(ttl_sec),
+            )
+            if ok:
+                publish_agent_to_streams(self.redis_client, agent_id)
+            return bool(ok)
+        except Exception as e:
+            self.logger.error(
+                "try_claim_and_reserve_for_distribution: error agente %s call_id=%s: %s",
+                agent_id,
+                call_id,
+                e,
+                exc_info=True,
+            )
+            return False
+
     def release_distribution_reservation(
         self,
         agent_id: Any,
@@ -352,7 +411,7 @@ class AgentStatusService:
     ) -> bool:
         """
         Libera lock/lease de distribución si coinciden con call_id.
-        Opcionalmente revierte DIALING→READY cuando restore_ready=True.
+        Opcionalmente revierte DIALING|RINGING→READY cuando restore_ready=True.
         """
         if not agent_id or not call_id:
             self.logger.warning("release_distribution_reservation: agent_id o call_id vacío")
@@ -381,6 +440,7 @@ class AgentStatusService:
                 AgentStatus.READY.value,
                 current_timestamp,
                 "1" if restore_ready else "0",
+                _AGENT_STATUS_RINGING,
             )
             if result and restore_ready:
                 publish_agent_to_streams(self.redis_client, agent_id)
@@ -397,7 +457,8 @@ class AgentStatusService:
 
     def revert_stale_dialing(self, agent_id: Any) -> bool:
         """
-        Revierte DIALING→READY si no hay lock ni lease activos (reserva expirada o huérfana).
+        Revierte DIALING|RINGING→READY si no hay lock ni lease activos
+        (reserva expirada o huérfana tras softphone ringing).
         """
         if not agent_id:
             return False
@@ -419,6 +480,7 @@ class AgentStatusService:
                 AgentStatus.DIAL_CALL.value,
                 AgentStatus.READY.value,
                 current_timestamp,
+                _AGENT_STATUS_RINGING,
             )
             if result:
                 publish_agent_to_streams(self.redis_client, agent_id)
@@ -512,9 +574,11 @@ class AgentStatusService:
         node_id: Optional[str] = None,
     ) -> bool:
         """
-        Transición atómica DIALING→ONCALL solo si STATUS=DIALING y CALLID==call_id.
-        Libera lock/lease de distribución pertenecientes a call_id.
-        No pisa el estado si otra reserva ya tomó al agente.
+        Transición atómica a ONCALL si CALLID==call_id y STATUS es DIALING o RINGING.
+
+        RINGING lo escribe Django (api_make_ringing) al mostrar el modal; sin aceptarlo
+        el agente contesta y el ACD rechazaba la consolidación.
+        Libera lock/lease de distribución de esa call_id.
         """
         if not agent_id or not call_id or not bridge_id:
             self.logger.warning(
@@ -553,6 +617,7 @@ class AgentStatusService:
                 campaign_str,
                 contact_str,
                 str(node_id),
+                _AGENT_STATUS_RINGING,
             )
             if result:
                 self.logger.info(
@@ -566,7 +631,7 @@ class AgentStatusService:
             else:
                 self.logger.warning(
                     "try_confirm_distribution_oncall: rechazo para agente %s call_id=%s "
-                    "(STATUS/CALLID no coinciden)",
+                    "(STATUS no es DIALING/RINGING o CALLID no coincide)",
                     agent_id,
                     call_id,
                 )

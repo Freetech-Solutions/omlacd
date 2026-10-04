@@ -872,12 +872,25 @@ class InboundCallHandler(BaseHandler):
                 )
                 return
 
-            if not self.distribution_service.handle_agent_answer(call_id, channel_id):
-                logger.debug(
-                    "InboundCallHandler.on_agent_stasis_start: canal %s no es el agente actual, ignorando",
+            answer_accepted = self.distribution_service.handle_agent_answer(
+                call_id, channel_id
+            )
+            if not answer_accepted:
+                # Loop pudo marcar answer por canal Up (lag del event worker).
+                if not self.distribution_service.is_answer_already_accepted_for_channel(
+                    call_id, channel_id
+                ):
+                    logger.debug(
+                        "InboundCallHandler.on_agent_stasis_start: canal %s no es el agente actual, ignorando",
+                        channel_id,
+                    )
+                    return
+                logger.info(
+                    "InboundCallHandler.on_agent_stasis_start: StasisStart tardío para "
+                    "call_id=%s channel=%s (answer ya aceptada por recover Up)",
+                    call_id,
                     channel_id,
                 )
-                return
 
             # Cancelar timer de timeout de cola: handle_agent_answer ya detiene el loop pero no el Timer.
             # No dequeue aún: la salida del ZSET es tras ONCALL (o redistribute si falla).
@@ -894,16 +907,18 @@ class InboundCallHandler(BaseHandler):
                 call_id,
             )
 
-            # Recuperar agent_id antes del lock (evita I/O dentro del lock)
-            agent_id_str = self._extract_agent_id_from_agent_channel(channel_id, event)
-
             bridge_id: Optional[str] = None
+            agent_id_str: Optional[str] = None
             with self.state_store.lock(call_id):
                 peek = self.state_store.get(call_id)
                 if not peek:
                     logger.info(
                         "InboundCallHandler.on_agent_stasis_start: contexto desapareció para call_id=%s",
                         call_id,
+                    )
+                    # Fallback ARI para liberar reserva si el contexto ya no está.
+                    agent_id_str = self._extract_agent_id_from_agent_channel(
+                        channel_id, event
                     )
                     if agent_id_str and self.agent_status_service:
                         try:
@@ -914,6 +929,12 @@ class InboundCallHandler(BaseHandler):
                             pass
                     return
                 bridge_id = peek.bridge_id
+                if getattr(peek, "agent_id", None) is not None:
+                    agent_id_str = str(peek.agent_id)
+
+            # Fallback ARI solo si distribución no dejó agent_id en el contexto.
+            if not agent_id_str:
+                agent_id_str = self._extract_agent_id_from_agent_channel(channel_id, event)
 
             if not bridge_id:
                 logger.warning(
