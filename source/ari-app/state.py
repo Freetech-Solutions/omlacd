@@ -123,6 +123,9 @@ class CallContext(BaseModel):
     # Timeout de cola en segundos (inbound); usado para distinguir EXIT_TIMEOUT vs EXIT_ABANDON en carrera
     queue_timeout_seconds: Optional[int] = None
 
+    # Playback ARI de ringback local (click2call) mientras espera answer PSTN
+    ringback_playback_id: Optional[str] = None
+
     # Campos para tracking de timestamps de respuesta (para determinar si fue contestada)
     bridge_created_ts: Optional[str] = None  # Timestamp ISO de creación del bridge
     agent_answered_ts: Optional[str] = None  # Timestamp ISO cuando el canal del agente pasó a "Up"

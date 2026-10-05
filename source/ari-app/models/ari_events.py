@@ -290,6 +290,25 @@ class RecordingFinishedEvent(BaseARIEvent):
         strict = False
 
 
+class PlaybackFinishedEvent(BaseARIEvent):
+    """
+    Modelo para eventos PlaybackFinished de ARI.
+
+    Se emite cuando un playback (tone/sound) termina en un canal o bridge.
+
+    Attributes:
+        type: Tipo del evento, debe ser "PlaybackFinished".
+        playback: Recurso Playback finalizado (id, target_uri, media_uri, state).
+    """
+    type: str = Field(default="PlaybackFinished", description="Tipo del evento")
+    playback: Dict[str, Any] = Field(..., description="Información del playback finalizado")
+
+    class Config:
+        """Configuración del modelo Pydantic."""
+        extra = "allow"
+        strict = False
+
+
 class ReferredBy(BaseModel):
     """
     Bloque referred_by del evento ChannelTransfer de ARI.

@@ -24,6 +24,7 @@ from models import (
     ChannelLeftBridgeEvent,
     StasisEndEvent,
     RecordingFinishedEvent,
+    PlaybackFinishedEvent,
     ChannelTransferEvent,
 )
 from reporter import ACDReporter
@@ -299,6 +300,9 @@ class AcDRouter:
             elif event_type == 'RecordingFinished':
                 if isinstance(event, RecordingFinishedEvent):
                     self._handle_recording_finished(event)
+            elif event_type == 'PlaybackFinished':
+                if isinstance(event, PlaybackFinishedEvent):
+                    self._handle_playback_finished(event)
             elif event_type == 'ChannelHold':
                 if isinstance(event, ChannelHoldEvent):
                     self._handle_channel_hold(event)
@@ -310,6 +314,31 @@ class AcDRouter:
             # Add other handlers as needed
         except Exception as e:
             self.logger.error(f"Error procesando evento {event_type}: {e}", exc_info=True)
+
+    def _handle_playback_finished(self, event: PlaybackFinishedEvent) -> None:
+        """
+        Delega PlaybackFinished a ManualCallHandler para loop de ringback click2call.
+        Otros tipos de llamada se ignoran.
+        """
+        playback = event.playback or {}
+        target_uri = playback.get("target_uri") or ""
+        channel_id = None
+        if isinstance(target_uri, str) and target_uri.startswith("channel:"):
+            channel_id = target_uri.split(":", 1)[1]
+        if not channel_id:
+            return
+
+        ctx = self.state_store.get_by_channel(channel_id)
+        if not ctx:
+            return
+
+        call_type = getattr(ctx.type, "value", ctx.type)
+        if call_type != CallType.MANUAL.value:
+            return
+
+        manual_handler = self.handlers.get(CallType.MANUAL.value)
+        if manual_handler and hasattr(manual_handler, "on_playback_finished"):
+            manual_handler.on_playback_finished(event)
 
     def _handle_stasis_start(self, event: StasisStartEvent, event_dict: Optional[Dict[str, Any]] = None) -> None:
         channel_id = event.channel.id

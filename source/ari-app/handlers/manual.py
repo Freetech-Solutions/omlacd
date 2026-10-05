@@ -1,6 +1,7 @@
 import logging
 import threading
 import time
+import uuid
 from datetime import datetime
 from typing import Any, Optional, Dict, Union, Tuple
 
@@ -36,6 +37,8 @@ from models import (
     BridgeDestroyedEvent,
     ChannelHangupRequestEvent,
 )
+
+RINGBACK_MEDIA = "tone:ringback"
 
 
 class ManualCallHandler(BaseHandler):
@@ -188,6 +191,162 @@ class ManualCallHandler(BaseHandler):
             return None, None, None
         return channel_id, channel_name, channel
 
+    def _start_ringback(self, call_id: str, agent_channel_id: str) -> None:
+        """
+        Reproduce tone:ringback en el canal del agente mientras espera answer PSTN.
+        Un fallo de play no aborta la llamada.
+        """
+        if not agent_channel_id or not hasattr(self.ari_client, "play_media"):
+            return
+        playback_id = f"rb-{uuid.uuid4().hex[:16]}"
+        try:
+            result = self.ari_client.play_media(
+                agent_channel_id,
+                RINGBACK_MEDIA,
+                playback_id=playback_id,
+            )
+        except Exception as e:
+            logging.warning(
+                "ManualCallHandler._start_ringback: error iniciando ringback "
+                "call_id=%s channel=%s: %s",
+                call_id,
+                agent_channel_id,
+                e,
+                exc_info=True,
+            )
+            return
+
+        if not result:
+            logging.warning(
+                "ManualCallHandler._start_ringback: play_media sin resultado "
+                "call_id=%s channel=%s",
+                call_id,
+                agent_channel_id,
+            )
+            return
+
+        effective_id = None
+        if isinstance(result, dict):
+            effective_id = result.get("id") or playback_id
+        else:
+            effective_id = playback_id
+
+        with self.state_store.lock(call_id):
+            ctx = self.state_store.get(call_id)
+            if not ctx:
+                try:
+                    self.ari_client.stop_playback(effective_id)
+                except Exception:
+                    pass
+                return
+            # Si ya contestó PSTN entre play y persist, cortar de inmediato
+            if ctx.pstn_answered_ts or ctx.pstn_channel_bridged:
+                try:
+                    self.ari_client.stop_playback(effective_id)
+                except Exception:
+                    pass
+                ctx.ringback_playback_id = None
+                self.state_store.register_unsafe(call_id, ctx)
+                return
+            ctx.ringback_playback_id = effective_id
+            self.state_store.register_unsafe(call_id, ctx)
+        logging.debug(
+            "ManualCallHandler._start_ringback: ringback iniciado call_id=%s playback_id=%s",
+            call_id,
+            effective_id,
+        )
+
+    def _stop_ringback(self, call_id: str) -> None:
+        """Detiene el ringback de forma idempotente (limpia id bajo lock, stop fuera)."""
+        playback_id = None
+        with self.state_store.lock(call_id):
+            ctx = self.state_store.get(call_id)
+            if not ctx:
+                return
+            playback_id = getattr(ctx, "ringback_playback_id", None)
+            if playback_id:
+                ctx.ringback_playback_id = None
+                self.state_store.register_unsafe(call_id, ctx)
+
+        if not playback_id:
+            return
+        try:
+            if hasattr(self.ari_client, "stop_playback"):
+                self.ari_client.stop_playback(playback_id)
+        except Exception as e:
+            logging.debug(
+                "ManualCallHandler._stop_ringback: stop_playback %s (call_id=%s): %s",
+                playback_id,
+                call_id,
+                e,
+            )
+
+    def on_playback_finished(self, event: Union[BaseARIEvent, Dict[str, Any]]) -> None:
+        """
+        Re-arma tone:ringback si el ciclo terminó y la PSTN aún no contestó.
+        """
+        try:
+            if isinstance(event, dict):
+                playback = event.get("playback") or {}
+                finished_id = playback.get("id")
+                target_uri = playback.get("target_uri") or ""
+            else:
+                playback = getattr(event, "playback", None) or {}
+                if isinstance(playback, dict):
+                    finished_id = playback.get("id")
+                    target_uri = playback.get("target_uri") or ""
+                else:
+                    finished_id = getattr(playback, "id", None)
+                    target_uri = getattr(playback, "target_uri", "") or ""
+
+            if not finished_id:
+                return
+
+            channel_id = None
+            if isinstance(target_uri, str) and target_uri.startswith("channel:"):
+                channel_id = target_uri.split(":", 1)[1]
+            if not channel_id:
+                return
+
+            context = self.state_store.get_by_channel(channel_id)
+            if not context:
+                return
+            call_id = context.call_id
+            if not call_id:
+                return
+
+            agent_channel_id = None
+            should_replay = False
+            with self.state_store.lock(call_id):
+                ctx = self.state_store.get(call_id)
+                if not ctx:
+                    return
+                current_id = getattr(ctx, "ringback_playback_id", None)
+                if not current_id or current_id != finished_id:
+                    return
+                if ctx.pstn_answered_ts or ctx.pstn_channel_bridged or ctx.call_ended:
+                    ctx.ringback_playback_id = None
+                    self.state_store.register_unsafe(call_id, ctx)
+                    return
+                # Liberar id vigente; _start_ringback asignará uno nuevo
+                ctx.ringback_playback_id = None
+                agent_channel_id = (
+                    getattr(ctx, "agent_connected_channel", None)
+                    or active_agent_channel(ctx)
+                    or channel_id
+                )
+                self.state_store.register_unsafe(call_id, ctx)
+                should_replay = True
+
+            if should_replay and agent_channel_id:
+                self._start_ringback(call_id, agent_channel_id)
+        except Exception as e:
+            logging.warning(
+                "ManualCallHandler.on_playback_finished: error: %s",
+                e,
+                exc_info=True,
+            )
+
     def _handle_pstn_leg_start(self, channel_id: str, bridge_id: str) -> bool:
         if self.pstn_ring_timer and channel_id:
             self.pstn_ring_timer.cancel(channel_id)
@@ -199,6 +358,9 @@ class ManualCallHandler(BaseHandler):
             return False
 
         call_id = context.call_id
+
+        # Cortar ringback antes de mezclar PSTN en el bridge (evita que el destino oiga el tono)
+        self._stop_ringback(call_id)
 
         # Variables para operación ARI fuera del lock
         needs_bridge_operation = False
@@ -568,6 +730,9 @@ class ManualCallHandler(BaseHandler):
                     self.state_store.register_unsafe(call_id, fresh_context)
                     logging.debug(f"📞 Canal agente {channel_id} marcado como contestado en StasisStart")
 
+            # Ringback local mientras el agente espera que conteste la PSTN
+            self._start_ringback(call_id, channel_id)
+
             # Originate to PSTN; si falla o retorna None, colgar el canal del agente de inmediato
             pstn_channel_id = self._originate_pstn_call(call_id, context, call_data, bridge_id, args_dict)
             if pstn_channel_id is None:
@@ -575,6 +740,7 @@ class ManualCallHandler(BaseHandler):
                     f"_originate_pstn_call falló o retornó None para call_id={call_id}, "
                     f"colgando canal del agente {channel_id} inmediatamente"
                 )
+                self._stop_ringback(call_id)
                 try:
                     self.ari_client.hangup_channel(channel_id)
                 except Exception as e:
@@ -1149,6 +1315,9 @@ class ManualCallHandler(BaseHandler):
                     "no se puede procesar fin de llamada"
                 )
                 return
+
+            # Evitar replay de ringback si llega PlaybackFinished en carrera con el hangup
+            self._stop_ringback(call_id)
 
             # ------------------------------------------------------------------
             # PRE‑CHEQUEOS ANTES DE MARCAR call_ended

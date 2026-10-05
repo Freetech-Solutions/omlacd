@@ -28,6 +28,7 @@ from .ari_events import (
     ChannelLeftBridgeEvent,
     StasisEndEvent,
     RecordingFinishedEvent,
+    PlaybackFinishedEvent,
     ChannelTransferEvent,
 )
 
@@ -49,6 +50,7 @@ _EVENT_TYPE_MAP: Dict[str, type] = {
     "ChannelLeftBridge": ChannelLeftBridgeEvent,
     "StasisEnd": StasisEndEvent,
     "RecordingFinished": RecordingFinishedEvent,
+    "PlaybackFinished": PlaybackFinishedEvent,
     "ChannelTransfer": ChannelTransferEvent,
 }
 
@@ -143,6 +145,7 @@ __all__ = [
     "ChannelLeftBridgeEvent",
     "StasisEndEvent",
     "RecordingFinishedEvent",
+    "PlaybackFinishedEvent",
     "ChannelTransferEvent",
     # Función factory
     "parse_ari_event",

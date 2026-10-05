@@ -275,6 +275,29 @@ class ARI:
         result = self.post(f'channels/{channel_id}/play', params={'media': f'sound:{sound}'})
         return self._unwrap_data(result)
 
+    def play_media(
+        self,
+        channel_id: str,
+        media: str,
+        playback_id: Optional[str] = None,
+    ):
+        """
+        Reproduce media ARI en un canal (tone:, sound:, etc.) sin forzar prefijo.
+
+        Args:
+            channel_id: ID del canal.
+            media: URI de media ARI (ej: 'tone:ringback', 'sound:hello').
+            playback_id: ID opcional del playback (para stop/replay determinístico).
+
+        Returns:
+            Dict del recurso Playback si ok, o None.
+        """
+        params = {'media': media}
+        if playback_id:
+            params['playbackId'] = playback_id
+        result = self.post(f'channels/{channel_id}/play', params=params)
+        return self._unwrap_data(result)
+
     def stop_playback(self, playback_id):
         route = f'playbacks/{playback_id}'
         return self.delete(route).get('ok', False)
