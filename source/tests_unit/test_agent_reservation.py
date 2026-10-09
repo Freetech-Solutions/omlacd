@@ -15,6 +15,13 @@ from unittest.mock import MagicMock, patch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "ari-app"))
 sys.modules.setdefault("gearman", MagicMock())
 
+# Otros tests pueden dejar redis como MagicMock; necesitamos el paquete real.
+if isinstance(sys.modules.get("redis"), MagicMock):
+    del sys.modules["redis"]
+    for key in list(sys.modules):
+        if key.startswith("redis."):
+            del sys.modules[key]
+
 from constants import AgentStatus, RedisKeys  # noqa: E402
 from services.agent_status_service import AgentStatusService  # noqa: E402
 from services.distribution_service import DistributionService  # noqa: E402
@@ -135,7 +142,10 @@ def test_try_transition_status_lua_failure(mock_redis, agent_status_service):
 def test_distribution_loop_skips_dial_when_cas_fails(mock_redis, agent_status_service):
     """Si CAS falla, no debe originarse llamada al agente."""
     mock_redis.smembers.return_value = [b"1"]
+    mock_redis.zrange.return_value = []
+    # Con ACD_QUEUE_WEIGHT_ENABLED el loop reserva vía try_claim_and_reserve_for_distribution.
     agent_status_service.try_reserve_for_distribution = MagicMock(return_value=False)
+    agent_status_service.try_claim_and_reserve_for_distribution = MagicMock(return_value=False)
 
     svc = _build_distribution_service(mock_redis, agent_status_service)
     ctx = MagicMock()
@@ -162,6 +172,8 @@ def test_distribution_loop_skips_dial_when_cas_fails(mock_redis, agent_status_se
     with patch("services.distribution_service.settings") as mock_settings:
         mock_settings.AGENTS_CACHE_TTL_SEC = 5
         mock_settings.DISTRIBUTION_LOOP_IDLE_INTERVAL_SEC = 3.0
+        mock_settings.ACD_QUEUE_WEIGHT_ENABLED = True
+        mock_settings.ACD_WAITING_ALIVE_TTL_SEC = 90
         svc._run_distribution_loop(
             call_id="call-1",
             id_camp="123",

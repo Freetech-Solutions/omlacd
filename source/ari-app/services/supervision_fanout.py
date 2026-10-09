@@ -150,6 +150,14 @@ def publish_agent_to_streams(
             if not redis_client.exists(stream):
                 continue
             try:
+                logger.info(
+                    "publica estado agente=%s stream=%s status=%s timestamp=%s callid=%s",
+                    agent_id,
+                    stream,
+                    agent_hash.get("STATUS"),
+                    agent_hash.get("TIMESTAMP"),
+                    agent_hash.get("CALLID"),
+                )
                 _xadd(redis_client, stream, payload, stream_buffer)
             except Exception:
                 logger.exception(

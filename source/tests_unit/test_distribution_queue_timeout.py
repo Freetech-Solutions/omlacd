@@ -42,6 +42,7 @@ if "requests" not in sys.modules:
     _req_exc.RequestException = _RequestException
     _req_adapters.HTTPAdapter = _HTTPAdapter
     _req.exceptions = _req_exc
+    _req.Response = type("Response", (), {})
     sys.modules["requests"] = _req
     sys.modules["requests.exceptions"] = _req_exc
     sys.modules["requests.adapters"] = _req_adapters

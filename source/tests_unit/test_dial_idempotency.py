@@ -25,7 +25,9 @@ class _MockHTTPError(Exception):
     pass
 
 mock_exceptions.HTTPError = _MockHTTPError
+mock_exceptions.RequestException = Exception
 mock_requests.exceptions = mock_exceptions
+mock_requests.Response = type("Response", (), {})
 
 mock_adapters = types.ModuleType("requests.adapters")
 class _MockHTTPAdapter:
@@ -204,7 +206,7 @@ class TestDialingServiceManualDialIdempotency(unittest.TestCase):
         self.mock_redis = MagicMock()
         self.mock_route_validator = MagicMock()
 
-        self.mock_route_validator.validate_route.return_value = True
+        self.mock_route_validator.validate_route.return_value = (True, "", None)
         self.mock_route_validator.get_sip_trunk.return_value = "SIP_TRUNK"
         self.mock_agent_status_service.get_sip.return_value = "SIP/1001"
         self.mock_call_service.dial_agent_with_headers.return_value = "channel-1"

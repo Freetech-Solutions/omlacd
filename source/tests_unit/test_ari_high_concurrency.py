@@ -18,9 +18,12 @@ from unittest.mock import MagicMock, patch, Mock
 import sys
 import os
 
-# Mock dependencies
-sys.modules['redis'] = MagicMock()
-sys.modules['requests'] = MagicMock()
+# Mock dependencies only when missing — never replace a real redis package
+# (breaks later tests: redis.exceptions / redis.Redis).
+try:
+    import redis  # noqa: F401
+except ImportError:
+    sys.modules['redis'] = MagicMock()
 sys.modules['config'] = MagicMock()
 sys.modules['config'].settings = MagicMock()
 sys.modules['config'].settings.NODE_ID = "test-node"
@@ -29,6 +32,8 @@ sys.modules['config'].settings.ARI_APP = "acd"
 sys.modules['config'].settings.RECORDING_ENABLED = "true"
 sys.modules['config'].settings.RECORDING_FORMAT = "wav"
 sys.modules['config'].settings.RECORDING_MAX_DURATION = 3600
+sys.modules['config'].settings.REDIS_LOCK_TIMEOUT = 30
+sys.modules['config'].settings.REDIS_LOCK_BLOCKING_TIMEOUT = 15
 
 # Adjust path to import source modules
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -54,15 +59,22 @@ class ThreadSafeMockRedis:
         
     def _try_acquire_lock(self, key):
         with self.lock_condition:
-            if key not in self.locks:
-                self.locks[key] = threading.current_thread().ident
+            me = threading.current_thread().ident
+            holder, count = self.locks.get(key, (None, 0))
+            if holder is None or holder == me:
+                self.locks[key] = (me, count + 1)
                 return True
             return False
     
     def _release_lock(self, key):
         with self.lock_condition:
-            if key in self.locks and self.locks[key] == threading.current_thread().ident:
-                del self.locks[key]
+            me = threading.current_thread().ident
+            holder, count = self.locks.get(key, (None, 0))
+            if holder == me:
+                if count <= 1:
+                    del self.locks[key]
+                else:
+                    self.locks[key] = (me, count - 1)
                 self.lock_condition.notify_all()
     
     def get(self, key):
@@ -92,6 +104,25 @@ class ThreadSafeMockRedis:
                     del self.data[key]
                     count += 1
             return count
+
+    def exists(self, key):
+        with self.data_lock:
+            return 1 if key in self.data else 0
+
+    def setnx(self, key, value):
+        with self.data_lock:
+            if key in self.data:
+                return 0
+            if isinstance(value, str):
+                self.data[key] = value.encode("utf-8")
+            elif isinstance(value, bytes):
+                self.data[key] = value
+            else:
+                self.data[key] = str(value).encode("utf-8")
+            return 1
+
+    def expire(self, key, ttl):
+        return True
     
     def pipeline(self):
         return MockPipeline(self)
@@ -166,6 +197,12 @@ class MockPipeline:
     def multi(self):
         return self
     
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        return False
+
     def execute(self):
         results = []
         with self.redis_mock.data_lock:
@@ -510,9 +547,9 @@ class TestConcurrentTransfers(unittest.TestCase):
         for t in threads:
             t.join(timeout=10)
         
-        # Verificaciones
-        self.assertEqual(transfers_started[0], 5, 
-                        "No se intentaron todas las transferencias")
+        # Verificaciones: el lock deja pasar una sola adquisición del flag.
+        self.assertEqual(transfers_started[0], 1,
+                        "Solo una transferencia debe adquirir transfer_in_progress")
         # Solo una transferencia debe completarse (las demás deben ver transfer_in_progress=True)
         self.assertEqual(transfers_completed[0], 1,
                         f"Se completaron {transfers_completed[0]} transferencias en lugar de 1")
@@ -629,8 +666,14 @@ class TestConcurrentRecordings(unittest.TestCase):
         self.state_store.register(call_id, context)
         
         # Configurar mock de ARI para start_recording
-        self.mock_ari.start_recording.return_value = {"name": "recording-123"}
-        self.mock_ari.get_channels_in_bridge.return_value = [channel_id, "channel-other"]
+        self.mock_ari.start_recording_op.return_value = {
+            "ok": True,
+            "data": {"name": "recording-123"},
+        }
+        self.mock_ari.get_channels_in_bridge_op.return_value = {
+            "ok": True,
+            "data": [channel_id, "channel-other"],
+        }
         
         # Contador de grabaciones iniciadas
         recordings_started = [0]

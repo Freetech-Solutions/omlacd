@@ -2,6 +2,8 @@
 
 Analisis realizado sobre el codigo actual de `components-git-repo/acd/source/ari-app` y tests asociados en `components-git-repo/acd/source/tests_unit`.
 
+Actualizado con `oml-3466` (streams `OML:STREAM:CALLEVENTS`, auditoria de canales por nodo y cierre inbound de ciega a campania). Ver seccion K.
+
 ## A. Resumen ejecutivo de la aplicacion
 
 La aplicacion ACD es un runtime ARI orientado a eventos que mantiene el estado de cada llamada en Redis mediante `state.CallRegistry`, expone operaciones de marcado y manipulacion via Gearman y Redis Pub/Sub, y usa `router.AcDRouter` como punto de convergencia de los eventos ARI.
@@ -12,7 +14,7 @@ La arquitectura tiene cuatro planos claramente diferenciados:
    - WebSocket ARI en `main.py` y `router.py`.
    - Tareas de inicio de llamada por Gearman en `infrastructure/gearman_listener.py`.
    - Comandos operativos por Redis Pub/Sub en `infrastructure/command_listener.py`.
-   - SIP REFER para voicebot en `sip_refer_listener.py`.
+   - SIP REFER handoff para voicebot en `sip_refer_listener.py`.
 2. Plano de orquestacion:
    - `handlers/manual.py`, `handlers/inbound.py` y `handlers/campaign.py`.
    - `transfer.py` para transferencias y handoff especiales.
@@ -22,8 +24,10 @@ La arquitectura tiene cuatro planos claramente diferenciados:
    - Helpers de coherencia en `state_helpers.py`.
 4. Plano de salida:
    - `reporter.ACDReporter` para eventos hacia `acd-log-processor`.
-   - `queue_events.QueueEventManager` para tamanio de cola y `OML:CHANNEL:CALLEVENTS`.
-   - `services/agent_status_service.py` para `OML:AGENT:{id}`.
+   - `queue_events.QueueEventManager` para tamanio de cola y `XADD` a `OML:STREAM:CALLEVENTS` (Redis DB 2).
+   - `workers/logger.py` para contadores `OML:CALLDATA:*` (DB 2) y los mismos eventos de supervision (`WAIT`, `EXIT_ABANDON`, `CAMP`).
+   - `services/agent_status_service.py` para `OML:AGENT:{id}`, mas el fan-out ya existente a `supervisor_{id}_*` (DB 0).
+   - `channel_audit_publisher.py` para la foto de canales dialer de este Asterisk en Redis DB 3.
 
 La fuente de verdad logica es Redis, no ARI. ARI representa el estado fisico de canales, bridges, MOH y grabaciones. La aplicacion pasa continuamente por ventanas donde ambos planos divergen a proposito, sobre todo durante transferencias.
 
@@ -114,8 +118,8 @@ La fuente de verdad logica es Redis, no ARI. ARI representa el estado fisico de 
 
 `queue_events.py`
 
-- Mantiene `OML:CALLDATA:QUEUE-SIZE:{camp}` y `OML:CALLDATA:QUEUE:{camp}`.
-- Publica eventos al canal Redis `OML:CHANNEL:CALLEVENTS`.
+- Mantiene `OML:CALLDATA:QUEUE-SIZE:{camp}` y `OML:CALLDATA:QUEUE:{camp}` en el Redis del ari-app (DB 0). Esas claves siguen siendo el estado; el script Lua es la fuente de verdad multi-nodo.
+- Avisa el delta con `XADD` a `OML:STREAM:CALLEVENTS` en Redis DB 2 (`event_stream.py`). El campo del stream es `value` (JSON). Ya no usa `PUBLISH` sobre `OML:CHANNEL:CALLEVENTS`.
 - Conserva cache en memoria y sincroniza contra Redis cuando detecta inconsistencia.
 
 ### B.3 Flujo de eventos global
@@ -344,7 +348,9 @@ Cuando el PSTN sale de Stasis, `InboundCallHandler.on_pstn_stasis_end()`:
 3. Cuelga cualquier leg de agente remanente.
 4. Detiene distribucion.
 5. Ejecuta `mark_call_ended_atomic()`.
-6. Decide `EXIT_ANSWERED`, `EXIT_TIMEOUT` o `EXIT_ABANDON`.
+6. Decide el evento final en `_report_inbound_pstn_end()`:
+   - `EXIT_ANSWERED` si hay pierna de agente activa, si `blind_transfer_attempted` (ciega a agente o endpoint en curso) o si ya hubo agente y `is_transferred` es falso.
+   - `EXIT_TIMEOUT` o `EXIT_ABANDON` si `is_transferred` y no queda pierna de agente: el cliente sigue en la cola destino de `blind_to_campaign`. Timeout si la app colgo el PSTN o si `bridge_wait_time` llego al `queue_timeout`; si no, abandono.
 7. Reporta a `reporter`.
 8. Notifica `QueueEventManager`.
 9. Hace `CallRegistry.unregister()`.
@@ -1043,15 +1049,13 @@ Ejemplos:
 
 ## H. Riesgos, bugs potenciales e inconsistencias
 
-### H.1 Riesgo alto: reserva de agente de 15s fija contra `ring_timeout` variable
+### H.1 ~~Riesgo alto: reserva de agente de 15s fija contra `ring_timeout` variable~~ (corregido)
 
-En `DistributionService` y `VoicebotDistributionLoop` la reserva temporal usa `SET NX EX 15` sobre `acd:lock:agent:{id}`. `ring_timeout` es configurable y puede ser mayor. Si el ring sigue mas de 15 segundos y el agente sigue `READY`, otra instancia puede volver a originarlo.
+La reserva ya no es un `SET NX EX 15` con el agente en `READY`.
 
-Impacto:
-
-- doble ring concurrente,
-- multi-originate cross-node,
-- metricas de distribucion distorsionadas.
+- El TTL del lock es `ring_timeout + AGENT_RESERVATION_MARGIN_SEC` (`DistributionService._agent_lock_ttl()`; margen default 10s en `config.py`).
+- En humanos, `AgentStatusService.try_reserve_for_distribution()` (y `try_claim_and_reserve_for_distribution()` si hay weight routing) hace en un solo Lua `READY → DIALING`, lock y lease. Otra instancia no lo vuelve a ofrecer mientras siga en `DIALING`.
+- Voicebot (`cas_ready=False`) no cambia `STATUS`; toma solo el lock NX con el mismo TTL. No exige `READY`.
 
 ### H.2 Riesgo alto: `blind_to_endpoint()` no compensa fallos sin leg destino
 
@@ -1064,13 +1068,9 @@ Si el agente A ya fue colgado y el originate falla de forma sincronica:
 
 La recuperacion `recover_after_blind_transfer_leg_failed()` solo aplica cuando llego a existir una pierna y luego se destruyo.
 
-### H.3 Riesgo alto: `consult_complete()` no actualiza explicitamente el estado ONCALL del agente B
+### H.3 ~~Riesgo alto: `consult_complete()` no actualiza explicitamente el estado ONCALL del agente B~~ (corregido)
 
-`ChannelStateChange Up` del consult leg se consume en el bloque especial del router y retorna antes de llamar a `AgentStatusService.set_oncall()`. Luego `consult_complete()` mueve a B al main bridge pero no llama a `set_oncall()`.
-
-Resultado posible:
-
-- B queda atendiendo la llamada pero Redis puede seguir mostrandolo `READY`.
+`ChannelStateChange Up` del consult leg sigue consumiendose en el bloque especial del router, sin `set_oncall()` ahi. `consult_complete()` si lo hace: despues de persistir `uniqueid_agent` y `agent_connected_channel` llama a `_update_agent_to_oncall()` para el agente B, fuera del lock.
 
 ### H.4 ~~Riesgo alto: `consult_complete()` no actualiza `uniqueid_agent`~~ (corregido)
 
@@ -1144,9 +1144,9 @@ Pero siguen existiendo ventanas donde un leg tardio:
 
 `on_transfer_leg_start()` ya contiene guardas especificas contra esto, lo que indica que el problema fue real.
 
-### H.11 Riesgo medio: `QueueEventManager` mantiene cache propia ademas de Redis
+### H.11 ~~Riesgo medio: `QueueEventManager` mantiene cache propia ademas de Redis~~ (corregido)
 
-El modulo ya implementa `_validate_state_consistency()` y `_sync_from_redis()`, lo que muestra que puede divergir del estado Redis bajo errores o carreras.
+No hay cache en memoria ni `_validate_state_consistency()` / `_sync_from_redis()`. El tamanio de cola lo escribe un script Lua sobre `OML:CALLDATA:QUEUE:{camp}` y `OML:CALLDATA:QUEUE-SIZE:{camp}` (Redis DB 0). El `XADD` a `OML:STREAM:CALLEVENTS` es solo el aviso: si falla, la cola ya quedo escrita y no se deshace.
 
 ### H.12 Riesgo medio-bajo: doble cleanup por `on_transfer_target_hangup()` y handlers de hangup
 
@@ -1159,11 +1159,11 @@ El resultado esperable es idempotente, pero ARI puede recibir doble `hangup_chan
 
 ## I. Recomendaciones de mejora
 
-1. Convertir la reserva de agente en un lease renovable con TTL >= `ring_timeout + margen`, o mover el agente a `RINGING` en Redis antes del originate.
-2. ~~Separar explicitamente identidad del agente actual y del agente iniciador~~ (parcialmente implementado para consultiva):
+1. ~~Convertir la reserva de agente en un lease con TTL >= `ring_timeout + margen`, y sacar al agente de `READY` antes del originate~~ (implementado, ver H.1). El estado intermedio es `DIALING`, no `RINGING`.
+2. ~~Separar explicitamente identidad del agente actual y del agente iniciador~~ (implementado para consultiva):
    - `agent_connected_channel` / `uniqueid_agent` = agente activo
    - `initiator_agent_channel` = agente iniciador tras `consult_complete`
-3. ~~Hacer que `consult_complete()` actualice `uniqueid_agent`~~ (implementado). Pendiente verificar `ONCALL` del agente B en todos los escenarios (H.3).
+3. ~~Hacer que `consult_complete()` actualice `uniqueid_agent` y pase al agente B a ONCALL~~ (implementado, ver H.3 y H.4).
 4. Arreglar `three_way_add()` o removerlo hasta que exista una rama `three_way_leg:true` en el router.
 5. En `blind_to_endpoint()`, agregar rollback fisico minimo si el originate falla sin crear leg:
    - detener MOH,
@@ -1183,9 +1183,8 @@ El resultado esperable es idempotente, pero ARI puede recibir doble `hangup_chan
    - `blind_transfer_report_state`
 10. Agregar tests de integracion multihilo para:
    - blind fail antes de crear leg
-   - consult_complete con verificacion de `ONCALL`
    - `blind_to_campaign` con redistribucion fallida
-   - expiracion del lock de agente durante ring prolongado
+   - voicebot: el lock NX cubre el ring pero no cambia `STATUS`
 
 ## J. Apendice con secuencias detalladas paso a paso
 
@@ -1305,6 +1304,8 @@ blind_to_campaign(call_id, camp_dest)
      -> start_distribution(camp_dest)
 ```
 
+Si el PSTN cuelga mientras espera en `camp_dest` (sin pierna de agente), `_report_inbound_pstn_end()` no emite `EXIT_ANSWERED`: el cierre es `EXIT_TIMEOUT` o `EXIT_ABANDON`. `is_transferred` solo no alcanza para marcarla atendida.
+
 ### J.5 Transferencia consultiva completa
 
 ```text
@@ -1394,7 +1395,7 @@ Consecuencia:
 
 - la campania de BI sigue siendo 10,
 - la campania operativa viva pasa a ser 20 y luego 30,
-- `call_has_prior_agent_handling()` sigue dando `True` aunque ya no haya agente conectado.
+- `call_has_prior_agent_handling()` sigue dando `True` aunque ya no haya agente conectado. Desde `oml-3466` eso no fuerza `EXIT_ANSWERED` si `is_transferred` es verdadero y no queda pierna de agente: el cierre en la cola destino es `EXIT_TIMEOUT` o `EXIT_ABANDON` (ver K.3).
 
 ### J.8 Hangup del cliente durante una transferencia en curso
 
@@ -1444,6 +1445,69 @@ B cuelga
      -> destruye bridge
 ```
 
+## K. oml-3466 — supervision HA y auditoria por nodo
+
+`oml-3466` no cambia el estado de la llamada (`CallRegistry`) ni el fan-out de agentes. Cambia como el ACD avisa la supervision de campania y como publica la foto de canales dialer cuando hay mas de un Asterisk.
+
+Tres planos siguen separados. No son tres copias del mismo registro:
+
+| Plano | Redis | Quien escribe en el ACD | Para que |
+|---|---|---|---|
+| Telefonia de campania | DB 2 `OML:CALLDATA:*` + stream `OML:STREAM:CALLEVENTS` | `workers/logger.py` y `queue_events.py` | Cola, espera, abandono, `DIAL` / `CONNECT` / `EXIT_*` |
+| Agente en vivo | DB 0 `OML:AGENT:{id}` + `supervisor_{id}_agentes\|entrantes\|dialers` | `agent_status_service` + `supervision_fanout.py` | Tarjeta del agente. El browser hace `XREAD` directo. 3466 no cambia este contrato |
+| Cupo dialer de este nodo | DB 3 `OML:ACD:{nodo}:*` | `channel_audit_publisher.py` | Canales PSTN dialer vistos por el Asterisk local |
+
+El discador sigue siendo dueno de `OML:CALLS:{camp}:DIALER` y de `CAMP:{camp}:COUNTER` en DB 3. El ACD no los escribe. El stream `OML:STREAM:DIALER` lo publica el dialer, no este repo.
+
+### K.1 De pub/sub a stream `OML:STREAM:CALLEVENTS`
+
+Antes, cola y logger hacian `PUBLISH` a `OML:CHANNEL:CALLEVENTS`. Cada subscriber recibia una copia y, si nadie estaba escuchando, el mensaje se perdia. Con dos `supervision_events_listener` la UI sumaba dos veces.
+
+Ahora el aviso es `XADD` al stream `OML:STREAM:CALLEVENTS` en Redis DB 2:
+
+- Campo `value`: JSON del evento.
+- Tope aproximado `OML_EVENT_STREAM_MAXLEN` (default 10000), `MAXLEN ~`.
+- Helper ari-app: `source/ari-app/event_stream.py` (`get_stream_redis()` abre DB 2 aunque el cliente de cola sea DB 0).
+- Helper logger: `source/workers/event_stream.py` sobre el Redis de calldata, que ya es DB 2.
+
+El estado durable no se mueve de las claves. El stream es solo la notificacion, recortada. Django lee el grupo `supervision-events` (`XREADGROUP` / `XACK` / `XAUTOCLAIM`); ese consumer no vive en el ACD.
+
+Productores y payloads:
+
+- `QueueEventManager._publish_event()`: `{"type": "QUEUE", ...}` al entrar o salir de cola. El `HSET` / `HLEN` de `OML:CALLDATA:QUEUE:{camp}` ya quedo escrito; si el `XADD` falla, la cola no se deshace.
+- `workers/logger.py`:
+  - `WAIT` y lista `OML:CALLDATA:WAIT-TIME:CAMP:{id}` en inbound atendido.
+  - `EXIT_ABANDON` y lista `OML:CALLDATA:EXIT_ABANDON-TIME:CAMP:{id}`.
+  - `CAMP` para `DIAL`, `CONNECT`, `EXIT_ANSWERED_HUMAN` / `EXIT_ANSWERED_BOT`, `EXIT_TIMEOUT` y no contacto saliente.
+
+Cada uno de esos JSON del logger agrega `uniqueid` y `callid` cuando el mensaje de cierre los trae. Sin eso, dos `WAIT` o dos `CAMP` de la misma campania eran el mismo documento y un consumer group no podia distinguir llamadas.
+
+### K.2 Auditoria de canales por nodo
+
+`source/ari-app/channel_audit_publisher.py` es un proceso aparte (loop con `sleep`, no Gearman ni APScheduler). Cada pod ACD mira sus canales por ARI (`DialerChannelAuditService`) y publica solo la foto de este Asterisk en el Redis dialer (DB 3, `settings.get_redis_dialer_url()`).
+
+Identidad: `ACD_AUDIT_NODE_ID`, o el hostname si no esta. Intervalo `ACD_CHANNEL_AUDIT_INTERVAL_SEC` (default 15s). Heartbeat `ACD_CHANNEL_AUDIT_HB_TTL_SEC` (default 45s).
+
+Claves:
+
+- `OML:ACD:NODES` — set de nodos que publicaron.
+- `OML:ACD:{nodo}:CHANNELS` — hash campania → cantidad de canales PSTN dialer.
+- `OML:ACD:{nodo}:RINGING` — hash campania → cuantos de esos siguen en ringing.
+- `OML:ACD:NODE:{nodo}:HB` — timestamp con TTL.
+
+La escritura es transaccional: hash temporal + `RENAME`, asi no queda un campo de una campania que ya no tiene canales. Si ARI no responde, el tick no toca Redis (no borra la foto anterior con un error transitorio). Lista vacia con ARI ok limpia los hashes y renueva el heartbeat.
+
+No escribe `OML:CALLS:{camp}:DIALER`. El dialer suma las fotos de los nodos con heartbeat vivo; este proceso solo describe el Asterisk local.
+
+### K.3 Cierre inbound tras ciega a campania
+
+`_report_inbound_pstn_end()` deja de tratar todo `is_transferred` como `EXIT_ANSWERED`.
+
+- Hay pierna de agente, o `blind_transfer_attempted` (ciega a agente/endpoint todavia en curso), o ya hubo agente y no es una transferencia a otra cola: `EXIT_ANSWERED`.
+- `is_transferred` sin pierna de agente: el cliente esta en la cola destino. El cierre es `EXIT_TIMEOUT` (hangup iniciado por la app, o espera >= `queue_timeout - 1s`) o `EXIT_ABANDON`.
+
+Ese evento entra al logger y, desde ahi, al stream `CALLEVENTS` como cualquier otro cierre inbound.
+
 ## Conclusiones practicas
 
 La aplicacion tiene un modelo de estado bastante rico y deliberadamente desacoplado de ARI. La mayor sofisticacion real esta en:
@@ -1455,3 +1519,5 @@ La aplicacion tiene un modelo de estado bastante rico y deliberadamente desacopl
 - y `agent_segments` para no perder historia tras re-encolados o transfers.
 
 El area con mas deuda tecnica no es la distribucion normal sino la frontera entre estado logico Redis y operaciones ARI durante transferencias. Ahi hay varias decisiones correctas de diseno, pero todavia quedan huecos donde el runtime puede divergir del reporte o dejar estado parcialmente inconsistente.
+
+Desde `oml-3466`, la supervision de campania no depende de un pub/sub efimero: el estado sigue en `OML:CALLDATA:*` y el aviso viaja por `OML:STREAM:CALLEVENTS`. La foto de canales dialer es por nodo (`OML:ACD:{nodo}:*`), distinta del cupo `OML:CALLS` que administra el dialer.

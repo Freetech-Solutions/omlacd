@@ -178,55 +178,68 @@ def test_distribution_loop_is_sequential_and_respects_ring_timeout(
     call_service,
 ):
     """
-    Verifica que:
-    - _distribution_loop usa ring_timeout tanto en dial_agent_with_headers como
-      en current_attempt_event.wait().
-    - Los agentes se intentan de forma secuencial (no ringall).
+    El loop vive en DistributionService: un agente a la vez, con el RINGTIME
+    tanto en dial_agent_with_headers como en la espera del intento.
     """
+    from services.distribution_service import DistributionService
 
     ring_timeout = 12
-    handler = _build_handler(
-        mock_ari_client=mock_ari_client,
-        mock_redis=mock_redis,
+    mock_redis.smembers.return_value = [b"1", b"2"]
+    mock_redis.zrange.return_value = []
+    mock_redis.hgetall.return_value = {}
+
+    ctx = MagicMock()
+    ctx.call_ended = False
+    ctx.agent_connected_channel = None
+    ctx.distribution_offering = False
+    state_store.get.return_value = ctx
+
+    agent_status = MagicMock()
+    agent_status.try_claim_and_reserve_for_distribution.return_value = True
+    agent_status.try_reserve_for_distribution.return_value = True
+
+    svc = DistributionService(
+        ari_client=mock_ari_client,
         state_store=state_store,
-        queue_strategy_engine=queue_strategy_engine,
         call_service=call_service,
+        queue_strategy_engine=queue_strategy_engine,
+        redis_client=mock_redis,
+        reporter=None,
+        agent_status_service=agent_status,
     )
 
-    inbound_data = {
-        "id_camp": "123",
-        "id_customer": "456",
-        "tel_customer": "555000111",
-        "callid": "call-1",
-    }
+    stop_event, attempt_finished = svc._get_or_create_call_events("call-1")
+    attempt_finished.wait = MagicMock(return_value=False)
+    stop_event.wait = MagicMock(return_value=True)
 
-    # Evitamos sleeps reales: simulamos que current_attempt_event.wait()
-    # expira por timeout para ambos agentes.
-    with patch.object(handler.current_attempt_event, "wait", side_effect=[False, False]) as wait_mock:
-        handler._distribution_loop(
+    with patch("services.distribution_service.settings") as mock_settings:
+        mock_settings.AGENTS_CACHE_TTL_SEC = 5
+        mock_settings.DISTRIBUTION_LOOP_IDLE_INTERVAL_SEC = 3.0
+        mock_settings.ACD_QUEUE_WEIGHT_ENABLED = True
+        mock_settings.ACD_WAITING_ALIVE_TTL_SEC = 90
+        mock_settings.WEBRTC_TRUNK = "webrtc-trunk"
+        mock_settings.NODE_ID = "test-node"
+        svc._run_distribution_loop(
             call_id="call-1",
             id_camp="123",
             bridge_id="bridge-1",
-            inbound_data=inbound_data,
+            distribution_metadata={
+                "id_customer": "456",
+                "id_camp": "123",
+                "tel_customer": "555000111",
+                "callid": "call-1",
+            },
             strategy="fewestcalls",
             ring_timeout=ring_timeout,
         )
 
-    # 1) Se debe haber llamado dial_agent_with_headers una vez por candidato,
-    #    nunca en paralelo (la propia implementación es secuencial).
     assert call_service.dial_agent_with_headers.call_count == 2
 
     first_call = call_service.dial_agent_with_headers.call_args_list[0]
     second_call = call_service.dial_agent_with_headers.call_args_list[1]
-
-    # Ambos intentos deben respetar el mismo ring_timeout configurado.
     assert first_call.kwargs.get("timeout") == ring_timeout
     assert second_call.kwargs.get("timeout") == ring_timeout
-
-    # 2) current_attempt_event.wait() debe ser llamado con ring_timeout como timeout,
-    #    lo que garantiza que esperamos la ventana de RINGTIME antes de pasar al
-    #    siguiente agente (comportamiento secuencial).
-    wait_mock.assert_has_calls(
+    attempt_finished.wait.assert_has_calls(
         [
             call(timeout=ring_timeout),
             call(timeout=ring_timeout),
@@ -243,12 +256,8 @@ def test_on_pstn_stasis_end_detiene_loop_y_cancela_timer(
     call_service,
 ):
     """
-    Verifica que on_pstn_stasis_end:
-    - Identifica correctamente el leg PSTN usando get_by_channel.
-    - Setea stop_event y attempt_finished para detener el _distribution_loop.
-    - Cancela el timer de cola asociado a la llamada.
-    - Marca la llamada como finalizada vía mark_call_ended_atomic.
-    - Cuelga el leg de agente actual y limpia current_agent_channel.
+    on_pstn_stasis_end identifica el leg PSTN y delega el cierre en
+    finalize_inbound_pstn_end. Un canal que no es PSTN no dispara el cierre.
     """
 
     handler = _build_handler(
@@ -270,31 +279,14 @@ def test_on_pstn_stasis_end_detiene_loop_y_cancela_timer(
 
     context = InboundContext()
     state_store.get_by_channel.return_value = context
-    state_store.mark_call_ended_atomic.return_value = True
 
-    # Registrar timer de cola para ese call_id
-    fake_timer = MagicMock()
-    handler._queue_timers[call_id] = fake_timer
+    with patch.object(handler, "finalize_inbound_pstn_end") as finalize:
+        handler.on_pstn_stasis_end(pstn_channel_id)
+        finalize.assert_called_once_with(context, pstn_channel_id, source="stasis_end")
 
-    # Simular intento de agente en curso
-    handler.current_agent_channel = "agent-chan-123"
-
-    handler.on_pstn_stasis_end(pstn_channel_id)
-
-    # El loop de distribución debe ser detenido y el intento actual desbloqueado
-    assert handler.stop_event.is_set()
-    assert handler.attempt_finished.is_set()
-
-    # El timer de cola debe ser cancelado y removido del mapa
-    fake_timer.cancel.assert_called_once()
-    assert call_id not in handler._queue_timers
-
-    # La llamada debe ser marcada como finalizada de forma atómica
-    state_store.mark_call_ended_atomic.assert_called_once_with(call_id)
-
-    # El leg de agente actual debe colgarse y limpiarse de current_agent_channel
-    mock_ari_client.hangup_channel.assert_called_once_with("agent-chan-123")
-    assert handler.current_agent_channel is None
+        finalize.reset_mock()
+        handler.on_pstn_stasis_end("agent-chan-123")
+        finalize.assert_not_called()
 
 
 def test_on_hangup_request_does_not_hang_pstn_when_only_attempt_leg_hangs_up(mock_ari_client, mock_redis):
