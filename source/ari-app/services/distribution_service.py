@@ -1248,7 +1248,13 @@ class DistributionService:
                     context = self.state_store.get(call_id)
                     if context:
                         context.distribution_answer_accepted = True
-                        if getattr(context, "agent_id", None) is None:
+                        # Vacío: primer answer (cola normal). is_voicebot_transfer: el
+                        # contexto puede seguir con el id del bot si el REFER no lo limpió;
+                        # hay que reemplazarlo por quien contestó. En el resto no se pisa.
+                        if (
+                            getattr(context, "agent_id", None) is None
+                            or getattr(context, "is_voicebot_transfer", False)
+                        ):
                             context.agent_id = int(answered_agent_id)
                         self.state_store.register_unsafe(call_id, context)
             except Exception:
