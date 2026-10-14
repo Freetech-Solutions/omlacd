@@ -20,12 +20,18 @@ sys.modules.setdefault("urllib3.util", MagicMock())
 sys.modules.setdefault("urllib3.util.retry", MagicMock())
 import types
 
-_mock_redis_pkg = types.ModuleType("redis")
-_mock_redis_exceptions = types.ModuleType("redis.exceptions")
-_mock_redis_exceptions.RedisError = Exception
-_mock_redis_pkg.exceptions = _mock_redis_exceptions
-sys.modules["redis"] = _mock_redis_pkg
-sys.modules["redis.exceptions"] = _mock_redis_exceptions
+# Solo stubear redis si no está instalado. Un ModuleType vacío sin Redis
+# rompe la recolección de otros tests (AttributeError: redis.Redis).
+try:
+    import redis  # noqa: F401
+except ImportError:
+    _mock_redis_pkg = types.ModuleType("redis")
+    _mock_redis_exceptions = types.ModuleType("redis.exceptions")
+    _mock_redis_exceptions.RedisError = Exception
+    _mock_redis_pkg.exceptions = _mock_redis_exceptions
+    _mock_redis_pkg.Redis = MagicMock
+    sys.modules["redis"] = _mock_redis_pkg
+    sys.modules["redis.exceptions"] = _mock_redis_exceptions
 sys.modules.setdefault("ari_manager", MagicMock())
 sys.modules.setdefault("queue_events", MagicMock())
 sys.modules.setdefault("services.call_manager", MagicMock())
@@ -48,20 +54,34 @@ if not USE_REAL_PYDANTIC:
     _mock_pydantic.BaseModel = RealBaseModel
     sys.modules["pydantic"] = _mock_pydantic
 
-_mock_state = MagicMock()
-_mock_state.CallRegistry = MagicMock()
-_mock_state.CallContext = RealBaseModel
-sys.modules.setdefault("state", _mock_state)
-
+# No poner CallContext = BaseModel en sys.modules['state']: en Pydantic v2
+# BaseModel() no se puede instanciar y contamina toda la suite.
 current_dir = os.path.dirname(os.path.abspath(__file__))
 source_dir = os.path.dirname(current_dir)
 ari_app_dir = os.path.join(source_dir, "ari-app")
 sys.path.insert(0, ari_app_dir)
 
-sys.modules.setdefault("config", MagicMock())
-sys.modules["config"].settings = MagicMock()
-sys.modules["config"].settings.NODE_ID = "test-node"
-sys.modules["config"].settings.AGENT_RESERVATION_MARGIN_SEC = 10
+if "config" not in sys.modules or isinstance(sys.modules.get("config"), MagicMock):
+    # Solo stubear config si aún no hay módulo real cargado.
+    try:
+        import config as _config_check  # noqa: F401
+    except Exception:
+        sys.modules.setdefault("config", MagicMock())
+        sys.modules["config"].settings = MagicMock()
+        sys.modules["config"].settings.NODE_ID = "test-node"
+        sys.modules["config"].settings.AGENT_RESERVATION_MARGIN_SEC = 10
+else:
+    pass
+# Asegurar settings usados por estos tests
+try:
+    from config import settings as _settings
+    if not hasattr(_settings, "AGENT_RESERVATION_MARGIN_SEC"):
+        _settings.AGENT_RESERVATION_MARGIN_SEC = 10
+except Exception:
+    sys.modules.setdefault("config", MagicMock())
+    sys.modules["config"].settings = MagicMock()
+    sys.modules["config"].settings.NODE_ID = "test-node"
+    sys.modules["config"].settings.AGENT_RESERVATION_MARGIN_SEC = 10
 
 from constants import AgentStatus, RedisKeys  # noqa: E402
 from services.agent_status_service import (  # noqa: E402

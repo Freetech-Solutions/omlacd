@@ -5,8 +5,12 @@ from unittest.mock import MagicMock, patch
 import sys
 import os
 
-# Mock dependencies
-sys.modules['redis'] = MagicMock()
+# Mock dependencies only when missing — never replace a real redis package
+# (breaks later tests: redis.exceptions / redis.Redis).
+try:
+    import redis  # noqa: F401
+except ImportError:
+    sys.modules['redis'] = MagicMock()
 sys.modules['requests'] = MagicMock()
 sys.modules['config'] = MagicMock()
 sys.modules['config'].settings = MagicMock()

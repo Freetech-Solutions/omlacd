@@ -1,5 +1,8 @@
 version: '3.8'
 
+# Deps (incl. gearman3 vía git) se instalan en el build del Dockerfile;
+# git se purga después. No re-ejecutar pip install -r /requirements.txt aquí.
+
 services:
   acd-tests:
     build:
@@ -7,22 +10,25 @@ services:
       dockerfile: Dockerfile
     image: acd-test:latest
     container_name: acd-tests
+    working_dir: /opt/asterisk
     volumes:
       - ./source/tests_unit:/opt/asterisk/source/tests_unit:ro
       - ./source/ari-app:/opt/asterisk/ari-app:ro
+      - ./source/workers:/opt/asterisk/workers:ro
       - ./.flake8:/opt/asterisk/.flake8:ro
       - ./pytest.ini:/opt/asterisk/pytest.ini:ro
     environment:
       - PYTHONPATH=/opt/asterisk/ari-app
-    command: >
-      bash -c "
-        pip install -q -r /requirements.txt &&
-        echo '=== Ejecutando Linter ===' &&
-        flake8 ari-app/ --config=.flake8 --statistics --count &&
-        echo '' &&
-        echo '=== Ejecutando Tests ===' &&
+    command:
+      - bash
+      - -c
+      - |
+        echo '=== Ejecutando Linter ==='
+        flake8 ari-app/ --config=.flake8 --statistics --count
+        echo ''
+        echo '=== Ejecutando Tests ==='
         pytest source/tests_unit/ -v --cov=ari-app --cov-report=term-missing
-      "
+        (cd /opt/asterisk/workers && PYTHONPATH=/opt/asterisk/workers python -m unittest tests_event_stream -v)
     profiles:
       - test
 
@@ -32,16 +38,16 @@ services:
       dockerfile: Dockerfile
     image: acd-test:latest
     container_name: acd-linter
+    working_dir: /opt/asterisk
     volumes:
       - ./source/ari-app:/opt/asterisk/ari-app:ro
       - ./.flake8:/opt/asterisk/.flake8:ro
     environment:
       - PYTHONPATH=/opt/asterisk/ari-app
-    command: >
-      bash -c "
-        pip install -q -r /requirements.txt &&
-        flake8 ari-app/ --config=.flake8 --statistics --count
-      "
+    command:
+      - bash
+      - -c
+      - flake8 ari-app/ --config=.flake8 --statistics --count
     profiles:
       - lint
 
@@ -51,17 +57,19 @@ services:
       dockerfile: Dockerfile
     image: acd-test:latest
     container_name: acd-pytest
+    working_dir: /opt/asterisk
     volumes:
       - ./source/tests_unit:/opt/asterisk/source/tests_unit:ro
       - ./source/ari-app:/opt/asterisk/ari-app:ro
+      - ./source/workers:/opt/asterisk/workers:ro
       - ./pytest.ini:/opt/asterisk/pytest.ini:ro
     environment:
       - PYTHONPATH=/opt/asterisk/ari-app
-    command: >
-      bash -c "
-        pip install -q -r /requirements.txt &&
+    command:
+      - bash
+      - -c
+      - |
         pytest source/tests_unit/ -v --cov=ari-app --cov-report=term-missing --cov-report=html
-      "
+        (cd /opt/asterisk/workers && PYTHONPATH=/opt/asterisk/workers python -m unittest tests_event_stream -v)
     profiles:
       - pytest
-

@@ -3,8 +3,11 @@ from unittest.mock import MagicMock, patch
 import sys
 import os
 
-# Mock dependencies
-sys.modules['redis'] = MagicMock()
+# Mock dependencies only when missing — never replace a real redis package.
+try:
+    import redis  # noqa: F401
+except ImportError:
+    sys.modules['redis'] = MagicMock()
 sys.modules['gearman'] = MagicMock()
 
 # Robust matching for requests

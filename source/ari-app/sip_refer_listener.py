@@ -306,6 +306,10 @@ class VerloopReferHandler:
                 fresh.uniqueid_agent = None
                 fresh.agent_answered_ts = None  # para que al contestar el agente humano se setee el ts correcto
                 fresh.is_voicebot = False
+                # Mismo criterio que la transferencia ciega a campaña: sin pierna de
+                # agente, agent_id vacío. Si queda el id del bot, el answer humano
+                # confirma ONCALL contra ese hash (ya en READY) y el ACD manda BYE.
+                fresh.agent_id = None
                 fresh.voicebot_transfer_waiting = True
                 refer_ctx.state_store.register_unsafe(call_id, fresh)
 

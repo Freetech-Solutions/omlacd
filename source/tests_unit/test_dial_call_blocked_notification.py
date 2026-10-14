@@ -43,7 +43,7 @@ class TestDialToAgentCallBlockedNotification(unittest.TestCase):
 
         self.mock_redis.set.return_value = True  # idempotencia: primera vez no duplicado
         self.mock_agent_status_service.get_sip.return_value = "SIP/1001"
-        self.mock_route_validator.validate_route.return_value = False  # falla validación
+        self.mock_route_validator.validate_route.return_value = (False, None, None)
 
         self.dialing_service = DialingService(
             call_service=self.mock_call_service,
@@ -91,7 +91,7 @@ class TestDialToAgentCallBlockedNotification(unittest.TestCase):
         """
         Si validate_route retorna True, no se debe llamar a notify_call_blocked.
         """
-        self.mock_route_validator.validate_route.return_value = True
+        self.mock_route_validator.validate_route.return_value = (True, "", None)
         self.mock_route_validator.get_sip_trunk.return_value = "SIP_TRUNK"
         self.mock_call_service.dial_agent_with_headers.return_value = "channel-1"
 

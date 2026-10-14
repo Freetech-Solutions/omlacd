@@ -61,7 +61,8 @@ class TestVoicebotActiveCalls(unittest.TestCase):
         self.assertEqual(stored["call-1"]["agent_id"], str(self.agent_id))
         self.assertEqual(stored["call-1"]["campaign_id"], "20")
         self.assertEqual(stored["call-2"]["contact_number"], "222")
-        self.assertEqual(self.redis.hset.call_count, 4)  # 2 active + 2 agent status
+        # 2 active + 2 VOICEBOT=1 + 2 set_status(ONCALL)
+        self.assertEqual(self.redis.hset.call_count, 6)
 
     def test_unregister_one_of_two_keeps_oncall(self):
         remaining_payload = json.dumps({
@@ -78,8 +79,12 @@ class TestVoicebotActiveCalls(unittest.TestCase):
         result = self.service.unregister_voicebot_active_call(self.agent_id, "call-1")
 
         self.assertTrue(result)
-        self.redis.hdel.assert_called_with(self.active_key, "call-1")
-        self.redis.hgetall.assert_called_with(self.active_key)
+        self.redis.hdel.assert_any_call(self.active_key, "call-1")
+        # set_status(ONCALL) también limpia campos legacy del hash del agente
+        self.redis.hdel.assert_any_call(
+            self.agent_key, "AGENT_CHANNEL_ID", "PSTN_CHANNEL_ID"
+        )
+        self.redis.hgetall.assert_any_call(self.active_key)
         self.redis.hset.assert_called()
         self.assertFalse(
             any(

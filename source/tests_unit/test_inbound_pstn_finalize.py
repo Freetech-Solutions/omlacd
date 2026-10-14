@@ -20,6 +20,7 @@ _requests.adapters = types.ModuleType("requests.adapters")
 _requests.adapters.HTTPAdapter = MagicMock()
 _requests.Session = MagicMock()
 _requests.exceptions.RequestException = Exception
+_requests.Response = type("Response", (), {})
 sys.modules["requests"] = _requests
 sys.modules["requests.exceptions"] = _requests.exceptions
 sys.modules["requests.adapters"] = _requests.adapters

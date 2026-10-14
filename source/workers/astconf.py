@@ -129,7 +129,7 @@ class WebsocketClient(object):
         CONN_LOG = 'Websocket connected'
         self.logger.info(self._log_msg(CONN_LOG))
 
-    def on_close(self, ws):
+    def on_close(self, ws, close_status_code=None, close_msg=None):
         CONN_LOG = 'Websocket connection closed'
         self.logger.error(self._log_msg(CONN_LOG))
 

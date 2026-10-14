@@ -134,7 +134,17 @@ class InboundCallHandler(BaseHandler):
         fresh_ctx: CallContext,
     ) -> None:
         """Envía reporte de cierre y eventos de cola tras ganar mark_call_ended_atomic."""
-        if active_agent_channel(fresh_ctx) or call_has_prior_agent_handling(fresh_ctx):
+        # Conversación con agente, o blind en curso: EXIT_ANSWERED.
+        # is_transferred sin pierna de agente es espera en la cola destino
+        # (blind_to_campaign): el cierre es EXIT_TIMEOUT o EXIT_ABANDON.
+        in_agent_leg = bool(active_agent_channel(fresh_ctx)) or bool(
+            getattr(fresh_ctx, "blind_transfer_attempted", False)
+        )
+        prior_outside_dest_queue = (
+            call_has_prior_agent_handling(fresh_ctx)
+            and not getattr(fresh_ctx, "is_transferred", False)
+        )
+        if in_agent_leg or prior_outside_dest_queue:
             if not self.reporter:
                 return
             try:
