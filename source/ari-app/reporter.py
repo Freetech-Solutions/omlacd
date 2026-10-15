@@ -328,6 +328,9 @@ class ACDReporter:
             "initiation_method": initiation_method,
             "agent_segments": agent_segments,
         }
+        sip_agentic = call_data.get("sip_agentic_leg_call_id")
+        if sip_agentic:
+            msg["sip_agentic_leg_call_id"] = str(sip_agentic)
         self._send_job(msg)
 
     # --------------------------------------------------------------------------

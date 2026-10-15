@@ -2072,6 +2072,9 @@ class DistributionService:
                     "ts_start_iso": context_for_report.bridge_created_ts,
                     "ts_answer_iso": context_for_report.pstn_answered_ts or context_for_report.agent_answered_ts,
                 }
+                sip_agentic = getattr(context_for_report, "sip_agentic_leg_call_id", None)
+                if sip_agentic:
+                    call_data["sip_agentic_leg_call_id"] = sip_agentic
                 if call_type == 2 and id_camp_val and self.route_validator:
                     trunk_callerid = self.route_validator.get_trunk_callerid(
                         id_camp_val,

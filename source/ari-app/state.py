@@ -138,6 +138,8 @@ class CallContext(BaseModel):
     # Duraciones del leg voicebot (para bot_duration en reporte): inicio/fin ISO del canal voicebot en el bridge
     voicebot_leg_start_ts: Optional[str] = None
     voicebot_leg_end_ts: Optional[str] = None
+    # Call-ID SIP del INVITE hacia el voicebot (ARI peer.protocol_id); sobrevive al handoff
+    sip_agentic_leg_call_id: Optional[str] = None
     call_ended: bool = False  # Flag para evitar procesar el evento de finalización múltiples veces
     # Inbound: True si el agente colgó primero (on_hangup_request); usado en on_pstn_stasis_end para reportar quien_corto=1
     inbound_agent_hung_up_first: bool = False

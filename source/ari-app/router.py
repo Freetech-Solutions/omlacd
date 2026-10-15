@@ -154,6 +154,10 @@ class AcDRouter:
         event_type = event.type
         if not event_type:
             return
+
+        # Call-ID SIP del INVITE hacia voicebot (peer.protocol_id); independiente del forward legacy
+        if event_type == 'Dial':
+            self._maybe_capture_agentic_sip_call_id(event_dict)
         
         # Legacy dial handling: DIAL call_type=2 (DIALER) con channel_type to_pstn o to_agent
         if event_type == 'Dial' and self.legacy_forwarder and self.legacy_forwarder.should_forward_dial(event_dict):
@@ -979,6 +983,82 @@ class AcDRouter:
                 if val not in (None, ""):
                     return str(val)
         return str(channel_id)
+
+    def _maybe_capture_agentic_sip_call_id(self, event_dict: Dict[str, Any]) -> None:
+        """
+        Persiste peer.protocol_id (Call-ID SIP del INVITE voicebot) en CallContext.
+        Solo si la metadata del canal marca agentic_leg=1; no sobrescribe un valor ya set.
+        """
+        peer = event_dict.get("peer") or {}
+        if not isinstance(peer, dict):
+            peer = {}
+        protocol_id = peer.get("protocol_id")
+        peer_id = peer.get("id")
+        if not protocol_id or not peer_id:
+            return
+
+        call_id = None
+        ctx = self.state_store.get_by_channel(str(peer_id))
+        if ctx:
+            call_id = ctx.call_id
+        else:
+            store = None
+            if self.legacy_forwarder and getattr(self.legacy_forwarder, "pending_dial_store", None):
+                store = self.legacy_forwarder.pending_dial_store
+            elif self.call_service and getattr(self.call_service, "pending_dial_store", None):
+                store = self.call_service.pending_dial_store
+            if store:
+                meta = store.get(str(peer_id)) or {}
+                if str(meta.get("agentic_leg") or "") == "1":
+                    related = meta.get("related_call_id") or meta.get("callid")
+                    if related:
+                        call_id = str(related)
+
+        if not call_id:
+            return
+
+        try:
+            with self.state_store.lock(call_id):
+                fresh = self.state_store.get(call_id)
+                if not fresh:
+                    return
+                if getattr(fresh, "sip_agentic_leg_call_id", None):
+                    return
+                # Confirmar pierna agentic: metadata o canal ya marcado como voicebot attempt
+                is_agentic = False
+                store = None
+                if self.legacy_forwarder and getattr(self.legacy_forwarder, "pending_dial_store", None):
+                    store = self.legacy_forwarder.pending_dial_store
+                elif self.call_service and getattr(self.call_service, "pending_dial_store", None):
+                    store = self.call_service.pending_dial_store
+                if store:
+                    meta = store.get(str(peer_id)) or {}
+                    is_agentic = str(meta.get("agentic_leg") or "") == "1"
+                if not is_agentic:
+                    attempt = getattr(fresh, "agent_attempt_channel", None)
+                    connected = getattr(fresh, "agent_connected_channel", None)
+                    if getattr(fresh, "is_voicebot", False) and str(peer_id) in (
+                        str(attempt or ""),
+                        str(connected or ""),
+                    ):
+                        is_agentic = True
+                if not is_agentic:
+                    return
+                fresh.sip_agentic_leg_call_id = str(protocol_id)
+                self.state_store.register_unsafe(call_id, fresh)
+                self.logger.debug(
+                    "Capturado sip_agentic_leg_call_id=%s call_id=%s peer_id=%s",
+                    protocol_id,
+                    call_id,
+                    peer_id,
+                )
+        except Exception as e:
+            self.logger.warning(
+                "Error capturando sip_agentic_leg_call_id peer_id=%s: %s",
+                peer_id,
+                e,
+                exc_info=True,
+            )
 
     def _maybe_log_dial_for_pstn_channel(
         self,
