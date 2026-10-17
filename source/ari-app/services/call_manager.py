@@ -837,6 +837,21 @@ class CallActionService:
             f"(timeout={timeout_value}s, related_call_id={related_call_id})"
         )
 
+        # Registrar antes del originate: el Dial ARI (protocol_id / Call-ID SIP) llega
+        # mientras originate_channel_op sigue bloqueado, antes del register post-originate
+        # y antes de que el contexto tenga agent_attempt_channel.
+        stored_meta = {
+            "call_type": call_type,
+            "channel_type": ChannelType.TO_AGENT.value,
+            "id_camp": id_campaign,
+            "id_customer": id_customer,
+            "tel_customer": phone_number,
+            "related_call_id": related_call_id,
+            "agentic_leg": "1",
+        }
+        if self.pending_dial_store and channel_id:
+            self.pending_dial_store.register(channel_id, stored_meta)
+
         result = self.ari_client.originate_channel_op(
             endpoint=endpoint,
             app=self.config["ARI_APP"],
@@ -852,6 +867,8 @@ class CallActionService:
                 "❌ Error crítico al originar hacia voicebot: %s",
                 result.get("error"),
             )
+            if self.pending_dial_store and channel_id:
+                self.pending_dial_store.pop(channel_id)
             return None
 
         data = result.get("data") or {}
@@ -861,6 +878,8 @@ class CallActionService:
                 "❌ Respuesta inválida de ARI al originar hacia voicebot, falta 'id': %s",
                 data,
             )
+            if self.pending_dial_store and channel_id:
+                self.pending_dial_store.pop(channel_id)
             return None
 
         if channel_id and agent_channel_id != channel_id:
@@ -870,15 +889,10 @@ class CallActionService:
                 channel_id,
                 agent_channel_id,
             )
+            if self.pending_dial_store and channel_id:
+                self.pending_dial_store.pop(channel_id)
 
         if self.pending_dial_store:
-            stored_meta = {
-                "call_type": call_type,
-                "channel_type": ChannelType.TO_AGENT.value,
-                "id_camp": id_campaign,
-                "id_customer": id_customer,
-                "tel_customer": phone_number,
-            }
             self.pending_dial_store.register(agent_channel_id, stored_meta)
 
         self.logger.info("✅ Canal voicebot creado con headers: %s", agent_channel_id)

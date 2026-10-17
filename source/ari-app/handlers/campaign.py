@@ -231,6 +231,13 @@ class ProgressiveCampaignHandler(BaseHandler):
                         "is_voicebot": bool(is_post_voicebot_handoff),
                         "is_voicebot_transfer": bool(is_post_voicebot_handoff),
                     }
+                    sip_agentic = (
+                        getattr(refreshed, "sip_agentic_leg_call_id", None)
+                        if refreshed is not None
+                        else None
+                    ) or getattr(context, "sip_agentic_leg_call_id", None)
+                    if sip_agentic:
+                        call_data["sip_agentic_leg_call_id"] = sip_agentic
                     if call_type == CallType.DIALER_ID and context.id_camp and self.route_validator:
                         trunk_callerid = self.route_validator.get_trunk_callerid(
                             context.id_camp,
@@ -324,6 +331,9 @@ class ProgressiveCampaignHandler(BaseHandler):
                         "is_voicebot": getattr(context, "is_voicebot", False),
                         "is_voicebot_transfer": getattr(context, "is_voicebot_transfer", False),
                     }
+                    sip_agentic = getattr(context, "sip_agentic_leg_call_id", None)
+                    if sip_agentic:
+                        call_data["sip_agentic_leg_call_id"] = sip_agentic
                     if call_type == CallType.DIALER_ID and context.id_camp and self.route_validator:
                         trunk_callerid = self.route_validator.get_trunk_callerid(
                             context.id_camp,

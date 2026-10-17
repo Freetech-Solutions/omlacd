@@ -195,6 +195,9 @@ class InboundCallHandler(BaseHandler):
                     "agente_id": getattr(fresh_ctx, "agent_id", None),
                     "agent_segments": agent_segments,
                 }
+                sip_agentic = getattr(fresh_ctx, "sip_agentic_leg_call_id", None)
+                if sip_agentic:
+                    call_data["sip_agentic_leg_call_id"] = sip_agentic
                 quien_corto = 1 if getattr(fresh_ctx, "inbound_agent_hung_up_first", False) else 2
                 bot_duration, agent_duration = compute_bot_agent_durations(
                     fresh_ctx,
@@ -279,6 +282,9 @@ class InboundCallHandler(BaseHandler):
             "ts_start_iso": fresh_ctx.bridge_created_ts,
             "ts_answer_iso": fresh_ctx.pstn_answered_ts or fresh_ctx.agent_answered_ts,
         }
+        sip_agentic = getattr(fresh_ctx, "sip_agentic_leg_call_id", None)
+        if sip_agentic:
+            call_data_queue["sip_agentic_leg_call_id"] = sip_agentic
 
         if treat_as_timeout:
             if self.queue_event_manager:

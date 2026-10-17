@@ -575,6 +575,10 @@ def insert_llamada_resumen(message):
         if agent_segments:
             custom_data["agent_segments"] = agent_segments
 
+        sip_agentic_leg_call_id = message.get("sip_agentic_leg_call_id")
+        if sip_agentic_leg_call_id:
+            custom_data["sip_agentic_leg_call_id"] = str(sip_agentic_leg_call_id)
+
         now_iso = datetime.now().astimezone().isoformat()
         
         # Diccionario para tabla interactions_summary (esquema migración 0013)
