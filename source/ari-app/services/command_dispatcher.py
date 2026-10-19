@@ -85,6 +85,34 @@ class CommandDispatcher:
                 )
             return
 
+        # voicebot_handoff: AudioSocket/CES (sin SIP REFER). Libera pierna externalMedia
+        # y arranca distribución a humanos de inmediato.
+        # Payload: {"action": "voicebot_handoff", "call_id": "..."}.
+        if action == 'voicebot_handoff':
+            if not self.distribution_service:
+                self.logger.warning(
+                    "CommandDispatcher: distribution_service no disponible para voicebot_handoff"
+                )
+                return
+            try:
+                ok = self.distribution_service.begin_voicebot_handoff(call_id)
+                if ok:
+                    self.logger.info(
+                        "CommandDispatcher: voicebot_handoff OK call_id=%s",
+                        call_id,
+                    )
+                else:
+                    self.logger.warning(
+                        "CommandDispatcher: voicebot_handoff no aplicado call_id=%s",
+                        call_id,
+                    )
+            except Exception:
+                self.logger.exception(
+                    "CommandDispatcher: error en voicebot_handoff call_id=%s",
+                    call_id,
+                )
+            return
+
         if action == 'spy' or action_normalized == 'SPY':
             self._handle_spy(call_id, data)
             return

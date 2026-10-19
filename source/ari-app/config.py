@@ -246,6 +246,17 @@ class Settings(BaseSettings):
         le=300,
         description="TTL en segundos del comando voicebot_transfer_proceed pendiente cuando llega antes que el waiter del REFER (race comando/REFER)",
     )
+    # Voicebot AudioSocket (ARI externalMedia)
+    AUDIOSOCKET_ADDR: str = Field(
+        default="audiosocket:9092",
+        description="Host:puerto del servidor AudioSocket para voicebots (ARI externalMedia)",
+    )
+    AUDIOSOCKET_SESSION_TTL_SEC: int = Field(
+        default=3600,
+        ge=60,
+        le=86400,
+        description="TTL en segundos de OML:AUDIOSOCKET:{uuid} con variables de negocio",
+    )
 
     # Prometheus (métricas)
     PROMETHEUS_METRICS_PORT: int = Field(

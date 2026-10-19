@@ -723,18 +723,48 @@ class ARI:
 
     # --- Métodos del Sistema y Medios Externos ---
 
-    def external_media(self, external_host, external_port, app, format='slin16', direction='both',
-                       variables=None):
+    def external_media(
+        self,
+        external_host,
+        app,
+        external_port=None,
+        format='slin16',
+        direction='both',
+        variables=None,
+        encapsulation=None,
+        transport=None,
+        data=None,
+        channel_id=None,
+    ):
+        """
+        Crea un canal externalMedia (RTP/UDP por defecto, o AudioSocket/TCP).
+
+        Si external_port es None, external_host debe ser ya ``host:port``
+        (p. ej. settings.AUDIOSOCKET_ADDR).
+        """
         route = 'channels/externalMedia'
+        host = (
+            f"{external_host}:{external_port}"
+            if external_port is not None
+            else external_host
+        )
         payload = {
-            "external_host": f"{external_host}:{external_port}",
+            "external_host": host,
             "app": app,
             "format": format,
-            "direction": direction
+            "direction": direction,
         }
 
+        if encapsulation is not None:
+            payload["encapsulation"] = encapsulation
+        if transport is not None:
+            payload["transport"] = transport
+        if data is not None:
+            payload["data"] = data
+        if channel_id is not None:
+            payload["channelId"] = channel_id
         if variables is not None:
-            payload['variables'] = variables
+            payload["variables"] = variables
 
         result = self.post(route, payload=payload)
         return self._unwrap_data(result)

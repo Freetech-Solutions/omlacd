@@ -822,7 +822,10 @@ class InboundCallHandler(BaseHandler):
                 "call_type": inbound_data.get("call_type", CallType.INBOUND_ID),
             }
             try:
-                if campaign_cfg.get("voicebot") and campaign_cfg.get("external_ag_host"):
+                # VOICEBOT=True basta para el VoicebotLoop. EXTERNAL_AG_HOST solo es
+                # fallback SIP (PJSIP/{sip}@{host}); AudioSocket usa AUDIOSOCKET_ADDR
+                # y SIP suele traer VOICEBOT_ADDR en OML:AGENT.
+                if campaign_cfg.get("voicebot"):
                     self.distribution_service.start_voicebot_distribution(
                         call_id=call_id,
                         campaign_id=str(id_camp),
@@ -833,7 +836,7 @@ class InboundCallHandler(BaseHandler):
                         pstn_channel_id=channel_id,
                         uniqueid=uniqueid,
                         distribution_metadata=distribution_metadata,
-                        external_host=campaign_cfg["external_ag_host"],
+                        external_host=campaign_cfg.get("external_ag_host") or "",
                         max_qcalls=campaign_cfg.get("maxqcall", 10),
                         on_queue_timeout_callback=lambda cid, ch: self._mark_pstn_hangup_by_app(ch),
                     )

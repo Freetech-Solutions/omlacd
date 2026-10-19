@@ -9,8 +9,10 @@ Incluye la lógica de decisión de tipos de llamada (dial to agent vs dial to PS
 validación de idempotencia y validación de rutas para el comando 'dial'.
 """
 
+import json
 import logging
 import time
+import uuid
 from datetime import datetime
 from typing import Optional, Dict, Any, TYPE_CHECKING
 
@@ -18,7 +20,7 @@ from ari_manager import ARI
 from config import settings
 from log_config import set_log_call_id, reset_log_call_id
 from state import CallRegistry
-from constants import ChannelType, ProtocolPrefix, CallType
+from constants import ChannelType, ProtocolPrefix, CallType, RedisKeys
 from utils import build_oml_sip_headers, build_dynamic_sip_headers_from_env
 from metadata_utils import build_app_args
 from idempotency import (
@@ -896,6 +898,128 @@ class CallActionService:
             self.pending_dial_store.register(agent_channel_id, stored_meta)
 
         self.logger.info("✅ Canal voicebot creado con headers: %s", agent_channel_id)
+        return agent_channel_id
+
+    def dial_voicebot_audiosocket(
+        self,
+        related_call_id: str,
+        metadata: Dict[str, Any],
+        channel_id: Optional[str] = None,
+        audiosocket_addr: Optional[str] = None,
+    ) -> Optional[str]:
+        """
+        Crea la pierna voicebot vía ARI externalMedia (encapsulation=audiosocket).
+
+        Las variables de negocio no caben en el protocolo AudioSocket: se publican
+        en Redis ``OML:AUDIOSOCKET:{uuid}`` para que audiosocket.py las inyecte en CES.
+        Registra ``pending_dial_store`` (externalMedia no envía appArgs en StasisStart).
+        """
+        addr = (audiosocket_addr or getattr(settings, "AUDIOSOCKET_ADDR", "") or "").strip()
+        if not addr:
+            self.logger.error("dial_voicebot_audiosocket: AUDIOSOCKET_ADDR vacío")
+            return None
+
+        session_uuid = str(uuid.uuid4())
+        agent_channel_id = channel_id or str(uuid.uuid4())
+
+        id_customer = str(metadata.get("id_customer", "") or "")
+        id_campaign = str(metadata.get("id_camp", metadata.get("id_campaign", "")) or "")
+        phone_number = str(metadata.get("phone_number", metadata.get("tel_customer", "")) or "")
+        callid = str(metadata.get("callid") or related_call_id or "")
+        agent_id = str(metadata.get("agent_id", metadata.get("id_agent", "")) or "")
+        call_type = str(metadata.get("call_type", CallType.INBOUND_ID))
+
+        session_payload = {
+            "X-OML-Contact-ID": id_customer,
+            "X-OML-Campaign-ID": id_campaign,
+            "X-OML-Call-ID": callid,
+            "phone_number": phone_number,
+            "agent_id": agent_id,
+        }
+
+        if self.redis_client:
+            try:
+                key = RedisKeys.audiosocket_session(session_uuid)
+                ttl = int(getattr(settings, "AUDIOSOCKET_SESSION_TTL_SEC", 3600))
+                self.redis_client.setex(key, ttl, json.dumps(session_payload))
+            except Exception as e:
+                self.logger.warning(
+                    "dial_voicebot_audiosocket: no se pudo escribir sesión Redis uuid=%s: %s",
+                    session_uuid,
+                    e,
+                )
+        else:
+            self.logger.warning(
+                "dial_voicebot_audiosocket: sin redis_client; sesión %s no publicada",
+                session_uuid,
+            )
+
+        stored_meta = {
+            "call_type": call_type,
+            "channel_type": ChannelType.TO_AGENT.value,
+            "id_camp": id_campaign,
+            "id_customer": id_customer,
+            "tel_customer": phone_number,
+            "related_call_id": related_call_id,
+            "callid": callid,
+            "agentic_leg": "1",
+            "audiosocket_uuid": session_uuid,
+        }
+        if self.pending_dial_store:
+            self.pending_dial_store.register(agent_channel_id, stored_meta)
+
+        self.logger.info(
+            "🚀 externalMedia AudioSocket hacia %s (uuid=%s, related_call_id=%s, channel_id=%s)",
+            addr,
+            session_uuid,
+            related_call_id,
+            agent_channel_id,
+        )
+
+        try:
+            data = self.ari_client.external_media(
+                external_host=addr,
+                app=self.config["ARI_APP"],
+                format="slin",
+                direction="both",
+                encapsulation="audiosocket",
+                transport="tcp",
+                data=session_uuid,
+                channel_id=agent_channel_id,
+            )
+        except Exception as e:
+            self.logger.error(
+                "❌ Error externalMedia AudioSocket: %s",
+                e,
+                exc_info=True,
+            )
+            if self.pending_dial_store:
+                self.pending_dial_store.pop(agent_channel_id)
+            return None
+
+        if not data or not isinstance(data, dict) or not data.get("id"):
+            self.logger.error(
+                "❌ Respuesta inválida de ARI externalMedia AudioSocket: %s",
+                data,
+            )
+            if self.pending_dial_store:
+                self.pending_dial_store.pop(agent_channel_id)
+            return None
+
+        returned_id = data.get("id")
+        if returned_id != agent_channel_id:
+            self.logger.warning(
+                "dial_voicebot_audiosocket: ARI devolvió id distinto "
+                "(solicitado=%s, recibido=%s)",
+                agent_channel_id,
+                returned_id,
+            )
+            if self.pending_dial_store:
+                self.pending_dial_store.pop(agent_channel_id)
+                self.pending_dial_store.register(returned_id, stored_meta)
+            agent_channel_id = returned_id
+
+        self.logger.info("✅ Canal voicebot AudioSocket creado: %s", agent_channel_id)
         return agent_channel_id
 
     def enqueue_call(self, call_id: str, campaign_id: int) -> bool:

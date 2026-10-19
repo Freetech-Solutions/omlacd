@@ -295,6 +295,11 @@ class RedisKeys:
         return f"OML:AGENT:{agent_id}"
 
     @staticmethod
+    def audiosocket_session(session_uuid: str) -> str:
+        """Sesión AudioSocket con variables de negocio (JSON) para el server CES."""
+        return f"OML:AUDIOSOCKET:{session_uuid}"
+
+    @staticmethod
     def agent_lock(agent_id: str) -> str:
         """Lock de reserva de agente durante distribución (TTL = ring_timeout + margen)."""
         return f"acd:lock:agent:{agent_id}"

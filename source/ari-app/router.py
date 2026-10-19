@@ -471,6 +471,37 @@ class AcDRouter:
                 self.logger.warning("No handler for amd_done")
             return
 
+        # externalMedia (AudioSocket) no envía appArgs: completar desde pending_dial_store
+        if not args_dict.get("channel_type"):
+            store = None
+            if self.legacy_forwarder and getattr(self.legacy_forwarder, "pending_dial_store", None):
+                store = self.legacy_forwarder.pending_dial_store
+            elif self.call_service and getattr(self.call_service, "pending_dial_store", None):
+                store = self.call_service.pending_dial_store
+            if store:
+                pending_meta = store.get(channel_id) or {}
+                if pending_meta.get("channel_type"):
+                    for key in (
+                        "channel_type",
+                        "related_call_id",
+                        "callid",
+                        "call_type",
+                        "id_camp",
+                        "id_customer",
+                        "tel_customer",
+                        "agentic_leg",
+                    ):
+                        if key in pending_meta and key not in args_dict:
+                            args_dict[key] = pending_meta[key]
+                    _log_callid = args_dict.get("callid") or args_dict.get("related_call_id")
+                    if _log_callid:
+                        set_log_call_id(str(_log_callid))
+                    self.logger.debug(
+                        "StasisStart: args desde pending_dial_store channel_id=%s channel_type=%s",
+                        channel_id,
+                        args_dict.get("channel_type"),
+                    )
+
         channel_type = args_dict.get('channel_type')
         is_manual = self._is_valid_manual_call(args_dict) # Verifica si tiene id_agent y id_camp
 

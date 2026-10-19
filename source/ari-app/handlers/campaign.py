@@ -869,7 +869,7 @@ class ProgressiveCampaignHandler(BaseHandler):
                     pstn_channel_id=channel_id,
                     uniqueid=uniqueid,
                     distribution_metadata=distribution_metadata,
-                    external_host=campaign_cfg["external_ag_host"],
+                    external_host=campaign_cfg.get("external_ag_host") or "",
                     max_qcalls=campaign_cfg.get("maxqcall", 10),
                     on_queue_timeout_callback=self._on_queue_timeout_for_dialer,
                 )
