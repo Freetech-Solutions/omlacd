@@ -126,6 +126,8 @@ Implementado en `audiosocket/oml_api.py`:
 
 Si falla el webhook o faltan env, se loguea warning y **igual** se publica `voicebot_handoff`.
 
+Tras un `new_contact/disposition` o webhook OK, Django escribe `CallContactCache` (`callid` → `contact_id`) para que la GUI del agente, que aún recibe `id_contacto=-1` en el originate, abra el contacto correcto en `calificar_llamada` (y no la pantalla de teléfonos repetidos).
+
 ---
 
 ## 5. Flujo SIP (legado, sin cambios disruptivos)

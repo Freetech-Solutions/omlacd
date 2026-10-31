@@ -116,6 +116,13 @@ class Settings(BaseSettings):
         ge=1,
         description="Cantidad de reintentos de submit por job en publisher Gearman asíncrono",
     )
+    # P0: si process-event queued >= umbral, no encolar AmdLatency (métrica no crítica).
+    # 0 = nunca omitir por cola.
+    AMD_LATENCY_QUEUE_MAX: int = Field(
+        default=100,
+        ge=0,
+        description="Omitir submit AmdLatency si process-event queued >= este valor (0=off)",
+    )
     OMNILEADS_HOSTNAME: str = Field(default="nginx", description="Hostname del servidor Django/OMniLeads")
     OMNILEADS_PROTOCOL: str = Field(default="https", description="Protocolo para Django (http/https)")
     OMNILEADS_VERIFY_SSL: bool = Field(
@@ -182,6 +189,26 @@ class Settings(BaseSettings):
         default=10,
         ge=0,
         description="Segundos extra sobre ring_timeout para el TTL del lock acd:lock:agent durante el ring",
+    )
+    # Tras offer fallido (BUSY / NOANSWER inmediato): lease corto sin volver a READY
+    AGENT_OFFER_FAILURE_COOLDOWN_SEC: int = Field(
+        default=5,
+        ge=1,
+        le=60,
+        description=(
+            "Segundos de cooldown (lease) tras un intento fallido de distribución hacia un agente; "
+            "evita que otras llamadas concurrentes re-originen al mismo SIP en ráfaga"
+        ),
+    )
+    # Grace extra sobre max(WRAPUPTIME, AUTO_UNPAUSE) al colgar (bloquea oferta aunque READY)
+    AGENT_WRAPUP_POST_READY_GRACE_SEC: int = Field(
+        default=5,
+        ge=0,
+        le=120,
+        description=(
+            "Segundos extra de cooldown post-colgado sumados a max(WRAPUPTIME, AUTO_UNPAUSE) "
+            "de la campaña; evita oferta inmediata apenas la consola sale de ACW a READY"
+        ),
     )
     # Piso de TTL al renovar lock/lease tras handle_agent_answer (ventana hasta ONCALL/bridge)
     AGENT_ANSWER_RESERVATION_TTL_SEC: int = Field(

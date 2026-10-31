@@ -29,6 +29,10 @@ end
 return 0
 """
 
+# KEYS[1]=agent KEYS[2]=lock KEYS[3]=lease KEYS[4]=cooldown
+# ARGV[1]=READY ARGV[2]=DIALING ARGV[3]=ts ARGV[4]=call_id ARGV[5]=ttl
+# Cooldown se setea al reservar (TTL=ring) para que un restore_ready ajenos
+# no permita re-reserve mientras el originate sigue en vuelo.
 _RESERVE_FOR_DISTRIBUTION_SCRIPT = """
 local current = redis.call('HGET', KEYS[1], 'STATUS')
 if current ~= ARGV[1] then
@@ -38,6 +42,9 @@ if redis.call('EXISTS', KEYS[2]) == 1 then
     return 0
 end
 if redis.call('EXISTS', KEYS[3]) == 1 then
+    return 0
+end
+if redis.call('EXISTS', KEYS[4]) == 1 then
     return 0
 end
 local lock_ok = redis.call('SET', KEYS[2], ARGV[4], 'EX', ARGV[5], 'NX')
@@ -56,9 +63,11 @@ if current2 ~= ARGV[1] then
     return 0
 end
 redis.call('HSET', KEYS[1], 'STATUS', ARGV[2], 'TIMESTAMP', ARGV[3], 'CALLID', ARGV[4])
+redis.call('SET', KEYS[4], ARGV[4], 'EX', tonumber(ARGV[5]))
 return 1
 """
 
+# KEYS[1]=agent KEYS[2]=lock KEYS[3]=lease KEYS[4]=cooldown
 _RELEASE_DISTRIBUTION_RESERVATION_SCRIPT = """
 local lock_val = redis.call('GET', KEYS[2])
 if lock_val and lock_val ~= ARGV[1] then
@@ -68,11 +77,15 @@ local lease_val = redis.call('GET', KEYS[3])
 if lease_val and lease_val ~= ARGV[1] then
     return 0
 end
+local cool_val = redis.call('GET', KEYS[4])
 if lock_val == ARGV[1] then
     redis.call('DEL', KEYS[2])
 end
 if lease_val == ARGV[1] then
     redis.call('DEL', KEYS[3])
+end
+if cool_val == ARGV[1] then
+    redis.call('DEL', KEYS[4])
 end
 if ARGV[5] == '1' then
     local current = redis.call('HGET', KEYS[1], 'STATUS')
@@ -88,6 +101,35 @@ end
 return 1
 """
 
+# Tras offer fallido: SET cooldown (KEYS[4]) siempre; libera lock; renueva lease;
+# deja DIALING. El cooldown bloquea re-reserve aunque otro path ponga READY.
+# KEYS[1]=agent KEYS[2]=lock KEYS[3]=lease KEYS[4]=cooldown
+# ARGV[1]=call_id ARGV[2]=cooldown_ttl ARGV[3]=DIALING ARGV[4]=ts ARGV[5]=RINGING
+_PENALIZE_FAILED_DISTRIBUTION_SCRIPT = """
+redis.call('SET', KEYS[4], ARGV[1], 'EX', tonumber(ARGV[2]))
+local lock_val = redis.call('GET', KEYS[2])
+local lease_val = redis.call('GET', KEYS[3])
+if lock_val and lock_val ~= ARGV[1] then
+    return 1
+end
+if lease_val and lease_val ~= ARGV[1] then
+    return 1
+end
+if lock_val == ARGV[1] then
+    redis.call('DEL', KEYS[2])
+end
+redis.call('SET', KEYS[3], ARGV[1], 'EX', tonumber(ARGV[2]))
+local current = redis.call('HGET', KEYS[1], 'STATUS')
+if current == ARGV[3] or current == ARGV[5] then
+    local callid = redis.call('HGET', KEYS[1], 'CALLID')
+    if not callid or callid == '' or callid == ARGV[1] then
+        redis.call('HSET', KEYS[1], 'STATUS', ARGV[3], 'TIMESTAMP', ARGV[4], 'CALLID', ARGV[1])
+    end
+end
+return 1
+"""
+
+# KEYS[1]=agent KEYS[2]=lock KEYS[3]=lease KEYS[4]=cooldown
 _REVERT_STALE_DIALING_SCRIPT = """
 local current = redis.call('HGET', KEYS[1], 'STATUS')
 -- ARGV[1]=DIALING ARGV[4]=RINGING
@@ -98,6 +140,9 @@ if redis.call('EXISTS', KEYS[2]) == 1 then
     return 0
 end
 if redis.call('EXISTS', KEYS[3]) == 1 then
+    return 0
+end
+if redis.call('EXISTS', KEYS[4]) == 1 then
     return 0
 end
 redis.call('HSET', KEYS[1], 'STATUS', ARGV[2], 'TIMESTAMP', ARGV[3])
@@ -140,11 +185,56 @@ local lease_val = redis.call('GET', KEYS[3])
 if lease_val and lease_val == ARGV[2] then
     redis.call('DEL', KEYS[3])
 end
+-- KEYS[4]=cooldown: liberar al consolidar ONCALL para no bloquear al agente
+local cool_val = redis.call('GET', KEYS[4])
+if cool_val and cool_val == ARGV[2] then
+    redis.call('DEL', KEYS[4])
+end
 return 1
 """
 
 # Estado UI del softphone (Django api_make_ringing); no está en AgentStatus del ACD.
 _AGENT_STATUS_RINGING = "RINGING"
+
+# ONCALL→POSTCALL atómico + limpieza de campos de llamada.
+# ARGV[1]=ONCALL ARGV[2]=POSTCALL ARGV[3]=timestamp ARGV[4]=expected_call_id ("" = no filtrar)
+# Retorna 1 si hubo cambio (STATUS o limpieza de campos), 0 si no tocó nada.
+# No pisa STATUS si ya no es ONCALL (p. ej. consola ya puso PAUSE-ACW/READY).
+# No toca voicebots (VOICEBOT=1). Preserva CAMPAIGN para métricas ACW de Django.
+_SET_POSTCALL_AND_CLEAR_FIELDS_SCRIPT = """
+local voicebot = redis.call('HGET', KEYS[1], 'VOICEBOT')
+if voicebot == '1' then
+    return 0
+end
+local callid = redis.call('HGET', KEYS[1], 'CALLID')
+if ARGV[4] ~= '' then
+    if callid and callid ~= '' and callid ~= ARGV[4] then
+        return 0
+    end
+end
+local current = redis.call('HGET', KEYS[1], 'STATUS')
+local changed = 0
+if current == ARGV[1] then
+    redis.call('HSET', KEYS[1], 'STATUS', ARGV[2], 'TIMESTAMP', ARGV[3])
+    changed = 1
+end
+-- Limpiar campos de llamada: si pasamos a POSTCALL, o si CALLID coincide
+-- (consola ya puso PAUSE-ACW/READY pero dejó metadatos de esta llamada).
+local should_clear = false
+if changed == 1 then
+    should_clear = true
+elseif ARGV[4] ~= '' and callid and callid == ARGV[4] then
+    should_clear = true
+end
+if should_clear then
+    redis.call('HDEL', KEYS[1],
+        'NODE_ID', 'CALLID', 'BRIDGE_ID', 'CONTACT_NUMBER',
+        'AGENT_CHANNEL_ID', 'PSTN_CHANNEL_ID'
+    )
+    changed = 1
+end
+return changed
+"""
 
 
 class AgentStatusService:
@@ -329,13 +419,15 @@ class AgentStatusService:
             agent_key = self._get_agent_key(agent_id)
             lock_key = RedisKeys.agent_lock(str(agent_id))
             lease_key = RedisKeys.agent_reservation_lease(str(agent_id))
+            cooldown_key = RedisKeys.agent_offer_cooldown(str(agent_id))
             current_timestamp = str(int(datetime.now().timestamp()))
             result = self.redis_client.eval(
                 _RESERVE_FOR_DISTRIBUTION_SCRIPT,
-                3,
+                4,
                 agent_key,
                 lock_key,
                 lease_key,
+                cooldown_key,
                 AgentStatus.READY.value,
                 AgentStatus.DIAL_CALL.value,
                 current_timestamp,
@@ -428,13 +520,15 @@ class AgentStatusService:
             agent_key = self._get_agent_key(agent_id)
             lock_key = RedisKeys.agent_lock(str(agent_id))
             lease_key = RedisKeys.agent_reservation_lease(str(agent_id))
+            cooldown_key = RedisKeys.agent_offer_cooldown(str(agent_id))
             current_timestamp = str(int(datetime.now().timestamp()))
             result = self.redis_client.eval(
                 _RELEASE_DISTRIBUTION_RESERVATION_SCRIPT,
-                3,
+                4,
                 agent_key,
                 lock_key,
                 lease_key,
+                cooldown_key,
                 str(call_id),
                 AgentStatus.DIAL_CALL.value,
                 AgentStatus.READY.value,
@@ -448,6 +542,60 @@ class AgentStatusService:
         except Exception as e:
             self.logger.error(
                 "release_distribution_reservation: error liberando agente %s call_id=%s: %s",
+                agent_id,
+                call_id,
+                e,
+                exc_info=True,
+            )
+            return False
+
+    def penalize_failed_distribution_offer(
+        self,
+        agent_id: Any,
+        call_id: str,
+        cooldown_sec: int,
+    ) -> bool:
+        """
+        Tras offer fallido: quita lock, renueva lease por cooldown_sec y deja
+        STATUS en DIALING para que otras llamadas no re-originen al mismo agente.
+        """
+        if not agent_id or not call_id:
+            self.logger.warning(
+                "penalize_failed_distribution_offer: agent_id o call_id vacío"
+            )
+            return False
+
+        if not self.redis_client:
+            self.logger.error(
+                "penalize_failed_distribution_offer: redis_client no disponible para agente %s",
+                agent_id,
+            )
+            return False
+
+        ttl = max(1, int(cooldown_sec))
+        try:
+            agent_key = self._get_agent_key(agent_id)
+            lock_key = RedisKeys.agent_lock(str(agent_id))
+            lease_key = RedisKeys.agent_reservation_lease(str(agent_id))
+            cooldown_key = RedisKeys.agent_offer_cooldown(str(agent_id))
+            current_timestamp = str(int(datetime.now().timestamp()))
+            result = self.redis_client.eval(
+                _PENALIZE_FAILED_DISTRIBUTION_SCRIPT,
+                4,
+                agent_key,
+                lock_key,
+                lease_key,
+                cooldown_key,
+                str(call_id),
+                str(ttl),
+                AgentStatus.DIAL_CALL.value,
+                current_timestamp,
+                _AGENT_STATUS_RINGING,
+            )
+            return bool(result)
+        except Exception as e:
+            self.logger.error(
+                "penalize_failed_distribution_offer: error agente %s call_id=%s: %s",
                 agent_id,
                 call_id,
                 e,
@@ -470,13 +618,15 @@ class AgentStatusService:
             agent_key = self._get_agent_key(agent_id)
             lock_key = RedisKeys.agent_lock(str(agent_id))
             lease_key = RedisKeys.agent_reservation_lease(str(agent_id))
+            cooldown_key = RedisKeys.agent_offer_cooldown(str(agent_id))
             current_timestamp = str(int(datetime.now().timestamp()))
             result = self.redis_client.eval(
                 _REVERT_STALE_DIALING_SCRIPT,
-                3,
+                4,
                 agent_key,
                 lock_key,
                 lease_key,
+                cooldown_key,
                 AgentStatus.DIAL_CALL.value,
                 AgentStatus.READY.value,
                 current_timestamp,
@@ -494,14 +644,19 @@ class AgentStatusService:
             return False
 
     def has_active_distribution_reservation(self, agent_id: Any) -> bool:
-        """True si el agente tiene lock o lease de reserva activos."""
+        """True si el agente tiene lock, lease o cooldown de offer activos."""
         if not agent_id or not self.redis_client:
             return False
         try:
             agent_id_str = str(agent_id)
             lock_key = RedisKeys.agent_lock(agent_id_str)
             lease_key = RedisKeys.agent_reservation_lease(agent_id_str)
-            return bool(self.redis_client.exists(lock_key) or self.redis_client.exists(lease_key))
+            cooldown_key = RedisKeys.agent_offer_cooldown(agent_id_str)
+            return bool(
+                self.redis_client.exists(lock_key)
+                or self.redis_client.exists(lease_key)
+                or self.redis_client.exists(cooldown_key)
+            )
         except Exception:
             return False
     
@@ -600,15 +755,17 @@ class AgentStatusService:
             agent_key = self._get_agent_key(agent_id)
             lock_key = RedisKeys.agent_lock(str(agent_id))
             lease_key = RedisKeys.agent_reservation_lease(str(agent_id))
+            cooldown_key = RedisKeys.agent_offer_cooldown(str(agent_id))
             current_timestamp = str(int(datetime.now().timestamp()))
             campaign_str = "" if campaign_id is None else str(campaign_id)
             contact_str = contact_number or ""
             result = self.redis_client.eval(
                 _CONFIRM_DISTRIBUTION_ONCALL_SCRIPT,
-                3,
+                4,
                 agent_key,
                 lock_key,
                 lease_key,
+                cooldown_key,
                 AgentStatus.DIAL_CALL.value,
                 str(call_id),
                 AgentStatus.ONCALL.value,
@@ -895,73 +1052,164 @@ class AgentStatusService:
                 e,
             )
     
-    def set_postcall_and_clear_fields(self, agent_id: Any) -> bool:
+    def apply_wrapup_cooldown(
+        self,
+        agent_id: Any,
+        campaign_id: Optional[Any] = None,
+    ) -> bool:
         """
-        Establece el estado del agente a POSTCALL y limpia los campos de llamada.
-        
-        Este método se usa cuando finaliza el canal del agente en una llamada manual.
-        Solo realiza la transición si el estado actual es ONCALL.
-        
-        Limpia los siguientes campos:
-        - NODE_ID
-        - CALLID
-        - CONTACT_NUMBER
-        
+        Bloquea nuevas ofertas (acd:cooldown:agent) tras colgado humano.
+
+        TTL = max(WRAPUPTIME, AUTO_UNPAUSE) + AGENT_WRAPUP_POST_READY_GRACE_SEC
+        desde OML:CAMP. No aplica a voicebots. Se setea aunque STATUS ya sea
+        PAUSE-ACW/READY (consola más rápida que POSTCALL).
+        """
+        if not agent_id or not self.redis_client:
+            return False
+
+        try:
+            agent_key = self._get_agent_key(agent_id)
+            voicebot = self.redis_client.hget(agent_key, "VOICEBOT")
+            if voicebot is not None and isinstance(voicebot, bytes):
+                voicebot = voicebot.decode("utf-8")
+            if str(voicebot or "") == "1":
+                return False
+
+            camp_id = campaign_id
+            if camp_id is None or str(camp_id).strip() == "":
+                camp_raw = self.redis_client.hget(agent_key, "CAMPAIGN")
+                if camp_raw is not None and isinstance(camp_raw, bytes):
+                    camp_raw = camp_raw.decode("utf-8")
+                camp_id = camp_raw
+
+            wrapuptime = 0
+            auto_unpause = 0
+            if camp_id is not None and str(camp_id).strip() != "":
+                from services.campaign_config import get_campaign_config_with_defaults
+
+                cfg = get_campaign_config_with_defaults(
+                    self.redis_client, str(camp_id).strip()
+                )
+                wrapuptime = int(cfg.get("wrapuptime") or 0)
+                auto_unpause = int(cfg.get("auto_unpause") or 0)
+
+            grace = int(
+                getattr(settings, "AGENT_WRAPUP_POST_READY_GRACE_SEC", 5) or 0
+            )
+            ttl = max(wrapuptime, auto_unpause, 0) + max(grace, 0)
+            if ttl <= 0:
+                return False
+
+            cooldown_key = RedisKeys.agent_offer_cooldown(str(agent_id))
+            self.redis_client.set(cooldown_key, "wrapup", ex=ttl)
+            self.logger.info(
+                "apply_wrapup_cooldown: agente %s campaign=%s ttl=%ss "
+                "(wrapup=%s auto_unpause=%s grace=%s)",
+                agent_id,
+                camp_id,
+                ttl,
+                wrapuptime,
+                auto_unpause,
+                grace,
+            )
+            return True
+        except Exception as e:
+            self.logger.warning(
+                "apply_wrapup_cooldown: error agente %s: %s",
+                agent_id,
+                e,
+                exc_info=True,
+            )
+            return False
+
+    def set_postcall_and_clear_fields(
+        self,
+        agent_id: Any,
+        call_id: Optional[str] = None,
+        campaign_id: Optional[Any] = None,
+    ) -> bool:
+        """
+        Transición atómica ONCALL→POSTCALL y limpieza de campos de llamada.
+
+        Solo cambia STATUS a POSTCALL si el valor actual es ONCALL.
+        Si el agente ya está en PAUSE-ACW/READY (consola más rápida), no pisa
+        STATUS pero limpia CALLID/NODE_ID/BRIDGE_ID cuando coinciden con call_id.
+        No toca voicebots (VOICEBOT=1). Preserva CAMPAIGN para métricas ACW.
+        Tras el intento aplica wrapup cooldown (bloquea oferta aunque READY).
+
         Args:
             agent_id: ID del agente
-            
+            call_id: CALLID esperado (opcional). Si el hash tiene otro CALLID,
+                     no se modifica (protege contra llamadas nuevas del agente).
+            campaign_id: campaña para WRAPUPTIME/AUTO_UNPAUSE; si falta se lee
+                     CAMPAIGN del hash del agente.
+
         Returns:
-            bool: True si la actualización fue exitosa, False en caso contrario
+            bool: True si hubo cambio (STATUS o limpieza), False en caso contrario
         """
         if not agent_id:
             self.logger.warning("set_postcall_and_clear_fields: agent_id vacío")
             return False
-        
+
         if not self.redis_client:
             self.logger.error(
-                f"set_postcall_and_clear_fields: redis_client no está disponible para agente {agent_id}"
+                "set_postcall_and_clear_fields: redis_client no está disponible "
+                "para agente %s",
+                agent_id,
             )
             return False
-        
+
         try:
-            # Verificar que el estado actual sea ONCALL
-            current_status = self.get_status(agent_id)
-            if current_status != AgentStatus.ONCALL:
-                self.logger.warning(
-                    f"set_postcall_and_clear_fields: El agente {agent_id} no está en estado ONCALL "
-                    f"(estado actual: {current_status.value if current_status else 'None'}). "
-                    f"No se realizará la transición a POSTCALL."
-                )
-                return False
-            
             agent_key = self._get_agent_key(agent_id)
-            current_timestamp = int(datetime.now().timestamp())
-            
-            # Actualizar estado a POSTCALL y timestamp
-            self.redis_client.hset(
+            current_timestamp = str(int(datetime.now().timestamp()))
+            expected_call_id = str(call_id).strip() if call_id else ""
+            result = self.redis_client.eval(
+                _SET_POSTCALL_AND_CLEAR_FIELDS_SCRIPT,
+                1,
                 agent_key,
-                mapping={
-                    "STATUS": AgentStatus.POSTCALL.value,
-                    "TIMESTAMP": str(current_timestamp)
-                }
+                AgentStatus.ONCALL.value,
+                AgentStatus.POSTCALL.value,
+                current_timestamp,
+                expected_call_id,
             )
-            
-            # Limpiar campos específicos de llamada
-            fields_to_remove = ["NODE_ID", "CALLID", "CONTACT_NUMBER"]
-            self.redis_client.hdel(agent_key, *fields_to_remove)
-            
-            self.logger.info(
-                f"set_postcall_and_clear_fields: Agente {agent_id} transicionado a POSTCALL "
-                f"y campos de llamada limpiados"
+            # Wrapup tras colgado humano (también si consola ya puso ACW/READY).
+            # No aplicar si el hash ya apunta a otra CALLID (llamada nueva).
+            callid_now = self.redis_client.hget(agent_key, "CALLID")
+            if callid_now is not None and isinstance(callid_now, bytes):
+                callid_now = callid_now.decode("utf-8")
+            callid_now = (callid_now or "").strip()
+            other_active_call = bool(
+                expected_call_id
+                and callid_now
+                and callid_now != expected_call_id
             )
-            publish_agent_to_streams(self.redis_client, agent_id)
-            return True
-            
+            if not other_active_call:
+                self.apply_wrapup_cooldown(agent_id, campaign_id=campaign_id)
+            if result:
+                self.logger.info(
+                    "set_postcall_and_clear_fields: agente %s → POSTCALL "
+                    "(o limpieza de campos) call_id=%s",
+                    agent_id,
+                    expected_call_id or "(any)",
+                )
+                publish_agent_to_streams(self.redis_client, agent_id)
+                return True
+
+            self.logger.debug(
+                "set_postcall_and_clear_fields: sin cambios para agente %s "
+                "call_id=%s (STATUS≠ONCALL, CALLID distinto o VOICEBOT)",
+                agent_id,
+                expected_call_id or "(any)",
+            )
+            return False
+
         except Exception as e:
             self.logger.error(
-                f"set_postcall_and_clear_fields: Error actualizando estado del agente "
-                f"{agent_id} a POSTCALL en Redis: {e}",
-                exc_info=True
+                "set_postcall_and_clear_fields: Error actualizando estado del agente "
+                "%s a POSTCALL en Redis: %s",
+                agent_id,
+                e,
+                exc_info=True,
             )
             return False
     

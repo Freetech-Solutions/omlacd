@@ -14,6 +14,7 @@ if TYPE_CHECKING:
 
 _PROCESS_EVENT_RETRIES = 3
 _PROCESS_EVENT_RETRY_DELAY_SEC = 0.25
+_GEARMAN_STATUS_TTL_SEC = 1.0
 
 
 class LegacyEventForwarder:
@@ -37,6 +38,7 @@ class LegacyEventForwarder:
         self._injected_client = gearman_client is not None
         self.pending_dial_store = pending_dial_store
         self.reporter = reporter
+        self._process_event_queued_cache: Dict[str, Any] = {"ts": 0.0, "queued": None}
         if not self.client:
             self._connect()
 
@@ -161,6 +163,10 @@ class LegacyEventForwarder:
         Envía a process-event (Gearman) eventos DIAL con call_type=2 (DIALER)
         y channel_type to_pstn o to_agent, añadiendo al payload el campo call_type.
 
+        Dial con dialstatus vacío / RINGING (PSTN o agent) no se reenvían: el
+        dialer los trata como progreso intermedio (no-op). El router sigue
+        pudiendo hacer log_dial a acd-log-processor vía should_forward_dial.
+
         Dial NOANSWER/CANCEL en pierna to_pstn no se reenvían: el conteo COUNTER
         lo define el HangupCause final en ChannelDestroyed (evita doble hincrby).
         """
@@ -189,6 +195,12 @@ class LegacyEventForwarder:
 
         dialstatus = event.get("dialstatus")
         is_pstn = channel_type in (ChannelType.TO_PSTN.value, "to_pstn")
+        if dialstatus in (None, "", "RINGING"):
+            self.logger.debug(
+                "Skip Dial progress dialstatus=%r (no process-event)",
+                dialstatus,
+            )
+            return
         if is_pstn and dialstatus in ("NOANSWER", "CANCEL"):
             self.logger.debug(
                 "Skip Dial %s to_pstn (COUNTER from ChannelDestroyed HangupCause)",
@@ -220,12 +232,37 @@ class LegacyEventForwarder:
                 "callid": callid,
             }
             # ART: solo Dial ANSWER to_pstn con originate_ts en pending (campo opcional).
-            if is_pstn and dialstatus == "ANSWER" and peer_id and self.pending_dial_store:
-                ring_duration = self._compute_ring_duration_from_pending(
-                    str(peer_id), event.get("timestamp"),
+            if is_pstn and dialstatus == "ANSWER":
+                stored_meta = (
+                    (self.pending_dial_store.get(str(peer_id)) or {})
+                    if (peer_id and self.pending_dial_store)
+                    else {}
                 )
-                if ring_duration is not None:
-                    event_with_call_type["ring_duration"] = ring_duration
+                if peer_id and self.pending_dial_store:
+                    ring_duration = self._compute_ring_duration_from_pending(
+                        str(peer_id), event.get("timestamp"),
+                    )
+                    if ring_duration is not None:
+                        event_with_call_type["ring_duration"] = ring_duration
+                        try:
+                            self.pending_dial_store.update(
+                                str(peer_id), {"ring_duration": ring_duration}
+                            )
+                        except Exception:
+                            pass
+                amd_val = args.get("amd")
+                if amd_val in (None, ""):
+                    amd_val = stored_meta.get("amd")
+                # Si la campaña tiene AMD activo, diferir el envío de ANSWERED_PSTN
+                # hasta que on_amd_done confirme HUMAN (evita contar MACHINE como HIT
+                # y pasar el canal a WAITING_AGENT durante el análisis [amd]).
+                if str(amd_val or "").strip().lower() in ("true", "1", "yes"):
+                    self.logger.debug(
+                        "Deferring Dial ANSWER to_pstn until AMD HUMAN confirmation (peer_id=%s, campaign_id=%s)",
+                        peer_id,
+                        business_fields.get("id_campaign"),
+                    )
+                    return
             event_json = json.dumps(event_with_call_type)
             payload = bytes(event_json, encoding="utf8")
 
@@ -614,6 +651,29 @@ class LegacyEventForwarder:
             "CHANUNAVAIL", campaign_id, contact_id, number, callid=callid
         )
 
+    def submit_dial_congestion(
+        self, campaign_id: Any, contact_id: Any, number: str, callid: Optional[str] = None
+    ) -> None:
+        """
+        Envía a process-event un Dial CONGESTION (p. ej. SIP 500/502/503 o
+        Congestion() remoto → Q.850 34/38/41/42). El dialer puede aplicar reglas
+        de incidencia y libera OML:CALLS vía CALLS_DECR_DIAL_STATUSES.
+        """
+        self._submit_dial_status(
+            "CONGESTION", campaign_id, contact_id, number, callid=callid
+        )
+
+    def submit_dial_busy(
+        self, campaign_id: Any, contact_id: Any, number: str, callid: Optional[str] = None
+    ) -> None:
+        """
+        Envía a process-event un Dial BUSY (Q.850 17 / SIP 486) cuando el fallo
+        temprano no llegó como DialStatus de Asterisk.
+        """
+        self._submit_dial_status(
+            "BUSY", campaign_id, contact_id, number, callid=callid
+        )
+
     def submit_dial_noanswer(
         self, campaign_id: Any, contact_id: Any, number: str, callid: Optional[str] = None
     ) -> None:
@@ -734,6 +794,92 @@ class LegacyEventForwarder:
                     contact_id,
                 )
 
+    def _gearman_host_port(self) -> Optional[tuple]:
+        servers = list(getattr(settings, "GEARMAN_SERVERS", None) or [])
+        if not servers:
+            return None
+        raw = str(servers[0] or "").strip()
+        if not raw:
+            return None
+        if ":" in raw:
+            host, _, port_s = raw.rpartition(":")
+            try:
+                return host.strip(), int(port_s)
+            except (TypeError, ValueError):
+                return host.strip(), 4730
+        return raw, 4730
+
+    def fetch_process_event_queued(self, force: bool = False) -> Optional[int]:
+        """Admin Gearman `status` → queued de process-event. None si no se pudo medir."""
+        now = time.time()
+        cached = self._process_event_queued_cache.get("queued")
+        ts = float(self._process_event_queued_cache.get("ts") or 0.0)
+        if (
+            not force
+            and cached is not None
+            and (now - ts) < _GEARMAN_STATUS_TTL_SEC
+        ):
+            try:
+                return int(cached)
+            except (TypeError, ValueError):
+                pass
+
+        endpoint = self._gearman_host_port()
+        if not endpoint:
+            return None
+        host, port = endpoint
+        try:
+            import socket as _socket
+
+            with _socket.create_connection((host, port), timeout=1.5) as sock:
+                sock.sendall(b"status\n")
+                sock.settimeout(1.5)
+                chunks = []
+                while True:
+                    try:
+                        data = sock.recv(8192)
+                    except _socket.timeout:
+                        break
+                    if not data:
+                        break
+                    chunks.append(data)
+                    if b".\n" in data or len(b"".join(chunks)) > 65536:
+                        break
+                raw = b"".join(chunks).decode("utf-8", errors="replace")
+        except OSError as exc:
+            self.logger.debug(
+                "LegacyEventForwarder: gearman status failed host=%s: %s", host, exc
+            )
+            return None
+
+        queued = None
+        for line in raw.splitlines():
+            if not line.strip() or "\t" not in line:
+                continue
+            parts = line.split("\t")
+            if len(parts) < 2 or parts[0].strip() != "process-event":
+                continue
+            try:
+                queued = int(parts[1])
+            except (TypeError, ValueError):
+                queued = None
+            break
+        self._process_event_queued_cache = {"ts": now, "queued": queued}
+        return queued
+
+    def should_skip_amd_latency(self) -> bool:
+        """True si process-event está por encima de AMD_LATENCY_QUEUE_MAX."""
+        try:
+            qmax = int(getattr(settings, "AMD_LATENCY_QUEUE_MAX", 100) or 0)
+        except (TypeError, ValueError):
+            qmax = 100
+        if qmax <= 0:
+            return False
+        queued = self.fetch_process_event_queued()
+        if queued is None:
+            return False
+        return queued >= qmax
+
     def compute_amd_duration_sec(
         self,
         amd_start_ts: Optional[str],
@@ -766,13 +912,22 @@ class LegacyEventForwarder:
     ) -> None:
         """
         Envía AmdLatency a process-event (solo métrica; sin status/DECR).
-        Usado en HUMAN y MACHINE al salir del dialplan [amd].
+        Usado sobre todo en HUMAN (MACHINE suele embeber amd_duration en Dial AMD).
+        P0: omitir si process-event queued >= AMD_LATENCY_QUEUE_MAX.
         """
         try:
             duration = max(0.0, float(amd_duration))
         except (TypeError, ValueError):
             return
         if campaign_id in (None, ""):
+            return
+        if self.should_skip_amd_latency():
+            self.logger.warning(
+                "LegacyEventForwarder.submit_amd_latency: skipped (process-event backlog) "
+                "campaign_id=%s amd_duration=%s",
+                campaign_id,
+                duration,
+            )
             return
         payload_dict = {
             "type": "AmdLatency",
@@ -796,22 +951,145 @@ class LegacyEventForwarder:
             duration,
         )
 
+    def submit_dial_answered_pstn(
+        self,
+        campaign_id: Any,
+        contact_id: Any,
+        number: str,
+        callid: Optional[str] = None,
+        *,
+        channel_id: Optional[str] = None,
+        ring_duration: Optional[float] = None,
+    ) -> None:
+        """
+        Envía a process-event un evento Dial ANSWER (to_pstn) una vez confirmado
+        que el canal PSTN superó AMD como HUMAN (o si el redirect a [amd] falló).
+        """
+        if channel_id and self.pending_dial_store:
+            if ring_duration is None:
+                meta = self.pending_dial_store.get(str(channel_id)) or {}
+                raw_ring = meta.get("ring_duration")
+                if raw_ring is not None:
+                    try:
+                        ring_duration = max(0.0, float(raw_ring))
+                    except (TypeError, ValueError):
+                        ring_duration = None
+                else:
+                    ring_duration = self._compute_ring_duration_from_pending(
+                        str(channel_id), None
+                    )
+            try:
+                self.pending_dial_store.update(str(channel_id), {"amd": False})
+            except Exception:
+                pass
+        base_payload: Dict[str, Any] = {
+            "type": "Dial",
+            "call_type": "to_pstn",
+            "dialstatus": "ANSWER",
+            "callid": callid or "",
+        }
+        if ring_duration is not None:
+            try:
+                base_payload["ring_duration"] = max(0.0, float(ring_duration))
+            except (TypeError, ValueError):
+                pass
+        payload_dict = self._attach_business_fields(
+            base_payload,
+            campaign_id=campaign_id,
+            contact_id=contact_id,
+            phone_number=number,
+            context="submit_dial_answered_pstn",
+        )
+        if not payload_dict:
+            return
+        if not self.client:
+            self._connect()
+        if not self.client:
+            return
+        payload_bytes = bytes(json.dumps(payload_dict), encoding="utf8")
+        self._submit_process_event(
+            payload_bytes,
+            context="submit_dial_answered_pstn",
+            summary={"campaign_id": campaign_id, "contact_id": contact_id},
+        )
+        self.logger.debug(
+            "Forwarded deferred Dial ANSWER to_pstn to Gearman: campaign_id=%s contact_id=%s",
+            campaign_id,
+            contact_id,
+        )
+
+    def submit_dial_answered_agent(
+        self,
+        campaign_id: Any,
+        contact_id: Any,
+        number: str,
+        callid: Optional[str] = None,
+    ) -> None:
+        """
+        Envía a process-event un evento Dial ANSWER (to_agent) cuando una pierna
+        agente/voicebot conecta sin emitir un evento ARI Dial (p. ej. AudioSocket
+        creado vía externalMedia).
+        """
+        payload_dict = self._attach_business_fields(
+            {
+                "type": "Dial",
+                "call_type": "to_agent",
+                "dialstatus": "ANSWER",
+                "callid": callid or "",
+            },
+            campaign_id=campaign_id,
+            contact_id=contact_id,
+            phone_number=number,
+            context="submit_dial_answered_agent",
+        )
+        if not payload_dict:
+            return
+        if not self.client:
+            self._connect()
+        if not self.client:
+            return
+        payload_bytes = bytes(json.dumps(payload_dict), encoding="utf8")
+        self._submit_process_event(
+            payload_bytes,
+            context="submit_dial_answered_agent",
+            summary={"campaign_id": campaign_id, "contact_id": contact_id},
+        )
+        self.logger.debug(
+            "Forwarded Dial ANSWER to_agent to Gearman: campaign_id=%s contact_id=%s",
+            campaign_id,
+            contact_id,
+        )
+
     def submit_dial_amd(
-        self, campaign_id: Any, contact_id: Any, number: str, callid: Optional[str] = None
+        self,
+        campaign_id: Any,
+        contact_id: Any,
+        number: str,
+        callid: Optional[str] = None,
+        amd_duration: Optional[float] = None,
     ) -> None:
         """
         Envía a process-event un evento Dial con dialstatus=AMD para que el dialer
         trate el resultado AMD MACHINE (contestador) como fallo de marcado
         (set_contact_status, decrement, send-reports). Usado cuando AMD declara
         la llamada como no HUMAN.
+
+        P0: si amd_duration está presente se embebe en el mismo job (el dialer
+        actualiza AMD_LATENCY sin job AmdLatency separado).
         """
+        base_payload: Dict[str, Any] = {
+            "type": "Dial",
+            "call_type": "to_pstn",
+            "dialstatus": "AMD",
+            "callid": callid or "",
+        }
+        if amd_duration is not None:
+            try:
+                base_payload["amd_duration"] = max(0.0, float(amd_duration))
+            except (TypeError, ValueError):
+                pass
         payload_dict = self._attach_business_fields(
-            {
-                "type": "Dial",
-                "call_type": "to_pstn",
-                "dialstatus": "AMD",
-                "callid": callid or "",
-            },
+            base_payload,
             campaign_id=campaign_id,
             contact_id=contact_id,
             phone_number=number,
@@ -830,9 +1108,10 @@ class LegacyEventForwarder:
             summary={"campaign_id": campaign_id, "contact_id": contact_id},
         )
         self.logger.debug(
-            "Forwarded Dial AMD to Gearman: campaign_id=%s contact_id=%s",
+            "Forwarded Dial AMD to Gearman: campaign_id=%s contact_id=%s amd_duration=%s",
             campaign_id,
             contact_id,
+            payload_dict.get("amd_duration"),
         )
 
     def submit_dial_exit_shortcall(

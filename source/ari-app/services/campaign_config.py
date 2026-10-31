@@ -27,6 +27,8 @@ DEFAULT_CAMPAIGN_CFG = {
     "voicebot": False,
     "voicebot_strategy": "random",
     "weight": 0,
+    "wrapuptime": 0,
+    "auto_unpause": 0,
 }
 
 
@@ -137,6 +139,26 @@ def fetch_campaign_cfg_from_redis(
     if weight < 0:
         weight = 0
 
+    wrapup_raw = normalized.get("wrapuptime")
+    try:
+        wrapuptime = int(wrapup_raw) if wrapup_raw is not None and str(wrapup_raw).strip() != "" else 0
+    except Exception:
+        wrapuptime = 0
+    if wrapuptime < 0:
+        wrapuptime = 0
+
+    auto_unpause_raw = normalized.get("auto_unpause")
+    try:
+        auto_unpause = (
+            int(auto_unpause_raw)
+            if auto_unpause_raw is not None and str(auto_unpause_raw).strip() != ""
+            else 0
+        )
+    except Exception:
+        auto_unpause = 0
+    if auto_unpause < 0:
+        auto_unpause = 0
+
     return {
         "moh_sound": moh_sound,
         "max_wait_time": max_wait_time,
@@ -149,6 +171,8 @@ def fetch_campaign_cfg_from_redis(
         "voicebot": voicebot,
         "voicebot_strategy": voicebot_strategy,
         "weight": weight,
+        "wrapuptime": wrapuptime,
+        "auto_unpause": auto_unpause,
     }
 
 

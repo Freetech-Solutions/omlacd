@@ -104,15 +104,37 @@ def _extract_campaign_id(channel: Dict[str, Any]) -> Optional[int]:
 
 
 def _is_ringing_state(channel: Dict[str, Any]) -> bool:
-    """True si el canal aún no está Up (contestado)."""
+    """True si el canal aún no está listo para agente (pre-amd_done).
+
+    - state Up + Stasis ``amd_done`` → NO ringing (humano/máquina ya clasificado).
+    - state Up + app AMD/Playback en context amd → SÍ ringing (AMD en curso;
+      el SIP ya contestó pero el dialer sigue en fase RINGING).
+    - Contar todo ``amd``+Up como ringing inflaba ringing==total y el dialer
+      audit zeraba ONCALL; por eso Up+amd_done queda fuera.
+    """
     state = channel.get("state")
     if state is None:
         return True
     state_str = str(state).strip()
+    dialplan = channel.get("dialplan") if isinstance(channel.get("dialplan"), dict) else {}
+    dp_context = str(dialplan.get("context") or "").strip().lower()
+    app_name = str(dialplan.get("app_name") or "").strip()
+    app_data = str(dialplan.get("app_data") or "")
+
     if state_str == "Up":
+        if dp_context == "amd":
+            # Clasificación terminada → waiting/oncall side del dialer.
+            if "amd_done" in app_data:
+                return False
+            # AMD o Playback de análisis aún corriendo.
+            if app_name.upper() == "AMD" or app_name == "Playback":
+                return True
         return False
     if state_str in ("Busy",):
         return False
+    # Pre-Up en context amd (Dialing/Ring, etc.) sigue siendo ringing.
+    if dp_context == "amd":
+        return True
     return state_str in RINGING_ARI_STATES or state_str != "Up"
 
 

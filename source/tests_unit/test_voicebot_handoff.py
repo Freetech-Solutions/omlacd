@@ -138,3 +138,57 @@ def test_begin_voicebot_handoff_missing_context_returns_false():
     state_store.lock.return_value = lock_cm
     state_store.get.return_value = None
     assert svc.begin_voicebot_handoff("missing") is False
+
+
+def test_inbound_voicebot_channel_destroyed_without_handoff_hangups_pstn():
+    """
+    Si el bot termina con session_escalated=False (solo cierra AudioSocket),
+    ChannelDestroyed sobre la pierna voicebot conectada debe colgar el PSTN.
+    """
+    from handlers.inbound import InboundCallHandler
+    from models import ChannelDestroyedEvent
+
+    ari = MagicMock()
+    state_store = MagicMock()
+    dist = MagicMock()
+    dist.handle_channel_failure.return_value = False
+
+    lock_cm = MagicMock()
+    lock_cm.__enter__ = MagicMock(return_value=None)
+    lock_cm.__exit__ = MagicMock(return_value=False)
+    state_store.lock.return_value = lock_cm
+
+    ctx = CallContext(call_id="c-rej-1", type=CallType.INBOUND, call_type=3)
+    ctx.bridge_id = "bridge-rej"
+    ctx.pstn_channel = "pstn-rej"
+    ctx.id_camp = 2
+    ctx.agent_id = 12
+    ctx.agent_connected_channel = "extmedia-bot"
+    ctx.is_voicebot = True
+    ctx.voicebot_transfer_waiting = False
+    ctx.is_voicebot_transfer = False
+
+    state_store.get_by_channel.return_value = ctx
+    state_store.get.return_value = ctx
+
+    handler = InboundCallHandler(
+        ari_client=ari,
+        state_store=state_store,
+        call_service=MagicMock(),
+        queue_strategy_engine=MagicMock(),
+        distribution_service=dist,
+        redis_client=MagicMock(),
+        reporter=MagicMock(),
+        agent_status_service=MagicMock(),
+    )
+
+    ev = MagicMock(spec=ChannelDestroyedEvent)
+    ev.channel = MagicMock()
+    ev.channel.id = "extmedia-bot"
+
+    handler.on_failure(ev)
+
+    ari.hangup_channel.assert_called_once_with("pstn-rej")
+    ari.destroy_bridge.assert_called_once_with("bridge-rej")
+    assert ctx.inbound_agent_hung_up_first is True
+

@@ -429,6 +429,7 @@ class InboundCallHandler(BaseHandler):
             )
 
         vb_camp = effective_queue_campaign_id(context)
+        ctx_for_status = fresh_ctx if fresh_ctx is not None else context
         if self.agent_status_service:
             try:
                 self.agent_status_service.release_voicebot_from_context(
@@ -442,6 +443,25 @@ class InboundCallHandler(BaseHandler):
                     call_id,
                     e,
                 )
+            # Agente humano: ONCALL→POSTCALL + limpieza CALLID/NODE_ID/BRIDGE_ID
+            if (
+                not getattr(ctx_for_status, "is_voicebot", False)
+                and getattr(ctx_for_status, "agent_id", None) is not None
+            ):
+                try:
+                    self.agent_status_service.set_postcall_and_clear_fields(
+                        ctx_for_status.agent_id,
+                        call_id=call_id,
+                        campaign_id=getattr(ctx_for_status, "id_camp", None),
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "InboundCallHandler.finalize_inbound_pstn_end: error set_postcall "
+                        "agente %s call_id=%s: %s",
+                        ctx_for_status.agent_id,
+                        call_id,
+                        e,
+                    )
 
         try:
             self.state_store.unregister(call_id)
@@ -1195,9 +1215,18 @@ class InboundCallHandler(BaseHandler):
             # Caso 1: destrucción del leg de agente actual
             # -----------------------------------------------------------------
             ctx_agent = self.state_store.get_by_channel(channel_id)
-            if ctx_agent and self.distribution_service.handle_channel_failure(ctx_agent.call_id, channel_id):
-                vb_camp = effective_queue_campaign_id(ctx_agent)
-                if getattr(ctx_agent, "is_voicebot", False) and getattr(ctx_agent, "agent_id", None) is not None:
+            failure_handled = False
+            if ctx_agent and self.distribution_service:
+                failure_handled = self.distribution_service.handle_channel_failure(
+                    ctx_agent.call_id, channel_id
+                )
+            elif self.distribution_service:
+                failure_handled = self.distribution_service.handle_channel_failure_by_channel(
+                    channel_id
+                )
+            if failure_handled:
+                vb_camp = effective_queue_campaign_id(ctx_agent) if ctx_agent else None
+                if ctx_agent and getattr(ctx_agent, "is_voicebot", False) and getattr(ctx_agent, "agent_id", None) is not None:
                     if self.agent_status_service:
                         try:
                             self.agent_status_service.release_voicebot_from_context(
@@ -1263,6 +1292,46 @@ class InboundCallHandler(BaseHandler):
                             vb_camp_leg,
                             e,
                         )
+                # AudioSocket / externalMedia: cuando el bot termina sin escalar
+                # (session_escalated=False), el cierre TCP suele llegar como
+                # ChannelDestroyed sin pasar por el mismo flujo de on_hangup_request.
+                # Si la pierna era la conectada y no hay handoff/transfer en curso,
+                # colgar el PSTN y destruir el bridge para no dejar al cliente colgado.
+                if (
+                    channel_id == active_agent_channel(context)
+                    and not getattr(context, "voicebot_transfer_waiting", False)
+                    and not getattr(context, "is_voicebot_transfer", False)
+                    and not getattr(context, "transfer_in_progress", False)
+                ):
+                    self._hangup_pstn_and_destroy_bridge_after_agent(
+                        context, source="voicebot_channel_destroyed"
+                    )
+                    return
+
+            # Agente humano: pierna conectada destruida sin transferencia → POSTCALL
+            if (
+                is_agent_leg
+                and not getattr(context, "is_voicebot", False)
+                and getattr(context, "agent_id", None) is not None
+                and channel_id == active_agent_channel(context)
+                and not getattr(context, "transfer_in_progress", False)
+                and not getattr(context, "voicebot_transfer_waiting", False)
+                and self.agent_status_service
+            ):
+                try:
+                    self.agent_status_service.set_postcall_and_clear_fields(
+                        context.agent_id,
+                        call_id=context.call_id,
+                        campaign_id=getattr(context, "id_camp", None),
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "InboundCallHandler.on_failure: error set_postcall agente %s "
+                        "call_id=%s: %s",
+                        context.agent_id,
+                        context.call_id,
+                        e,
+                    )
 
             pstn_channel = getattr(context, "pstn_channel", None)
             uniqueid_pstn = getattr(context, "uniqueid_pstn", None)
@@ -1390,68 +1459,101 @@ class InboundCallHandler(BaseHandler):
                 )
                 return
 
-            logger.info(
-                "InboundCallHandler.on_hangup_request: agente colgó (call_id=%s), colgando PSTN y destruyendo bridge",
-                context.call_id,
+            self._hangup_pstn_and_destroy_bridge_after_agent(
+                context, source="on_hangup_request"
             )
-            # Marcar que quien cortó fue el agente; on_pstn_stasis_end usará esto para reportar quien_corto=1
-            try:
-                with self.state_store.lock(context.call_id):
-                    fresh = self.state_store.get(context.call_id)
-                    if fresh:
-                        fresh.inbound_agent_hung_up_first = True
-                        self.state_store.register_unsafe(context.call_id, fresh)
-            except Exception as e:
-                logger.warning(
-                    "InboundCallHandler.on_hangup_request: no se pudo marcar inbound_agent_hung_up_first: %s",
-                    e,
-                )
-            if pstn_channel.strip():
-                try:
-                    hangup_result = self.ari_client.hangup_channel(pstn_channel)
-                    if hangup_result:
-                        logger.info(
-                            "InboundCallHandler.on_hangup_request: PSTN leg %s colgado (call_id=%s)",
-                            pstn_channel,
-                            context.call_id,
-                        )
-                    else:
-                        logger.debug(
-                            "InboundCallHandler.on_hangup_request: hangup_channel retornó False para %s",
-                            pstn_channel,
-                        )
-                except Exception as e:
-                    logger.error(
-                        "InboundCallHandler.on_hangup_request: error colgando PSTN %s: %s",
-                        pstn_channel,
-                        e,
-                        exc_info=True,
-                    )
-            if bridge_id.strip():
-                try:
-                    destroy_result = self.ari_client.destroy_bridge(bridge_id)
-                    if destroy_result:
-                        logger.info(
-                            "InboundCallHandler.on_hangup_request: bridge %s destruido (call_id=%s)",
-                            bridge_id,
-                            context.call_id,
-                        )
-                    else:
-                        logger.debug(
-                            "InboundCallHandler.on_hangup_request: destroy_bridge retornó False para %s",
-                            bridge_id,
-                        )
-                except Exception as e:
-                    logger.error(
-                        "InboundCallHandler.on_hangup_request: error destruyendo bridge %s: %s",
-                        bridge_id,
-                        e,
-                        exc_info=True,
-                    )
         except Exception as e:
             logger.error(
                 "InboundCallHandler.on_hangup_request: Error inesperado: %s", e, exc_info=True
             )
+
+    def _hangup_pstn_and_destroy_bridge_after_agent(
+        self, context: Any, *, source: str = "on_hangup_request"
+    ) -> None:
+        """
+        Cuelga el PSTN y destruye el bridge cuando la pierna de agente/voicebot
+        termina sin transferencia. Idempotente ante llamadas repetidas (404 ARI).
+        """
+        pstn_channel = getattr(context, "pstn_channel", None) or ""
+        bridge_id = getattr(context, "bridge_id", None) or ""
+        if not pstn_channel or not bridge_id:
+            return
+        logger.info(
+            "InboundCallHandler (%s): pierna agente/voicebot finalizó (call_id=%s); "
+            "colgando PSTN y destruyendo bridge",
+            source,
+            context.call_id,
+        )
+        try:
+            with self.state_store.lock(context.call_id):
+                fresh = self.state_store.get(context.call_id)
+                if fresh:
+                    if getattr(fresh, "voicebot_transfer_waiting", False) or getattr(
+                        fresh, "transfer_in_progress", False
+                    ):
+                        logger.info(
+                            "InboundCallHandler (%s): abortando cuelgue PSTN por transfer/handoff "
+                            "activo (call_id=%s)",
+                            source,
+                            context.call_id,
+                        )
+                        return
+                    fresh.inbound_agent_hung_up_first = True
+                    self.state_store.register_unsafe(context.call_id, fresh)
+        except Exception as e:
+            logger.warning(
+                "InboundCallHandler (%s): no se pudo marcar inbound_agent_hung_up_first: %s",
+                source,
+                e,
+            )
+        if pstn_channel.strip():
+            try:
+                hangup_result = self.ari_client.hangup_channel(pstn_channel)
+                if hangup_result:
+                    logger.info(
+                        "InboundCallHandler (%s): PSTN leg %s colgado (call_id=%s)",
+                        source,
+                        pstn_channel,
+                        context.call_id,
+                    )
+                else:
+                    logger.debug(
+                        "InboundCallHandler (%s): hangup_channel retornó False para %s",
+                        source,
+                        pstn_channel,
+                    )
+            except Exception as e:
+                logger.error(
+                    "InboundCallHandler (%s): error colgando PSTN %s: %s",
+                    source,
+                    pstn_channel,
+                    e,
+                    exc_info=True,
+                )
+        if bridge_id.strip():
+            try:
+                destroy_result = self.ari_client.destroy_bridge(bridge_id)
+                if destroy_result:
+                    logger.info(
+                        "InboundCallHandler (%s): bridge %s destruido (call_id=%s)",
+                        source,
+                        bridge_id,
+                        context.call_id,
+                    )
+                else:
+                    logger.debug(
+                        "InboundCallHandler (%s): destroy_bridge retornó False para %s",
+                        source,
+                        bridge_id,
+                    )
+            except Exception as e:
+                logger.error(
+                    "InboundCallHandler (%s): error destruyendo bridge %s: %s",
+                    source,
+                    bridge_id,
+                    e,
+                    exc_info=True,
+                )
 
     def on_pstn_stasis_end(self, channel_id: str) -> None:
         """

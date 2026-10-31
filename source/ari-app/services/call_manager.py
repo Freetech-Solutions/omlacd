@@ -470,27 +470,60 @@ class CallActionService:
             caller_id = None
         if caller_id is None or caller_id == '':
             caller_id = tel_customer or number or ''
-        
+
+        call_type_raw = metadata.get("call_type") or metadata.get("id_calltype") or ""
+        id_camp_meta = metadata.get("id_camp") or metadata.get("campaign_id") or ""
+        amd_enabled = False
+        if self.redis_client and id_camp_meta and str(id_camp_meta) != "0":
+            try:
+                raw_amd = self.redis_client.hget(f"OML:CAMP:{id_camp_meta}", "AMD")
+                if isinstance(raw_amd, bytes):
+                    raw_amd = raw_amd.decode("utf-8", errors="ignore")
+                amd_enabled = str(raw_amd or "").strip().lower() in ("true", "1", "yes")
+            except Exception:
+                amd_enabled = False
+        metadata_with_amd = {**metadata, "amd": "1" if amd_enabled else "0"}
+
         # Construir appArgs de forma centralizada
         app_args = build_app_args(
-            metadata,
+            metadata_with_amd,
             related_call_id=related_call_id,
             default_channel_type=ChannelType.TO_PSTN.value,
         )
-        
+
         # Variables de canal OML para el leg PSTN en llamadas DIALER (tipo 2)
-        call_type_raw = metadata.get("call_type") or metadata.get("id_calltype")
         if call_type_raw in (2, "2", CallType.DIALER_ID):
             _id_camp = metadata.get("id_camp") or metadata.get("campaign_id") or "0"
             _id_customer = metadata.get("id_customer") or metadata.get("contact_id") or "0"
             variables = {"OMLCAMPID": str(_id_camp), "OMLCODCLI": str(_id_customer)}
         else:
             variables = None
-        
+
         # Timeout de negocio (timer acd-app) vs timeout ARI (margen de seguridad).
         business_timeout = timeout if timeout is not None else settings.DEFAULT_ORIGINATE_TIMEOUT
         safety_margin = int(getattr(settings, "ORIGINATE_SAFETY_MARGIN_SEC", 2))
         ari_timeout = business_timeout + safety_margin
+
+        pre_channel_id = str(uuid.uuid4())
+        stored_meta = {
+            "call_type": call_type_raw,
+            "channel_type": ChannelType.TO_PSTN.value,
+            "id_camp": id_camp_meta,
+            "campaign_id": id_camp_meta,
+            "id_customer": metadata.get("id_customer", metadata.get("contact_id", "")),
+            "tel_customer": metadata.get("tel_customer", metadata.get("phone_number", number)),
+            "originate_ts": datetime.now().astimezone().isoformat(),
+            "originate_timeout": business_timeout,
+            "local_cancel": False,
+            "amd": amd_enabled,
+        }
+        if related_call_id:
+            stored_meta["related_call_id"] = related_call_id
+        callid = metadata.get("callid") or metadata.get("uniqueid") or related_call_id
+        if callid:
+            stored_meta["callid"] = str(callid)
+        if self.pending_dial_store:
+            self.pending_dial_store.register(pre_channel_id, stored_meta)
 
         self.logger.info(
             f"🚀 Originando llamada hacia PSTN: {endpoint} "
@@ -505,6 +538,7 @@ class CallActionService:
             appArgs=app_args,
             variables=variables,
             timeout=ari_timeout,
+            channelId=pre_channel_id,
         )
 
         if not result.get("ok"):
@@ -512,6 +546,8 @@ class CallActionService:
                 "❌ Error crítico al originar hacia PSTN después de reintentos: %s",
                 result.get("error"),
             )
+            if self.pending_dial_store:
+                self.pending_dial_store.pop(pre_channel_id)
             return None
 
         data = result.get("data") or {}
@@ -521,28 +557,12 @@ class CallActionService:
                 "❌ Respuesta inválida de ARI al originar hacia PSTN, falta 'id': %s",
                 data,
             )
+            if self.pending_dial_store:
+                self.pending_dial_store.pop(pre_channel_id)
             return None
 
-        # Registrar metadata para LegacyEventForwarder / clasificación CANCEL vs 480.
-        if self.pending_dial_store:
-            call_type_raw = metadata.get("call_type") or metadata.get("id_calltype") or ""
-            id_camp = metadata.get("id_camp") or metadata.get("campaign_id") or ""
-            stored_meta = {
-                "call_type": call_type_raw,
-                "channel_type": ChannelType.TO_PSTN.value,
-                "id_camp": id_camp,
-                "campaign_id": id_camp,
-                "id_customer": metadata.get("id_customer", metadata.get("contact_id", "")),
-                "tel_customer": metadata.get("tel_customer", metadata.get("phone_number", number)),
-                "originate_ts": datetime.now().astimezone().isoformat(),
-                "originate_timeout": business_timeout,
-                "local_cancel": False,
-            }
-            if related_call_id:
-                stored_meta["related_call_id"] = related_call_id
-            callid = metadata.get("callid") or metadata.get("uniqueid") or related_call_id
-            if callid:
-                stored_meta["callid"] = str(callid)
+        if self.pending_dial_store and pstn_channel_id != pre_channel_id:
+            self.pending_dial_store.pop(pre_channel_id)
             self.pending_dial_store.register(pstn_channel_id, stored_meta)
 
         if self.pstn_ring_timer:
@@ -726,7 +746,27 @@ class CallActionService:
             f"(timeout={timeout_value}s, related_call_id={related_call_id}, "
             f"callid={callid}, agent_id={agent_id})"
         )
-        
+
+        # Pre-registrar metadata en pending_dial_store cuando viene channel_id
+        # (p. ej. DistributionService genera UUID antes del originate): el evento
+        # ARI Dial (RINGING/ANSWER con auto-answer) puede llegar mientras
+        # originate_channel_op sigue bloqueado esperando el response HTTP.
+        call_type_raw = metadata.get("call_type") or metadata.get("id_calltype")
+        is_dialer_agent_leg = call_type_raw in (2, "2", CallType.DIALER_ID)
+        stored_meta = None
+        if self.pending_dial_store and is_dialer_agent_leg:
+            stored_meta = {
+                "call_type": call_type_raw,
+                "channel_type": ChannelType.TO_AGENT.value,
+                "id_camp": id_campaign,
+                "id_customer": id_customer,
+                "tel_customer": phone_number,
+                "callid": callid,
+                "uniqueid": uniqueid_tecnico or callid,
+            }
+            if channel_id:
+                self.pending_dial_store.register(channel_id, stored_meta)
+
         result = self.ari_client.originate_channel_op(
             endpoint=endpoint,
             app=self.config['ARI_APP'],
@@ -742,6 +782,8 @@ class CallActionService:
                 "❌ Error crítico al originar hacia agente con headers después de reintentos: %s",
                 result.get("error"),
             )
+            if self.pending_dial_store and channel_id and is_dialer_agent_leg:
+                self.pending_dial_store.pop(channel_id)
             return None
 
         data = result.get("data") or {}
@@ -751,6 +793,8 @@ class CallActionService:
                 "❌ Respuesta inválida de ARI al originar hacia agente con headers, falta 'id': %s",
                 data,
             )
+            if self.pending_dial_store and channel_id and is_dialer_agent_leg:
+                self.pending_dial_store.pop(channel_id)
             return None
 
         if channel_id and agent_channel_id != channel_id:
@@ -760,22 +804,13 @@ class CallActionService:
                 channel_id,
                 agent_channel_id,
             )
+            if self.pending_dial_store and is_dialer_agent_leg:
+                self.pending_dial_store.pop(channel_id)
 
-        # Registrar metadata para LegacyEventForwarder: eventos Dial de la pierna agente
-        # (call_type=2 DIALER) para que se reenvíen a process-event con call_type=to_agent.
-        if self.pending_dial_store:
-            call_type_raw = metadata.get("call_type") or metadata.get("id_calltype")
-            if call_type_raw in (2, "2", CallType.DIALER_ID):
-                stored_meta = {
-                    "call_type": call_type_raw,
-                    "channel_type": ChannelType.TO_AGENT.value,
-                    "id_camp": id_campaign,
-                    "id_customer": id_customer,
-                    "tel_customer": phone_number,
-                    "callid": callid,
-                    "uniqueid": uniqueid_tecnico or callid,
-                }
-                self.pending_dial_store.register(agent_channel_id, stored_meta)
+        # Registrar metadata para LegacyEventForwarder si no tenía channel_id previo
+        # o si ARI devolvió un id distinto.
+        if self.pending_dial_store and stored_meta is not None and agent_channel_id != channel_id:
+            self.pending_dial_store.register(agent_channel_id, stored_meta)
 
         self.logger.info(
             f"✅ Canal de agente creado con headers: {agent_channel_id}"
@@ -963,6 +998,7 @@ class CallActionService:
             "related_call_id": related_call_id,
             "callid": callid,
             "agentic_leg": "1",
+            "voicebot_transport": "audiosocket",
             "audiosocket_uuid": session_uuid,
         }
         if self.pending_dial_store:

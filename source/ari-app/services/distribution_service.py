@@ -783,14 +783,23 @@ class DistributionService:
         lock_key: str,
         *,
         restore_ready: bool = False,
+        failure_cooldown: bool = False,
         use_status_reservation: bool = False,
     ) -> None:
-        """Libera reserva de agente (lock/lease + opcional DIALING→READY)."""
+        """Libera reserva de agente (lock/lease + opcional DIALING→READY o cooldown)."""
         try:
             if use_status_reservation and self.agent_status_service:
-                self.agent_status_service.release_distribution_reservation(
-                    agent_id, call_id, restore_ready=restore_ready
-                )
+                if failure_cooldown:
+                    cooldown = int(
+                        getattr(settings, "AGENT_OFFER_FAILURE_COOLDOWN_SEC", 5) or 5
+                    )
+                    self.agent_status_service.penalize_failed_distribution_offer(
+                        agent_id, call_id, cooldown
+                    )
+                else:
+                    self.agent_status_service.release_distribution_reservation(
+                        agent_id, call_id, restore_ready=restore_ready
+                    )
             else:
                 try:
                     current = self.redis_client.get(lock_key)
@@ -1393,11 +1402,13 @@ class DistributionService:
                 attempt_agent_id = self._active_attempt_agents.pop(call_id, None)
                 self._active_attempt_loop_gens.pop(call_id, None)
             if attempt_agent_id is not None:
+                # Abort de offer en vuelo (timeout/stop): cooldown, no READY inmediato
+                # (evita que otra llamada robe al agente en la misma ráfaga).
                 self._release_agent_reservation(
                     int(attempt_agent_id),
                     call_id,
                     RedisKeys.agent_lock(str(attempt_agent_id)),
-                    restore_ready=True,
+                    failure_cooldown=True,
                     use_status_reservation=True,
                 )
             if agent_ch:
@@ -1421,6 +1432,7 @@ class DistributionService:
         for key in (
             RedisKeys.agent_lock(agent_id_str),
             RedisKeys.agent_reservation_lease(agent_id_str),
+            RedisKeys.agent_offer_cooldown(agent_id_str),
         ):
             try:
                 current = self.redis_client.get(key)
@@ -1662,7 +1674,8 @@ class DistributionService:
         el siguiente candidato (solo attempt_finished, no stop_event). Retorna True
         si era el agente actual; False si no.
 
-        Libera lock/lease Redis y revierte DIALING→READY para que el agente vuelva a ser candidato.
+        Libera lock Redis y aplica cooldown de lease (sin READY inmediato) para evitar
+        re-origenes en ráfaga al mismo agente ocupado/rechazado.
         """
         failed_agent_id: Optional[int] = None
         with self._dialing_lock:
@@ -1678,7 +1691,52 @@ class DistributionService:
                 failed_agent_id,
                 call_id,
                 RedisKeys.agent_lock(str(failed_agent_id)),
-                restore_ready=True,
+                failure_cooldown=True,
+                use_status_reservation=True,
+            )
+
+        _, attempt_finished = self._get_or_create_call_events(call_id)
+        attempt_finished.set()
+        return True
+
+    def handle_channel_failure_by_channel(self, channel_id: str) -> bool:
+        """
+        Fallback cuando state_store aún no indexó el canal (Destroyed durante originate).
+        Busca channel_id en _active_attempts y aplica el mismo cooldown.
+        """
+        if not channel_id:
+            return False
+        matched_call_id: Optional[str] = None
+        with self._dialing_lock:
+            for call_id, active_ch in self._active_attempts.items():
+                if active_ch == channel_id:
+                    matched_call_id = call_id
+                    break
+        if matched_call_id is None:
+            return False
+        return self.handle_channel_failure(matched_call_id, channel_id)
+
+    def handle_agent_leg_dial_failure(self, call_id: str) -> bool:
+        """
+        Backup ante Dial NOANSWER/BUSY/CANCEL to_agent: no depende del channel_id ARI.
+        Aplica cooldown al agente del intento activo y desbloquea el loop.
+        """
+        if not call_id:
+            return False
+        failed_agent_id: Optional[int] = None
+        with self._dialing_lock:
+            if call_id not in self._active_attempts:
+                return False
+            failed_agent_id = self._active_attempt_agents.pop(call_id, None)
+            self._active_attempts.pop(call_id, None)
+            self._active_attempt_loop_gens.pop(call_id, None)
+
+        if failed_agent_id is not None:
+            self._release_agent_reservation(
+                failed_agent_id,
+                call_id,
+                RedisKeys.agent_lock(str(failed_agent_id)),
+                failure_cooldown=True,
                 use_status_reservation=True,
             )
 
@@ -1894,6 +1952,22 @@ class DistributionService:
                                 self._active_attempt_agents[call_id] = candidate.agent_id
                                 self._active_attempt_loop_gens[call_id] = loop_gen
 
+                            # Indexar antes del originate: ChannelDestroyed puede llegar
+                            # mientras ARI HTTP aún bloquea y get_by_channel fallaría.
+                            try:
+                                with self.state_store.lock(call_id):
+                                    ctx = self.state_store.get(call_id)
+                                    if ctx:
+                                        ctx.agent_attempt_channel = pre_generated_channel_id
+                                        self.state_store.register_unsafe(call_id, ctx)
+                            except Exception:
+                                logger.debug(
+                                    "DistributionLoop: no se pudo pre-registrar "
+                                    "agent_attempt_channel call_id=%s",
+                                    call_id,
+                                    exc_info=True,
+                                )
+
                             try:
                                 agent_channel_id = self.call_service.dial_agent_with_headers(
                                     agent_sip=candidate.interface,
@@ -1916,7 +1990,7 @@ class DistributionService:
                                         candidate.agent_id,
                                         call_id,
                                         lock_key,
-                                        restore_ready=True,
+                                        failure_cooldown=True,
                                         use_status_reservation=True,
                                     )
                                 continue
@@ -1928,7 +2002,7 @@ class DistributionService:
                                         candidate.agent_id,
                                         call_id,
                                         lock_key,
-                                        restore_ready=True,
+                                        failure_cooldown=True,
                                         use_status_reservation=True,
                                     )
                                 continue
@@ -1952,7 +2026,7 @@ class DistributionService:
                                         candidate.agent_id,
                                         call_id,
                                         lock_key,
-                                        restore_ready=True,
+                                        failure_cooldown=True,
                                         use_status_reservation=True,
                                     )
                                 return
@@ -1977,7 +2051,7 @@ class DistributionService:
                                         candidate.agent_id,
                                         call_id,
                                         lock_key,
-                                        restore_ready=True,
+                                        failure_cooldown=True,
                                         use_status_reservation=True,
                                     )
                                 continue
@@ -2001,7 +2075,7 @@ class DistributionService:
                                     candidate.agent_id,
                                     call_id,
                                     lock_key,
-                                    restore_ready=True,
+                                    failure_cooldown=True,
                                     use_status_reservation=True,
                                 )
 
@@ -2034,7 +2108,7 @@ class DistributionService:
                         attempt_agent_id,
                         call_id,
                         RedisKeys.agent_lock(str(attempt_agent_id)),
-                        restore_ready=True,
+                        failure_cooldown=True,
                         use_status_reservation=True,
                     )
         except Exception as e:
@@ -2209,20 +2283,12 @@ class DistributionService:
                 timeout_agent_id,
                 call_id,
                 RedisKeys.agent_lock(str(timeout_agent_id)),
-                restore_ready=True,
+                failure_cooldown=True,
                 use_status_reservation=True,
             )
 
         with self._on_queue_timeout_callbacks_lock:
             cb = self._on_queue_timeout_callbacks.pop(call_id, None)
-        if cb is not None and pstn_channel_id:
-            try:
-                cb(call_id, pstn_channel_id)
-            except Exception:
-                logger.exception(
-                    "DistributionService._on_queue_timeout: error en callback para call_id=%s",
-                    call_id,
-                )
 
         try:
             mark_result = self.state_store.mark_call_ended_atomic(call_id)
@@ -2239,6 +2305,15 @@ class DistributionService:
                 "_on_queue_timeout: error marcando llamada %s como finalizada", call_id
             )
             return
+
+        if cb is not None and pstn_channel_id:
+            try:
+                cb(call_id, pstn_channel_id)
+            except Exception:
+                logger.exception(
+                    "DistributionService._on_queue_timeout: error en callback para call_id=%s",
+                    call_id,
+                )
 
         if self.queue_event_manager:
             try:
