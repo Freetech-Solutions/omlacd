@@ -141,6 +141,12 @@ class PstnRingTimerService:
 
     def _on_timeout(self, channel_id: str) -> None:
         with self._lock:
+            if channel_id not in self._timers:
+                self.logger.debug(
+                    "PstnRingTimer: timer for channel_id=%s was already cancelled",
+                    channel_id,
+                )
+                return
             self._timers.pop(channel_id, None)
         if self._store:
             updated = self._store.update(channel_id, {"local_cancel": True})

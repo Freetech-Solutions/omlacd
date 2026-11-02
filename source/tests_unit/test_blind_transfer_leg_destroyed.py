@@ -199,7 +199,9 @@ class TestBlindTransferLegDestroyed(unittest.TestCase):
         manager.recover_after_blind_transfer_leg_failed("1776194678.27")
 
         self.mock_ari.delete.assert_called_once_with("bridges/834d13c7-bridge/moh")
-        mock_agent_status.set_postcall_and_clear_fields.assert_called_once_with(1)
+        mock_agent_status.set_postcall_and_clear_fields.assert_called_once_with(
+            1, call_id="1776194678.27"
+        )
 
     def test_recover_skips_postcall_for_voicebot(self):
         ctx = _ctx_blind_pending()
@@ -261,7 +263,53 @@ class TestBlindTransferLegDestroyed(unittest.TestCase):
             cancel_timer=True,
             hangup_agent_channel=False,
         )
-        mock_agent_status.set_postcall_and_clear_fields.assert_called_once_with(1)
+        mock_agent_status.set_postcall_and_clear_fields.assert_called_once_with(
+            1, call_id="1776194678.27"
+        )
+
+    def test_progressive_failed_blind_to_agent_hangs_up_pstn_and_preserves_answered_history(self):
+        ctx = _ctx_blind_pending()
+        ctx.type = CallType.PROGRESSIVE
+        ctx.call_type = CallType.DIALER_ID
+        ctx.pstn_channel = "pstn-prog-live"
+        ctx.uniqueid_pstn = "pstn-prog-uid"
+        ctx.agent_segments = []
+        registry = _FakeRegistry(ctx)
+        mock_agent_status = MagicMock()
+        mock_distribution = MagicMock()
+        manager = TransferManager(
+            state_store=registry,
+            ari_client=self.mock_ari,
+            reporter=self.mock_reporter,
+            agent_status_service=mock_agent_status,
+            distribution_service=mock_distribution,
+        )
+
+        ok = manager._on_blind_transfer_leg_destroyed_locked(
+            ctx,
+            "1776194678.27",
+            "1776194696.35",
+            "busy",
+        )
+        self.assertTrue(ok)
+        self.assertTrue(ctx.inbound_agent_hung_up_first)
+        self.assertTrue(ctx.blind_transfer_attempted)
+        self.assertIsNone(ctx.agent_answered_ts)
+        self.assertEqual(len(ctx.agent_segments), 1)
+        self.assertEqual(ctx.agent_segments[0]["agent_id"], 1)
+
+        manager.recover_after_blind_transfer_leg_failed("1776194678.27")
+
+        self.mock_ari.delete.assert_called_once_with("bridges/834d13c7-bridge/moh")
+        self.mock_ari.hangup_channel.assert_called_once_with("pstn-prog-live")
+        mock_distribution.stop_distribution.assert_called_once_with(
+            "1776194678.27",
+            cancel_timer=True,
+            hangup_agent_channel=False,
+        )
+        mock_agent_status.set_postcall_and_clear_fields.assert_called_once_with(
+            1, call_id="1776194678.27"
+        )
 
     def test_manual_failed_blind_transfer_does_not_hangup_pstn(self):
         ctx = _ctx_blind_pending()
@@ -281,7 +329,9 @@ class TestBlindTransferLegDestroyed(unittest.TestCase):
 
         self.mock_ari.delete.assert_called_once_with("bridges/834d13c7-bridge/moh")
         self.mock_ari.hangup_channel.assert_not_called()
-        mock_agent_status.set_postcall_and_clear_fields.assert_called_once_with(1)
+        mock_agent_status.set_postcall_and_clear_fields.assert_called_once_with(
+            1, call_id="1776194678.27"
+        )
 
 
 if __name__ == "__main__":

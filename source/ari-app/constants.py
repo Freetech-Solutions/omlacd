@@ -88,7 +88,8 @@ AST_CAUSE_TO_EVENT = {
     27: HangupCause.ERROR.value,         # Destination out of order
     28: HangupCause.ERROR.value,         # Invalid number format
     34: HangupCause.CONGESTION.value,    # No circuit/channel available
-    38: HangupCause.CHANUNAVAIL.value,   # Network out of order
+    # SIP 500 Internal Server Error (p. ej. Congestion() remoto) → Q.850 38.
+    38: HangupCause.CONGESTION.value,    # Network out of order / SIP 500
     41: HangupCause.CONGESTION.value,    # Temporary failure
     42: HangupCause.CONGESTION.value,    # Switching equipment congestion
     58: HangupCause.CHANUNAVAIL.value,   # Bearer capability not presently available
@@ -110,7 +111,7 @@ def map_unanswered_hangup_to_event(
     (603→603_DECLINED, 403→403_FORBIDDEN, 404→404_NOT_FOUND, 405→405_NOT_ALLOWED,
      406→406_NO_ACCEPTABLE, 408→408_REQUEST_TIMEOUT,
      480→480_TEMPORARILY_UNAVAILABLE, 487→487_REQUEST_TERMINATED,
-     488→488_NOT_ACCEPTABLE_HERE, 608→608_REJECTED).
+     488→488_NOT_ACCEPTABLE_HERE, 500/502/503→CONGESTION, 608→608_REJECTED).
     """
     if tech_cause == 603:
         return HangupCause.DECLINED.value
@@ -130,6 +131,9 @@ def map_unanswered_hangup_to_event(
         return HangupCause.REQUEST_TERMINATED.value
     if tech_cause == 488:
         return HangupCause.NOT_ACCEPTABLE_HERE.value
+    # Congestion() remoto / ITSP overload: SIP 5xx → CONGESTION (no CHANUNAVAIL).
+    if tech_cause in (500, 502, 503):
+        return HangupCause.CONGESTION.value
     if tech_cause == 608:
         return HangupCause.SIP_REJECTED.value
     if cause is not None:
@@ -286,13 +290,18 @@ class RedisKeys:
 
     @staticmethod
     def pending_amd(node_id: str, channel_id: str) -> str:
-        """Estado pendiente post-AMD para canal (metadata para continuar distribución). TTL recomendado ~300s."""
+        """Estado pendiente post-AMD para canal (metadata para continuar distribución)."""
         return f"acd:{node_id}:pending_amd:{channel_id}"
 
     @staticmethod
     def agent_hash(agent_id: str) -> str:
         """Hash del agente (OML:AGENT:{agent_id}). Incluye STATUS, SIP, VOICEBOT_ADDR, etc."""
         return f"OML:AGENT:{agent_id}"
+
+    @staticmethod
+    def audiosocket_session(session_uuid: str) -> str:
+        """Sesión AudioSocket con variables de negocio (JSON) para el server CES."""
+        return f"OML:AUDIOSOCKET:{session_uuid}"
 
     @staticmethod
     def agent_lock(agent_id: str) -> str:
@@ -303,3 +312,12 @@ class RedisKeys:
     def agent_reservation_lease(agent_id: str) -> str:
         """Lease de reserva de agente (mismo TTL que agent_lock; permite lazy cleanup de DIALING)."""
         return f"acd:lease:agent:{agent_id}"
+
+    @staticmethod
+    def agent_offer_cooldown(agent_id: str) -> str:
+        """Cooldownoldown post-offer-fallido o wrapup post-colgado; bloquea re-reserve aunque READY."""
+        return f"acd:cooldown:agent:{agent_id}"
+
+
+# TTL de pending_amd: cubre TOTAL_ANALYSIS_TIME largo + margen de redirect/cola ARI.
+PENDING_AMD_TTL_SEC = 900

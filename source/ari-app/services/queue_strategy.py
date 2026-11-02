@@ -172,6 +172,10 @@ class QueueStrategyEngine:
         if status is not AgentStatus.READY:
             return None
 
+        # Cooldown post-fallo puede dejar READY sin lock/lease; no re-ofrecer aún
+        if self._has_active_reservation(agent_id):
+            return None
+
         # Penalty de distribución viene de OML:CAMP:{id}:MEMBER-PENALTY (membresía).
         # No usar penalty del hash OML:AGENT (nadie lo escribe para colas).
         penalty = 0
@@ -242,14 +246,19 @@ class QueueStrategyEngine:
         return penalties
 
     def _has_active_reservation(self, agent_id: int) -> bool:
-        """True si el agente tiene lock o lease de reserva activos."""
+        """True si el agente tiene lock, lease o cooldown de offer activos."""
         if self.agent_status_service:
             return self.agent_status_service.has_active_distribution_reservation(agent_id)
         try:
             agent_id_str = str(agent_id)
             lock_key = RedisKeys.agent_lock(agent_id_str)
             lease_key = RedisKeys.agent_reservation_lease(agent_id_str)
-            return bool(self.redis.exists(lock_key) or self.redis.exists(lease_key))
+            cooldown_key = RedisKeys.agent_offer_cooldown(agent_id_str)
+            return bool(
+                self.redis.exists(lock_key)
+                or self.redis.exists(lease_key)
+                or self.redis.exists(cooldown_key)
+            )
         except RedisError:
             return True
 

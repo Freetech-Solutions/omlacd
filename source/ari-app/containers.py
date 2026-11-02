@@ -283,7 +283,7 @@ class ACDContainer(containers.DeclarativeContainer):
         inbound_handler=inbound_handler,
     )
 
-    progressive_handler = providers.Factory(
+    progressive_handler = providers.Singleton(
         ProgressiveCampaignHandler,
         ari_client=ari_client,
         state_store=state_store,

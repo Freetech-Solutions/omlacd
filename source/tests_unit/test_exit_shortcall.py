@@ -258,6 +258,29 @@ class TestRouterChannelDestroyedStateUpReportsShortcallOrAnswered(unittest.TestC
         # Meta ya limpiada en timeout; igual se intenta ChannelDestroyed para liberar dialer si queda meta.
         self.mock_legacy_forwarder.handle_channel_destroyed.assert_called_once_with(channel_id)
 
+    def test_state_up_after_dial_amd_skips_channel_destroyed(self):
+        """Tras on_amd_done MACHINE (credit_via_dial_amd), ChannelDestroyed no reenvía a dialer."""
+        channel_id = "pstn-after-amd"
+        mock_pstn_reported_store = MagicMock()
+        mock_pstn_reported_store.is_reported.return_value = True
+        mock_pstn_reported_store.is_dial_amd_credit_released.return_value = True
+        router = AcDRouter(
+            ari_client=self.mock_ari,
+            state_store=self.mock_state_store,
+            reporter=self.mock_reporter,
+            handlers={},
+            legacy_forwarder=self.mock_legacy_forwarder,
+            route_validator=self.mock_route_validator,
+            pstn_reported_store=mock_pstn_reported_store,
+        )
+        self.mock_legacy_forwarder.get_pending_dial_metadata.return_value = None
+        event = MagicMock()
+        event.channel.id = channel_id
+        event.channel.state = "Up"
+        router._handle_channel_destroyed(event)
+        self.mock_legacy_forwarder.submit_dial_amd.assert_not_called()
+        self.mock_legacy_forwarder.handle_channel_destroyed.assert_not_called()
+
     def test_state_up_pending_amd_does_not_report_exit_answered(self):
         """Durante AMD (pending_amd), ChannelDestroyed reporta EXIT_AMD (no EXIT_ANSWERED)."""
         channel_id = "1786967911.1366"
@@ -295,12 +318,16 @@ class TestRouterChannelDestroyedStateUpReportsShortcallOrAnswered(unittest.TestC
         self.assertEqual(call_kwargs.get("event_final"), HangupCause.EXIT_AMD.value)
         self.assertEqual(call_kwargs.get("callid"), "1786967911.51")
         self.mock_reporter.log_dial.assert_not_called()
-        self.mock_legacy_forwarder.submit_dial_amd.assert_called_once_with(
-            "19", "51", "1230036", callid="1786967911.51",
-        )
+        self.mock_legacy_forwarder.submit_dial_amd.assert_called_once()
+        amd_args, amd_kwargs = self.mock_legacy_forwarder.submit_dial_amd.call_args
+        self.assertEqual(amd_args[:3], ("19", "51", "1230036"))
+        self.assertEqual(amd_kwargs.get("callid"), "1786967911.51")
         mock_redis.delete.assert_called_once()
-        mock_pstn_reported_store.add.assert_called_once_with(channel_id)
-        self.mock_legacy_forwarder.handle_channel_destroyed.assert_called_once_with(channel_id)
+        mock_pstn_reported_store.add.assert_called_once_with(
+            channel_id, credit_via_dial_amd=True,
+        )
+        # Dial AMD ya libera cupo: no reenviar ChannelDestroyed a process-event.
+        self.mock_legacy_forwarder.handle_channel_destroyed.assert_not_called()
 
     def test_state_up_peer_channel_id_differs_from_meta_callid_does_not_report(self):
         """PSTN duplicado (channel_id != meta.callid) no inventa EXIT_ANSWERED con uniqueid ARI."""

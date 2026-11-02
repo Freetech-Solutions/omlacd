@@ -331,6 +331,179 @@ class DistributionService:
             entry = self._voicebot_transfer_waiters.get(call_id)
         return entry[1] if entry else None
 
+    def begin_voicebot_handoff(
+        self,
+        call_id: str,
+        *,
+        on_queue_timeout_callback: OnQueueTimeoutCallback = None,
+    ) -> bool:
+        """
+        Handoff AudioSocket/CES (sin SIP REFER): libera la pierna externalMedia del bot,
+        deja MOH al PSTN e inicia start_distribution a humanos de inmediato.
+
+        Debe ejecutarse antes (o apenas) el hangup de la pierna bot para que
+        voicebot_transfer_waiting evite colgar el PSTN en ChannelDestroyed/hangup.
+        """
+        if not call_id:
+            return False
+
+        with self.state_store.lock(call_id):
+            ctx = self.state_store.get(call_id)
+            if not ctx or getattr(ctx, "call_ended", False):
+                logger.warning(
+                    "begin_voicebot_handoff: contexto ausente o llamada finalizada call_id=%s",
+                    call_id,
+                )
+                return False
+
+            agent_channel = active_agent_channel(ctx) or getattr(
+                ctx, "agent_attempt_channel", None
+            )
+            bridge_id = getattr(ctx, "bridge_id", None)
+            pstn_channel_id = getattr(ctx, "pstn_channel", None)
+            campaign_id = str(
+                effective_queue_campaign_id(ctx)
+                or getattr(ctx, "id_camp", None)
+                or ""
+            ).strip()
+            uniqueid = str(
+                getattr(ctx, "uniqueid", None)
+                or getattr(ctx, "call_id", None)
+                or call_id
+            )
+            id_camp_origin = getattr(ctx, "id_camp", None)
+            agent_id_voicebot = getattr(ctx, "agent_id", None)
+            distribution_metadata = {
+                "id_customer": getattr(ctx, "id_customer", None),
+                "id_camp": campaign_id or id_camp_origin,
+                "tel_customer": getattr(ctx, "phone_number", None),
+                "callid": call_id,
+                "call_type": getattr(ctx, "call_type", None) or 3,
+            }
+
+            if not bridge_id:
+                logger.warning(
+                    "begin_voicebot_handoff: sin bridge_id call_id=%s",
+                    call_id,
+                )
+                return False
+            if not campaign_id:
+                logger.warning(
+                    "begin_voicebot_handoff: sin campaign_id call_id=%s",
+                    call_id,
+                )
+                return False
+
+            # Flags ANTES de colgar la pierna bot (externalMedia / AudioSocket).
+            ctx.voicebot_leg_end_ts = datetime.now().isoformat()
+            ctx.is_voicebot_transfer = True
+            ctx.agent_attempt_channel = None
+            ctx.agent_connected_channel = None
+            ctx.uniqueid_agent = None
+            ctx.agent_answered_ts = None
+            ctx.is_voicebot = False
+            ctx.agent_id = None
+            ctx.voicebot_transfer_waiting = True
+            self.state_store.register_unsafe(call_id, ctx)
+
+        if agent_channel:
+            try:
+                self.ari_client.remove_channel_from_bridge(bridge_id, agent_channel)
+            except Exception as e:
+                logger.warning(
+                    "begin_voicebot_handoff: remove_channel_from_bridge falló "
+                    "channel=%s bridge=%s: %s",
+                    agent_channel,
+                    bridge_id,
+                    e,
+                )
+            try:
+                self.ari_client.hangup_channel(agent_channel)
+            except Exception as e:
+                logger.warning(
+                    "begin_voicebot_handoff: hangup_channel falló channel=%s: %s",
+                    agent_channel,
+                    e,
+                )
+        else:
+            logger.info(
+                "begin_voicebot_handoff: sin pierna bot en contexto call_id=%s "
+                "(posible race con cierre AudioSocket); se continúa handoff",
+                call_id,
+            )
+
+        if (
+            id_camp_origin is not None
+            and str(id_camp_origin).strip()
+            and agent_id_voicebot is not None
+        ):
+            if self.agent_status_service:
+                try:
+                    self.agent_status_service.release_voicebot_call(
+                        id_camp_origin,
+                        agent_id_voicebot,
+                        call_id,
+                    )
+                except Exception as e:
+                    logger.debug(
+                        "begin_voicebot_handoff: release_voicebot_call falló: %s",
+                        e,
+                    )
+            else:
+                try:
+                    self.redis_client.decr(
+                        RedisKeys.voicebot_calls(str(id_camp_origin), agent_id_voicebot)
+                    )
+                except Exception as e:
+                    logger.debug(
+                        "begin_voicebot_handoff: DECR VOICEBOT-CALLS falló: %s",
+                        e,
+                    )
+
+        try:
+            self.ari_client.post(f"bridges/{bridge_id}/moh")
+        except Exception as e:
+            logger.warning(
+                "begin_voicebot_handoff: MOH falló bridge=%s: %s",
+                bridge_id,
+                e,
+            )
+
+        campaign_cfg = get_campaign_config_with_defaults(self.redis_client, campaign_id)
+        strategy = campaign_cfg.get("strategy", "fewestcalls")
+        ring_timeout = int(campaign_cfg.get("ring_timeout", 45))
+        queue_timeout_sec = int(campaign_cfg.get("max_wait_time", 3600))
+
+        with self.state_store.lock(call_id):
+            ctx_after = self.state_store.get(call_id)
+            if not ctx_after or getattr(ctx_after, "call_ended", False):
+                logger.info(
+                    "begin_voicebot_handoff: llamada finalizada antes de distribuir call_id=%s",
+                    call_id,
+                )
+                return False
+            ctx_after.voicebot_transfer_waiting = False
+            self.state_store.register_unsafe(call_id, ctx_after)
+
+        logger.info(
+            "begin_voicebot_handoff: start_distribution call_id=%s campaign_id=%s",
+            call_id,
+            campaign_id,
+        )
+        self.start_distribution(
+            call_id=call_id,
+            campaign_id=campaign_id,
+            bridge_id=bridge_id,
+            strategy=strategy,
+            ring_timeout=ring_timeout,
+            queue_timeout_sec=queue_timeout_sec,
+            pstn_channel_id=pstn_channel_id,
+            uniqueid=uniqueid,
+            distribution_metadata=distribution_metadata,
+            on_queue_timeout_callback=on_queue_timeout_callback,
+        )
+        return True
+
     def _get_or_create_call_events(self, call_id: str) -> Tuple[threading.Event, threading.Event]:
         """Obtiene o crea el par (stop_event, attempt_finished) para la llamada call_id."""
         with self._call_events_lock:
@@ -610,14 +783,23 @@ class DistributionService:
         lock_key: str,
         *,
         restore_ready: bool = False,
+        failure_cooldown: bool = False,
         use_status_reservation: bool = False,
     ) -> None:
-        """Libera reserva de agente (lock/lease + opcional DIALING→READY)."""
+        """Libera reserva de agente (lock/lease + opcional DIALING→READY o cooldown)."""
         try:
             if use_status_reservation and self.agent_status_service:
-                self.agent_status_service.release_distribution_reservation(
-                    agent_id, call_id, restore_ready=restore_ready
-                )
+                if failure_cooldown:
+                    cooldown = int(
+                        getattr(settings, "AGENT_OFFER_FAILURE_COOLDOWN_SEC", 5) or 5
+                    )
+                    self.agent_status_service.penalize_failed_distribution_offer(
+                        agent_id, call_id, cooldown
+                    )
+                else:
+                    self.agent_status_service.release_distribution_reservation(
+                        agent_id, call_id, restore_ready=restore_ready
+                    )
             else:
                 try:
                     current = self.redis_client.get(lock_key)
@@ -942,12 +1124,20 @@ class DistributionService:
                                     call_id,
                                 )
                                 continue
+                            agent_hash_key = RedisKeys.agent_hash(str(candidate.agent_id))
+                            voicebot_transport = "sip"
                             voicebot_addr: Optional[str] = None
                             try:
-                                raw = self.redis_client.hget(
-                                    RedisKeys.agent_hash(str(candidate.agent_id)),
-                                    "VOICEBOT_ADDR",
+                                transport_raw = self.redis_client.hget(
+                                    agent_hash_key, "VOICEBOT_TRANSPORT"
                                 )
+                                if transport_raw is not None:
+                                    voicebot_transport = (
+                                        transport_raw.decode("utf-8").strip().lower()
+                                        if isinstance(transport_raw, bytes)
+                                        else (transport_raw or "").strip().lower()
+                                    ) or "sip"
+                                raw = self.redis_client.hget(agent_hash_key, "VOICEBOT_ADDR")
                                 if raw is not None:
                                     voicebot_addr = (
                                         raw.decode("utf-8").strip()
@@ -956,24 +1146,64 @@ class DistributionService:
                                     )
                             except Exception as e:
                                 logger.debug(
-                                    "VoicebotLoop: error leyendo VOICEBOT_ADDR para agente %s: %s",
+                                    "VoicebotLoop: error leyendo VOICEBOT_* para agente %s: %s",
                                     candidate.agent_id,
                                     e,
                                 )
+
+                            if voicebot_transport == "audiosocket":
+                                audiosocket_addr = (
+                                    getattr(settings, "AUDIOSOCKET_ADDR", "") or ""
+                                ).strip()
+                                if not audiosocket_addr:
+                                    logger.warning(
+                                        "VoicebotLoop: VOICEBOT_TRANSPORT=audiosocket pero "
+                                        "AUDIOSOCKET_ADDR vacío; se reintenta call_id=%s agente=%s",
+                                        call_id,
+                                        candidate.agent_id,
+                                    )
+                                    self._release_agent_reservation(
+                                        candidate.agent_id, call_id, lock_key
+                                    )
+                                    continue
+                            elif not (voicebot_addr or (external_host or "").strip()):
+                                logger.warning(
+                                    "VoicebotLoop: VOICEBOT_TRANSPORT=sip sin VOICEBOT_ADDR "
+                                    "ni EXTERNAL_AG_HOST; se reintenta call_id=%s agente=%s",
+                                    call_id,
+                                    candidate.agent_id,
+                                )
+                                self._release_agent_reservation(
+                                    candidate.agent_id, call_id, lock_key
+                                )
+                                continue
+
                             pre_generated_channel_id = str(uuid.uuid4())
                             with self._dialing_lock:
                                 self._active_attempts[call_id] = pre_generated_channel_id
                                 self._voicebot_attempt_agent_id[call_id] = candidate.agent_id
                             try:
-                                agent_channel_id = self.call_service.dial_voicebot_with_headers(
-                                    agent_sip=candidate.interface,
-                                    external_host=external_host,
-                                    related_call_id=call_id,
-                                    metadata=metadata,
-                                    timeout=ring_timeout,
-                                    voicebot_addr=voicebot_addr or None,
-                                    channel_id=pre_generated_channel_id,
-                                )
+                                if voicebot_transport == "audiosocket":
+                                    agent_channel_id = (
+                                        self.call_service.dial_voicebot_audiosocket(
+                                            related_call_id=call_id,
+                                            metadata=metadata,
+                                            channel_id=pre_generated_channel_id,
+                                            audiosocket_addr=audiosocket_addr,
+                                        )
+                                    )
+                                else:
+                                    agent_channel_id = (
+                                        self.call_service.dial_voicebot_with_headers(
+                                            agent_sip=candidate.interface,
+                                            external_host=external_host,
+                                            related_call_id=call_id,
+                                            metadata=metadata,
+                                            timeout=ring_timeout,
+                                            voicebot_addr=voicebot_addr or None,
+                                            channel_id=pre_generated_channel_id,
+                                        )
+                                    )
                             except Exception as e:
                                 logger.error(
                                     "VoicebotLoop: error originando hacia voicebot %s: %s",
@@ -1172,11 +1402,13 @@ class DistributionService:
                 attempt_agent_id = self._active_attempt_agents.pop(call_id, None)
                 self._active_attempt_loop_gens.pop(call_id, None)
             if attempt_agent_id is not None:
+                # Abort de offer en vuelo (timeout/stop): cooldown, no READY inmediato
+                # (evita que otra llamada robe al agente en la misma ráfaga).
                 self._release_agent_reservation(
                     int(attempt_agent_id),
                     call_id,
                     RedisKeys.agent_lock(str(attempt_agent_id)),
-                    restore_ready=True,
+                    failure_cooldown=True,
                     use_status_reservation=True,
                 )
             if agent_ch:
@@ -1200,6 +1432,7 @@ class DistributionService:
         for key in (
             RedisKeys.agent_lock(agent_id_str),
             RedisKeys.agent_reservation_lease(agent_id_str),
+            RedisKeys.agent_offer_cooldown(agent_id_str),
         ):
             try:
                 current = self.redis_client.get(key)
@@ -1441,7 +1674,8 @@ class DistributionService:
         el siguiente candidato (solo attempt_finished, no stop_event). Retorna True
         si era el agente actual; False si no.
 
-        Libera lock/lease Redis y revierte DIALING→READY para que el agente vuelva a ser candidato.
+        Libera lock Redis y aplica cooldown de lease (sin READY inmediato) para evitar
+        re-origenes en ráfaga al mismo agente ocupado/rechazado.
         """
         failed_agent_id: Optional[int] = None
         with self._dialing_lock:
@@ -1457,7 +1691,52 @@ class DistributionService:
                 failed_agent_id,
                 call_id,
                 RedisKeys.agent_lock(str(failed_agent_id)),
-                restore_ready=True,
+                failure_cooldown=True,
+                use_status_reservation=True,
+            )
+
+        _, attempt_finished = self._get_or_create_call_events(call_id)
+        attempt_finished.set()
+        return True
+
+    def handle_channel_failure_by_channel(self, channel_id: str) -> bool:
+        """
+        Fallback cuando state_store aún no indexó el canal (Destroyed durante originate).
+        Busca channel_id en _active_attempts y aplica el mismo cooldown.
+        """
+        if not channel_id:
+            return False
+        matched_call_id: Optional[str] = None
+        with self._dialing_lock:
+            for call_id, active_ch in self._active_attempts.items():
+                if active_ch == channel_id:
+                    matched_call_id = call_id
+                    break
+        if matched_call_id is None:
+            return False
+        return self.handle_channel_failure(matched_call_id, channel_id)
+
+    def handle_agent_leg_dial_failure(self, call_id: str) -> bool:
+        """
+        Backup ante Dial NOANSWER/BUSY/CANCEL to_agent: no depende del channel_id ARI.
+        Aplica cooldown al agente del intento activo y desbloquea el loop.
+        """
+        if not call_id:
+            return False
+        failed_agent_id: Optional[int] = None
+        with self._dialing_lock:
+            if call_id not in self._active_attempts:
+                return False
+            failed_agent_id = self._active_attempt_agents.pop(call_id, None)
+            self._active_attempts.pop(call_id, None)
+            self._active_attempt_loop_gens.pop(call_id, None)
+
+        if failed_agent_id is not None:
+            self._release_agent_reservation(
+                failed_agent_id,
+                call_id,
+                RedisKeys.agent_lock(str(failed_agent_id)),
+                failure_cooldown=True,
                 use_status_reservation=True,
             )
 
@@ -1673,6 +1952,22 @@ class DistributionService:
                                 self._active_attempt_agents[call_id] = candidate.agent_id
                                 self._active_attempt_loop_gens[call_id] = loop_gen
 
+                            # Indexar antes del originate: ChannelDestroyed puede llegar
+                            # mientras ARI HTTP aún bloquea y get_by_channel fallaría.
+                            try:
+                                with self.state_store.lock(call_id):
+                                    ctx = self.state_store.get(call_id)
+                                    if ctx:
+                                        ctx.agent_attempt_channel = pre_generated_channel_id
+                                        self.state_store.register_unsafe(call_id, ctx)
+                            except Exception:
+                                logger.debug(
+                                    "DistributionLoop: no se pudo pre-registrar "
+                                    "agent_attempt_channel call_id=%s",
+                                    call_id,
+                                    exc_info=True,
+                                )
+
                             try:
                                 agent_channel_id = self.call_service.dial_agent_with_headers(
                                     agent_sip=candidate.interface,
@@ -1695,7 +1990,7 @@ class DistributionService:
                                         candidate.agent_id,
                                         call_id,
                                         lock_key,
-                                        restore_ready=True,
+                                        failure_cooldown=True,
                                         use_status_reservation=True,
                                     )
                                 continue
@@ -1707,7 +2002,7 @@ class DistributionService:
                                         candidate.agent_id,
                                         call_id,
                                         lock_key,
-                                        restore_ready=True,
+                                        failure_cooldown=True,
                                         use_status_reservation=True,
                                     )
                                 continue
@@ -1731,7 +2026,7 @@ class DistributionService:
                                         candidate.agent_id,
                                         call_id,
                                         lock_key,
-                                        restore_ready=True,
+                                        failure_cooldown=True,
                                         use_status_reservation=True,
                                     )
                                 return
@@ -1756,7 +2051,7 @@ class DistributionService:
                                         candidate.agent_id,
                                         call_id,
                                         lock_key,
-                                        restore_ready=True,
+                                        failure_cooldown=True,
                                         use_status_reservation=True,
                                     )
                                 continue
@@ -1780,7 +2075,7 @@ class DistributionService:
                                     candidate.agent_id,
                                     call_id,
                                     lock_key,
-                                    restore_ready=True,
+                                    failure_cooldown=True,
                                     use_status_reservation=True,
                                 )
 
@@ -1813,7 +2108,7 @@ class DistributionService:
                         attempt_agent_id,
                         call_id,
                         RedisKeys.agent_lock(str(attempt_agent_id)),
-                        restore_ready=True,
+                        failure_cooldown=True,
                         use_status_reservation=True,
                     )
         except Exception as e:
@@ -1988,20 +2283,12 @@ class DistributionService:
                 timeout_agent_id,
                 call_id,
                 RedisKeys.agent_lock(str(timeout_agent_id)),
-                restore_ready=True,
+                failure_cooldown=True,
                 use_status_reservation=True,
             )
 
         with self._on_queue_timeout_callbacks_lock:
             cb = self._on_queue_timeout_callbacks.pop(call_id, None)
-        if cb is not None and pstn_channel_id:
-            try:
-                cb(call_id, pstn_channel_id)
-            except Exception:
-                logger.exception(
-                    "DistributionService._on_queue_timeout: error en callback para call_id=%s",
-                    call_id,
-                )
 
         try:
             mark_result = self.state_store.mark_call_ended_atomic(call_id)
@@ -2018,6 +2305,15 @@ class DistributionService:
                 "_on_queue_timeout: error marcando llamada %s como finalizada", call_id
             )
             return
+
+        if cb is not None and pstn_channel_id:
+            try:
+                cb(call_id, pstn_channel_id)
+            except Exception:
+                logger.exception(
+                    "DistributionService._on_queue_timeout: error en callback para call_id=%s",
+                    call_id,
+                )
 
         if self.queue_event_manager:
             try:

@@ -507,8 +507,13 @@ class TransferManager:
         # blind_to_endpoint ya colgó al agente origen antes de originar: no dejar IDs de pierna muerta.
         saved_connected = getattr(ctx, "agent_connected_channel", None)
         call_type = getattr(getattr(ctx, "type", None), "value", getattr(ctx, "type", None))
+        is_inbound_or_progressive = call_type in (
+            CallType.INBOUND.value,
+            CallType.PROGRESSIVE.value,
+            CallType.DIALER.value,
+        )
         prior_answered_inbound_agent_blind = bool(
-            call_type == CallType.INBOUND.value
+            is_inbound_or_progressive
             and ctx.target_agent_id is not None
             and saved_connected
             and getattr(ctx, "agent_answered_ts", None)
@@ -588,8 +593,13 @@ class TransferManager:
             is_voicebot = bool(getattr(ctx, "is_voicebot", False))
             pstn_channel = getattr(ctx, "pstn_channel", None) or getattr(ctx, "uniqueid_pstn", None)
             call_type = getattr(getattr(ctx, "type", None), "value", getattr(ctx, "type", None))
+            is_inbound_or_progressive = call_type in (
+                CallType.INBOUND.value,
+                CallType.PROGRESSIVE.value,
+                CallType.DIALER.value,
+            )
             should_hangup_inbound_pstn = bool(
-                call_type == CallType.INBOUND.value
+                is_inbound_or_progressive
                 and getattr(ctx, "target_agent_id", None) is not None
                 and getattr(ctx, "inbound_agent_hung_up_first", False)
             )
@@ -634,7 +644,10 @@ class TransferManager:
 
         if self.agent_status_service and agent_id and not is_voicebot:
             try:
-                self.agent_status_service.set_postcall_and_clear_fields(agent_id)
+                self.agent_status_service.set_postcall_and_clear_fields(
+                    agent_id,
+                    call_id=call_id,
+                )
             except Exception:
                 self.logger.warning(
                     "recover_after_blind_transfer_leg_failed: error set_postcall agent_id=%s call_id=%s",
@@ -955,6 +968,7 @@ class TransferManager:
             
             # Leer todos los valores necesarios dentro del lock para mantener consistencia
             initiator = "VOICEBOT" if ctx.is_voicebot else "AGENTE"
+            is_voicebot = bool(getattr(ctx, "is_voicebot", False))
             bridge_id = ctx.bridge_id
             agent_channel = active_agent_channel(ctx)
             call_id = ctx.call_id
@@ -1022,8 +1036,25 @@ class TransferManager:
                         f"⚠️ No se pudo colgar canal de agente {agent_channel} después de reintentos. "
                         f"Continuando con la transferencia."
                     )
-                # TODO: Aquí podrías liberar al agente en Redis si tienes lógica de presencia
-            
+                # Liberar presencia del agente origen humano (ONCALL→POSTCALL)
+                if (
+                    self.agent_status_service
+                    and agent_id
+                    and not is_voicebot
+                ):
+                    try:
+                        self.agent_status_service.set_postcall_and_clear_fields(
+                            agent_id,
+                            call_id=call_id,
+                        )
+                    except Exception:
+                        self.logger.warning(
+                            "blind_to_endpoint: error set_postcall agent_id=%s call_id=%s",
+                            agent_id,
+                            call_id,
+                            exc_info=True,
+                        )
+
             # 4. Originar llamada (operación crítica irreversible)
             #    NOTA: originate se ejecuta fuera del lock para no bloquear, pero ya verificamos
             #    el estado dentro del lock y tenemos los valores copiados (no el objeto ctx)
@@ -1290,6 +1321,7 @@ class TransferManager:
             source_camp_id = ctx.id_camp
             call_type = ctx.call_type
             source_agent_id = ctx.agent_id
+            is_voicebot_source = bool(getattr(ctx, "is_voicebot", False))
         
         # 2. Ejecución física fuera del lock (no modifica estado compartido)
         self._start_moh(bridge_id)
@@ -1333,6 +1365,25 @@ class TransferManager:
             ctx.transfer_phase = TRANSFER_PHASE_NONE
 
             self.state_store.register_unsafe(unique_id, ctx)
+
+        # Liberar presencia del agente origen humano (ONCALL→POSTCALL)
+        if (
+            self.agent_status_service
+            and source_agent_id
+            and not is_voicebot_source
+        ):
+            try:
+                self.agent_status_service.set_postcall_and_clear_fields(
+                    source_agent_id,
+                    call_id=call_id,
+                )
+            except Exception:
+                self.logger.warning(
+                    "blind_to_campaign: error set_postcall agent_id=%s call_id=%s",
+                    source_agent_id,
+                    call_id,
+                    exc_info=True,
+                )
 
         # 4. Reporte (fuera del lock, usando copias locales)
         self._log_transfer_result(
@@ -1780,6 +1831,25 @@ class TransferManager:
                     campaign_id=id_camp,
                     contact_number=phone_number,
                 )
+
+            # Liberar presencia del agente iniciador A (ONCALL→POSTCALL)
+            if (
+                self.agent_status_service
+                and agent_id
+                and agent_id != target_agent_id
+            ):
+                try:
+                    self.agent_status_service.set_postcall_and_clear_fields(
+                        agent_id,
+                        call_id=call_id,
+                    )
+                except Exception:
+                    self.logger.warning(
+                        "consult_complete: error set_postcall agent_id=%s call_id=%s",
+                        agent_id,
+                        call_id,
+                        exc_info=True,
+                    )
 
             # 4. Registrar resultado de la transferencia
             # Todos los valores ya fueron obtenidos dentro del lock antes de liberarlo
@@ -2361,7 +2431,7 @@ class TransferManager:
                 f"(call_id={call_id}, channel_id={channel_id})"
             )
 
-        # 5. Colgar agente anterior si sigue vivo
+        # 5. Colgar agente anterior si sigue vivo y liberar su presencia
         if old_agent:
             # hangup_channel ya tiene retry logic, si retorna False significa que falló después de reintentos
             hangup_result = self.ari.hangup_channel(old_agent)
@@ -2369,6 +2439,23 @@ class TransferManager:
                 self.logger.warning(
                     f"⚠️ No se pudo colgar canal de agente anterior {old_agent} después de reintentos. "
                     f"Continuando con la transferencia."
+                )
+        if (
+            self.agent_status_service
+            and old_agent_id
+            and old_agent_id != target_agent_id
+        ):
+            try:
+                self.agent_status_service.set_postcall_and_clear_fields(
+                    old_agent_id,
+                    call_id=call_id,
+                )
+            except Exception:
+                self.logger.warning(
+                    "on_transfer_leg_start: error set_postcall old_agent_id=%s call_id=%s",
+                    old_agent_id,
+                    call_id,
+                    exc_info=True,
                 )
 
         self.logger.info(f"✅ Blind Transfer completada para {call_id}")

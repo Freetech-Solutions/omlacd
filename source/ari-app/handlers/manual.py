@@ -1142,7 +1142,10 @@ class ManualCallHandler(BaseHandler):
                 )
         if self.agent_status_service and context.agent_id:
             try:
-                self.agent_status_service.set_postcall_and_clear_fields(context.agent_id)
+                self.agent_status_service.set_postcall_and_clear_fields(
+                    context.agent_id,
+                    call_id=context.call_id,
+                )
             except Exception as e:
                 logging.error(f"Error actualizando estado del agente: {e}", exc_info=True)
 

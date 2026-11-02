@@ -1,1001 +1,320 @@
-# Propuesta de arquitectura para soporte de voicebots por AudioSocket en ACD/Stasis
+# Voicebots por AudioSocket en ACD / Stasis
 
-## 1. Resumen ejecutivo
+Documentación de la integración **implementada**: Asterisk ARI `externalMedia` (AudioSocket) + servicio `audiosocket` (CES) + handoff por Redis, conviviendo con voicebots SIP / SIP REFER.
 
-La recomendación es evolucionar la plataforma actual, centrada en `Asterisk + Stasis/ARI + ACD + Redis`, hacia un modelo de integración dual de voicebots:
+Documento hermano del componente: [`components-git-repo/audiosocket/README.md`](../../audiosocket/README.md).
 
-- `SIP/SIP REFER` se mantiene como mecanismo soportado y backward compatible.
-- `AudioSocket` se incorpora como un segundo transporte de media para bots externos.
-- El control de sesión y el handoff dejan de depender exclusivamente de SIP REFER y pasan a normalizarse sobre `Redis Pub/Sub`, reutilizando el mecanismo ya existente de comandos del ACD.
+---
 
-La pieza nueva no debe ser un simple media loop. Debe ser un `Bot Gateway` con dos responsabilidades explícitas:
+## 1. Resumen
 
-1. `media adapter` para AudioSocket.
-2. `control adapter` para traducir acciones del bot a comandos internos del ACD.
+La plataforma soporta dos transportes de voicebot sin cambiar el core de orquestación (Stasis/ARI + Redis):
 
-Stasis/ARI debe seguir siendo el centro de orquestación porque ya concentra el ciclo de vida de la llamada, el bridge, el estado distribuido, la distribución a colas/agentes y la compatibilidad con el ACD actual. La expansión propuesta no mueve esa autoridad; agrega una capa de adaptación para nuevos transportes.
+| Transporte | Media | Control / handoff |
+|------------|--------|-------------------|
+| **SIP** (legado) | Originate PJSIP + headers `X-OML-*` | Preferido: SIP REFER → `sip_refer_listener` |
+| **AudioSocket** | ARI `externalMedia` (`encapsulation=audiosocket`) | Redis `action=voicebot_handoff` → `begin_voicebot_handoff` |
 
-La arquitectura objetivo queda así:
-
-```text
-                   +-------------------------------+
-                   |         ACD / Backoffice      |
-                   | colas, agentes, campañas      |
-                   +---------------+---------------+
-                                   |
-                                   | Redis Pub/Sub
-                                   v
-+----------+      ARI/Stasis    +-------------------+      AudioSocket
-| Cliente  | <----------------> | Asterisk + ARI App| <----------------+
-+----------+                    | session manager   |                 |
-                                | bridges, state    |                 |
-                                +-----+---------+---+                 |
-                                      |         |                     |
-                                      |         | SIP                 |
-                                      |         +---------------------+----> Proveedor bot SIP
-                                      |
-                                      | externalMedia / chan_audiosocket
-                                      v
-                                +-------------------+
-                                |    Bot Gateway    |
-                                | AudioSocket       |
-                                | control adapter   |
-                                +---------+---------+
-                                          |
-                                          | API/WebSocket/gRPC
-                                          v
-                                +-------------------+
-                                | Proveedor bot     |
-                                | AudioSocket/AI    |
-                                +-------------------+
-```
-
-## 2. Arquitectura actual
-
-### 2.1 Estructura actual sobre Asterisk + Stasis/ARI
-
-La base actual del componente ACD ya responde al patrón correcto para un contact center multi-tenant:
-
-- El canal de cliente entra a `Stasis`.
-- La aplicación ARI crea y administra el `bridge` principal de la conversación.
-- El estado de la llamada se persiste en Redis mediante `CallRegistry`.
-- La distribución a agentes humanos se resuelve en `DistributionService`.
-- Las transferencias se resuelven en `TransferManager`.
-- Los comandos externos se reciben por `CommandListener`, suscripto a `acd:commands:global` y `acd:commands:{NODE_ID}`.
-
-En el árbol actual esto ya se ve reflejado en:
-
-- `source/ari-app/sip_refer_listener.py`
-- `source/ari-app/infrastructure/command_listener.py`
-- `source/ari-app/services/command_dispatcher.py`
-- `source/ari-app/services/distribution_service.py`
-- `source/ari-app/transfer.py`
-- `source/ari-app/state.py`
-
-### 2.2 Integración actual de bots vía SIP
-
-Hoy el bot se comporta, desde la perspectiva de Asterisk, como un endpoint SIP o un destino SIP alcanzable por trunk externo.
-
-El flujo operativo actual es:
-
-1. La llamada del cliente entra a Stasis.
-2. La app ARI crea el `bridge`.
-3. `DistributionService` puede seleccionar un agente marcado como `VOICEBOT=1`.
-4. `CallActionService.dial_voicebot_with_headers()` origina una pierna SIP hacia el bot.
-5. La pierna del bot entra al mismo bridge que el cliente.
-6. El cliente conversa con el bot como si fuera un agente especial.
-
-En este esquema SIP cumple dos roles:
-
-- `media/signaling`: establecer la sesión del bot.
-- `control`: permitir transferencia posterior mediante `SIP REFER`.
-
-### 2.3 Rol de SIP REFER en el flujo actual
-
-El listener actual `sip_refer_listener.py` ya implementa el patrón de control de handoff para voicebots SIP:
-
-- Resuelve el `call_id` a partir del canal que origina el REFER.
-- Interpreta el destino del REFER como campaña o agente.
-- Si el destino es agente, dispara `blind_to_agent`.
-- Si el destino es campaña, y el transferente es un voicebot, hace una liberación controlada del leg del bot:
-  - saca el bot del bridge
-  - cuelga su canal
-  - decrementa el contador `VOICEBOT-CALLS`
-  - deja al cliente en MOH
-  - registra un waiter
-  - espera `voicebot_transfer_proceed` por Redis o TTL
-  - luego invoca `start_distribution`
-
-Ese detalle es importante: la plataforma ya tiene un precedente concreto de handoff desacoplado del signaling SIP puro. REFER inicia la intención, pero el avance del traspaso humano ya puede coordinarse por Redis.
-
-### 2.4 Cómo se produce hoy el handoff a cola o agente humano
-
-Hay dos variantes:
-
-- `bot -> agente humano`
-  - el bot manda REFER a un destino que se interpreta como agente.
-  - el `SipReferHandler` llama a `TransferManager.blind_to_agent()`.
-
-- `bot -> cola/campaña`
-  - el bot manda REFER a campaña.
-  - la app Stasis libera el leg del bot.
-  - el cliente queda en el bridge con MOH.
-  - el ACD reanuda distribución humana contra la campaña objetivo.
-
-### 2.5 Participación del ACD
-
-El ACD participa en tres capas:
-
-- `estado`: Redis como fuente de verdad de `CallContext`.
-- `control`: `CommandListener` y `CommandDispatcher` para acciones sobre llamadas activas.
-- `negocio`: colas, agentes, timers, reportes, límites y estrategia de distribución.
-
-Conclusión sobre el estado actual: la arquitectura ya está correctamente centrada en Stasis/ARI y Redis. La extensión a AudioSocket debe apoyarse ahí y no crear un plano de control paralelo.
-
-## 3. Arquitectura objetivo
-
-### 3.1 Principio rector
-
-La plataforma debe soportar dos modos de integración de voicebots sin cambiar el core del ACD:
-
-- `modo SIP`: bot conectado por SIP, con opción de control por SIP REFER y/o Redis.
-- `modo AudioSocket`: bot conectado por streaming PCM bidireccional, con control por Redis.
-
-La decisión de transporte debe ser una propiedad de configuración del bot o de la campaña, no del flujo core de atención.
-
-### 3.2 Modelo propuesto
-
-La propuesta es introducir un `Bot Session Manager` en la app ARI y un `Bot Gateway` externo para AudioSocket.
+- Stasis/ARI sigue siendo la autoridad de bridge, estado (`CallRegistry`) y distribución.
+- El servicio **`audiosocket`** es el *Bot Gateway*: termina TCP AudioSocket, habla con Google CES (WSS) y publica comandos al ACD.
+- Variables de negocio no viajan en el protocolo AudioSocket: se publican en Redis `OML:AUDIOSOCKET:{uuid}`.
 
 ```text
-                   +------------------------------------+
-                   |          ARI / Stasis App          |
-                   |------------------------------------|
-                   | Bot Session Manager                |
-                   | TransferManager                    |
-                   | DistributionService                |
-                   | CommandDispatcher                  |
-                   | CallRegistry                       |
-                   +-----------------+------------------+
-                                     |
-                         selecciona adapter por transporte
-                                     |
-                +--------------------+--------------------+
-                |                                         |
-                v                                         v
-      +------------------------+              +------------------------+
-      | SipBotAdapter          |              | AudioSocketBotAdapter  |
-      | usa originate SIP      |              | usa externalMedia      |
-      | REFER opcional         |              | contra Bot Gateway     |
-      +-----------+------------+              +-----------+------------+
-                  |                                           |
-                  v                                           v
-      +------------------------+              +------------------------+
-      | Proveedor bot SIP      |              | Bot Gateway            |
-      | B2BUA / SBC / UA       |              | sesión + media + ctrl  |
-      +------------------------+              +-----------+------------+
-                                                          |
-                                                          v
-                                              +------------------------+
-                                              | Proveedor bot IA       |
-                                              +------------------------+
+PSTN ──► acd-app (bridge / CallRegistry)
+              │
+              ├─ SIP voicebot ──────────► proveedor SIP (REFER opcional)
+              │
+              └─ externalMedia TCP ─────► audiosocket:9092
+                                              │
+                         Redis sesión         │ WSS CES
+                    OML:AUDIOSOCKET:{uuid}    ▼
+                                              Google CES
+                                              │
+                         Redis Pub/Sub        │ end_session escalado
+                    acd:commands:global ◄─────┘
+                         voicebot_handoff
+                              │
+                              ▼
+                    DistributionService.begin_voicebot_handoff
+                    (MOH + start_distribution humanos)
 ```
 
-### 3.3 Cómo incorporar AudioSocket
+---
 
-Para AudioSocket no propongo sacar la llamada de Stasis ni resolver el bot por dialplan puro. Propongo usar `ARI externalMedia` con `transport=tcp` y `encapsulation=audiosocket`, de forma que el canal externo siga estando bajo control de la misma app Stasis.
+## 2. Selección de transporte
 
-Eso permite:
+En el loop de voicebot (`DistributionService`), por agente se lee configuración Redis (`VOICEBOT_TRANSPORT`, etc.):
 
-- mantener un único orquestador de llamada
-- seguir usando el bridge actual
-- conservar trazabilidad completa en ARI
-- evitar un bypass del estado del ACD
+- `VOICEBOT_TRANSPORT=audiosocket` → `CallManager.dial_voicebot_audiosocket` (requiere `AUDIOSOCKET_ADDR`).
+- Cualquier otro / default SIP → `dial_voicebot_with_headers` (requiere `VOICEBOT_ADDR` / host externo).
 
-El flujo recomendado es:
+Código: `source/ari-app/services/distribution_service.py` (rama `voicebot_transport == "audiosocket"`).
 
-1. El cliente entra a Stasis.
-2. `Bot Session Manager` resuelve que el bot usa `transport=audiosocket`.
-3. La app crea un `externalMedia channel` contra el `Bot Gateway`.
-4. Ese canal entra a la misma app Stasis.
-5. El canal AudioSocket se agrega al `bridge` de la conversación.
-6. El `Bot Gateway` traduce el stream AudioSocket al protocolo requerido por el proveedor bot.
-7. El `Bot Gateway` publica acciones de control en Redis.
-8. La app Stasis ejecuta handoff, cierre o fallback sobre la llamada real.
+---
 
-### 3.4 ¿Media loop, media proxy, media adapter o bot gateway?
+## 3. Componentes y código
 
-La decisión correcta es `Bot Gateway`.
+| Pieza | Rol | Ubicación |
+|-------|-----|-----------|
+| Asterisk | Bridge, canales, `externalMedia` / PJSIP | `chan_audiosocket` / ARI |
+| acd-app | Orquestación, dial bot, handoff, distribución | `source/ari-app/` |
+| `CallManager.dial_voicebot_audiosocket` | Escribe sesión Redis + `POST externalMedia` | `services/call_manager.py` |
+| `CommandDispatcher` | Acción `voicebot_handoff` | `services/command_dispatcher.py` |
+| `DistributionService.begin_voicebot_handoff` | Saca pierna bot, MOH, `start_distribution` | `services/distribution_service.py` |
+| `SipReferListener` | Handoff SIP legado | `sip_refer_listener.py` |
+| Config ACD | `AUDIOSOCKET_ADDR`, TTL sesión | `config.py` |
+| Clave Redis sesión | `OML:AUDIOSOCKET:{uuid}` | `constants.py` → `RedisKeys.audiosocket_session` |
+| Servicio audiosocket | Gateway TCP + CES + webhook Django + publish Redis | `components-git-repo/audiosocket/` |
+| Tests ACD handoff | Unitarios handoff | `source/tests_unit/test_voicebot_handoff.py` |
 
-No alcanza con modelarlo como `media loop`:
+No existe un `Bot Session Manager` / `BotAdapter` abstracto separado: la selección de transporte está en el loop de voicebot; la sesión AudioSocket se modela con el canal externalMedia + metadata en `pending_dial_store` + flags en `CallContext` (`is_voicebot`, `voicebot_transfer_waiting`, `voicebot_leg_end_ts`, etc.).
 
-- un media loop solo reenvía audio
-- no modela identidad de sesión
-- no resuelve control, handoff, tenant, timeouts ni trazabilidad
+---
 
-Tampoco conviene pensarlo solo como `media proxy`:
+## 4. Flujo AudioSocket (llamada)
 
-- el problema no es solo pasar RTP/PCM
-- hay que transformar acciones de negocio del bot a comandos del ACD
+### 4.1 Alta de pierna bot
 
-El `AudioSocketBotAdapter` sí es un `media adapter`, pero encapsulado dentro de un `Bot Gateway`.
+1. Cliente en Stasis; campaña con agente `VOICEBOT=1` y `VOICEBOT_TRANSPORT=audiosocket`.
+2. `dial_voicebot_audiosocket`:
+   - Genera `session_uuid`.
+   - `SETEX OML:AUDIOSOCKET:{uuid}` (TTL `AUDIOSOCKET_SESSION_TTL_SEC`, default 3600) con:
 
-La definición recomendada es:
+     ```json
+     {
+       "X-OML-Contact-ID": "<id_customer>",
+       "X-OML-Campaign-ID": "<id_camp>",
+       "X-OML-Call-ID": "<callid>",
+       "phone_number": "...",
+       "agent_id": "..."
+     }
+     ```
 
-- `Bot Gateway`: componente de borde para sesiones bot, consciente de tenant, bot_session_id, control y observabilidad.
-- `AudioSocket adapter`: submódulo del gateway que termina el protocolo AudioSocket.
+   - Registra `pending_dial_store` (externalMedia no manda `appArgs` en StasisStart).
+   - ARI `externalMedia`:
+     - `external_host` = `AUDIOSOCKET_ADDR` (ej. `audiosocket:9092`)
+     - `encapsulation=audiosocket`, `transport=tcp`, `format=slin`, `direction=both`
+     - `data=<session_uuid>`
+3. El canal entra a Stasis, se agrega al bridge como pierna de “agente” voicebot.
+4. `audiosocket` acepta TCP, lee `MSG_UUID` (16 bytes), carga Redis, conecta CES, envía saludo.
 
-Justificación:
+### 4.2 Media
 
-- desacopla transporte de la lógica de handoff
-- evita meter lógica específica de proveedores IA dentro del ARI app
-- permite soportar varios vendors sin contaminar `TransferManager` ni `DistributionService`
-- habilita estrategias mixtas: SIP directo, AudioSocket, e incluso futuros transports
+- Protocolo AudioSocket: hangup `0x00`, UUID `0x01`, audio PCM LINEAR16 8 kHz `0x10` (tramas 320 B / 20 ms).
+- El gateway agrupa ~100 ms hacia CES y pacea 20 ms hacia Asterisk.
+- Vendor actual: `VOICEBOT_VENDOR=ces` (Google CES BidiRunSession WSS).
 
-### 3.5 Componentes nuevos
+### 4.3 Fin de sesión CES → ACD
 
-Los componentes nuevos mínimos son:
+El adapter CES espera un evento estructurado `endSession` (también acepta fallback si el modelo **verbaliza** `end_session(...)` en el transcript).
 
-1. `Bot Session Manager` en la app ARI.
-2. `Bot Adapter` como contrato interno.
-3. `AudioSocketBotAdapter` en la app ARI.
-4. `Bot Gateway` externo.
-5. `Bot Command Publisher` para Redis Pub/Sub.
-6. `Bot Provider Registry` o configuración por tenant/campaña/bot.
+| `session_escalated` | Comportamiento en `audiosocket` | Efecto en ACD |
+|---------------------|----------------------------------|---------------|
+| `true` | Login OML + calificación Django → `PUBLISH voicebot_handoff` → hangup pierna TCP | `begin_voicebot_handoff`: remueve/cuelga externalMedia, MOH, `start_distribution` humanos |
+| `false` / ausente | Solo cierra pierna TCP (MSG_HANGUP + close) | Hangup de pierna voicebot; PSTN se limpia como fin de agente bot (sin transferencia) |
 
-## 4. Componentes
+Orden crítico en escalación: **publicar `voicebot_handoff` antes** (o apenas) del hangup de la pierna, para que `voicebot_transfer_waiting` evite colgar el PSTN.
 
-### 4.1 Vista de componentes
+### 4.4 Calificación Django (antes del handoff)
 
-| Componente | Responsabilidad principal | Estado |
-| --- | --- | --- |
-| Asterisk | Media anchor, bridges, canales, signaling SIP, external media | Existente |
-| App ARI/Stasis | Orquestación central de llamada y estado | Existente |
-| ACD | Lógica de negocio de campañas, colas y agentes | Existente |
-| Redis Pub/Sub | Canal de comandos y handoff | Existente |
-| CallRegistry | Estado distribuido por `call_id` | Existente |
-| CommandListener/Dispatcher | Ejecución de comandos externos | Existente |
-| SipReferListener | Compatibilidad con bots SIP actuales | Existente |
-| Bot Session Manager | Abstracción de sesión bot desacoplada del transporte | Nuevo |
-| Bot Adapter | Contrato interno común | Nuevo |
-| AudioSocketBotAdapter | Crear y administrar sesiones bot por externalMedia AudioSocket | Nuevo |
-| Bot Gateway | Terminar AudioSocket, adaptar media/control a proveedor | Nuevo |
-| Proveedor bot SIP | Bot externo integrado por SIP | Existente |
-| Proveedor bot AudioSocket | Bot externo integrado por streaming | Nuevo |
-| Colas / agentes humanos | Destino de handoff y fallback | Existente |
+Implementado en `audiosocket/oml_api.py`:
 
-### 4.2 Responsabilidades por componente
+1. `POST /api/v1/login` (`OML_VOICEBOT_USERNAME` / `PASSWORD`, token cacheado).
+2. `GET /api/v1/campaign/{id}/dispositionOptions/` → opción `name=GESTION_BOT` (configurable).
+3. Contacto válido (`X-OML-Contact-ID` > 0) → `POST /api/v1/webhook/voicebot/`.
+4. Contacto `-1` / ausente → `POST /api/v1/new_contact/disposition/` con `phone` de la sesión Redis.
 
-#### Asterisk
+Si falla el webhook o faltan env, se loguea warning y **igual** se publica `voicebot_handoff`.
 
-- Terminar llamada del cliente.
-- Crear bridge principal.
-- Crear canal SIP del bot cuando aplique.
-- Crear external media channel AudioSocket cuando aplique.
-- Mantener el audio anclado en la plataforma.
+Tras un `new_contact/disposition` o webhook OK, Django escribe `CallContactCache` (`callid` → `contact_id`) para que la GUI del agente, que aún recibe `id_contacto=-1` en el originate, abra el contacto correcto en `calificar_llamada` (y no la pantalla de teléfonos repetidos).
 
-#### App ARI/Stasis
+---
 
-- Mantener autoridad del estado de llamada.
-- Crear `BotSession`.
-- Asociar `bot_session_id`, `call_id`, `bridge_id`, `channel_id`.
-- Decidir handoff, fallback, cierre y limpieza.
-- Ejecutar MOH, distribución y transferencias.
+## 5. Flujo SIP (legado, sin cambios disruptivos)
 
-#### Bot Session Manager
+1. `dial_voicebot_with_headers` → originate SIP con headers de negocio.
+2. Conversación en el mismo bridge.
+3. Handoff típico: SIP REFER → `sip_refer_listener.py`:
+   - destino agente → `TransferManager.blind_to_agent`
+   - destino campaña → libera pierna bot, MOH, waiter + `voicebot_transfer_proceed` / distribución
 
-- Seleccionar adapter por `transport`.
-- Crear/destruir sesiones bot.
-- Normalizar eventos entre SIP y AudioSocket.
-- Publicar/consumir metadatos comunes.
+AudioSocket **no** usa SIP REFER.
 
-#### Bot Gateway
+---
 
-- Aceptar conexión AudioSocket desde Asterisk.
-- Mapear UUID AudioSocket a `bot_session_id`.
-- Convertir PCM/DTMF al protocolo del proveedor IA.
-- Recibir acciones del bot y traducirlas al contrato interno.
-- Publicar comandos de handoff por Redis.
+## 6. Contratos Redis (reales)
 
-#### Redis Pub/Sub
+### 6.1 Sesión AudioSocket (ACD → gateway)
 
-- Transportar comandos de control de bot hacia el ACD.
-- Permitir handoff desacoplado del transporte de media.
-- Mantener el mecanismo único de activación sobre llamadas activas.
+- **Clave:** `OML:AUDIOSOCKET:{session_uuid}`
+- **Escritor:** `CallManager.dial_voicebot_audiosocket`
+- **Lector:** `audiosocket.load_oml_session`
+- **TTL:** `AUDIOSOCKET_SESSION_TTL_SEC`
 
-## 5. Flujos
+Los `X-OML-*` se inyectan en CES (`remoteDialogflowQueryParameters`).
 
-### 5.1 Llamada atendida por bot vía SIP
+### 6.2 Handoff (gateway → ACD)
+
+- **Canal:** `acd:commands:global` (override en gateway: `ACD_COMMANDS_CHANNEL`)
+- **Payload implementado:**
+
+```json
+{"action": "voicebot_handoff", "call_id": "<X-OML-Call-ID>"}
+```
+
+- **Consumidor:** `CommandListener` → `CommandDispatcher` → `DistributionService.begin_voicebot_handoff(call_id)`
+
+No se usan (hoy) acciones propuestas como `bot_handoff_queue` / `bot_session_end` / `bot_fallback_human`. El handoff AudioSocket es una sola acción: `voicebot_handoff`, siempre a distribución humana de la campaña del contexto.
+
+### 6.3 Acciones SIP relacionadas (referencia)
+
+Siguen vigentes para el flujo REFER: `voicebot_transfer_proceed`, waiters en `DistributionService`, etc. Son independientes del path AudioSocket.
+
+---
+
+## 7. `begin_voicebot_handoff` (detalle ACD)
+
+1. Valida `CallContext` vivo, `bridge_id`, `campaign_id`.
+2. Marca `voicebot_leg_end_ts`, `is_voicebot_transfer=True`, limpia pierna agente, `voicebot_transfer_waiting=True`.
+3. `remove_channel_from_bridge` + `hangup` de la pierna bot (si aún existe; tolera race con cierre TCP).
+4. `release_voicebot_call` / DECR `VOICEBOT-CALLS`.
+5. MOH en el bridge del PSTN.
+6. Limpia `voicebot_transfer_waiting` y llama `start_distribution` a humanos (misma campaña / cola efectiva).
+
+Handlers de campaña/inbound distinguen post-handoff (`is_voicebot_transfer`, `voicebot_leg_end_ts`) para reporting y no tratar el hangup del bot como fin total de la llamada.
+
+---
+
+## 8. Configuración
+
+### 8.1 ACD (`acd-app`)
+
+| Variable | Descripción | Default típico |
+|----------|-------------|----------------|
+| `AUDIOSOCKET_ADDR` | `host:port` del gateway (ARI `external_host`) | `audiosocket:9092` |
+| `AUDIOSOCKET_SESSION_TTL_SEC` | TTL de `OML:AUDIOSOCKET:{uuid}` | `3600` |
+
+Definidas en `source/ari-app/config.py`. En Compose suelen mapearse desde `docker-compose/env`.
+
+### 8.2 Agente voicebot (Redis / Django)
+
+Por agente voicebot (campos típicos leídos en el loop):
+
+- `VOICEBOT_TRANSPORT` = `audiosocket` \| `sip`
+- `VOICEBOT_ADDR` / host SIP (solo SIP)
+- Resto de flags voicebot existentes (`VOICEBOT=1`, límites de llamadas, etc.)
+
+### 8.3 Servicio `audiosocket`
+
+Ver tabla completa en el README del componente. Resumen:
+
+| Variable | Uso |
+|----------|-----|
+| `AUDIOSOCKET_HOST` / `PORT` | Bind TCP (9092) |
+| `VOICEBOT_VENDOR` | `ces` |
+| `REDIS_*` | Lectura sesión + publish handoff |
+| `APP_ID` / `PROJECT_ID` / `LOCATION` | CES (`APP_ID` obligatorio) |
+| `GOOGLE_APPLICATION_CREDENTIALS` | SA GCP |
+| `AUDIOSOCKET_GCP_SCOPE` | Default `cloud-platform`; opt-in `ces` |
+| `OML_API_BASE_URL`, `OML_VOICEBOT_USERNAME` / `PASSWORD` | Webhook / new_contact |
+| `AUDIOSOCKET_DEBUG_PII` | Logs de transcripts/teléfonos (off por defecto) |
+
+Compose: servicio `audiosocket`, imagen `AUDIOSOCKET_IMG`, volume SA GCP.
+
+---
+
+## 9. Prompt CES / `end_session`
+
+El agente CES debe **invocar** la tool de sistema `end_session` (no narrarla en texto hablado):
+
+| Campo | Uso |
+|-------|-----|
+| `session_escalated` / `sessionEscalated` | `true` → webhook + `voicebot_handoff`; `false` → fin de llamada |
+| `reason` | Log + campo en POST Django |
+| `params.call_summary` / `Call_Summary` | Observaciones del agente humano |
+
+Ejemplos:
+
+- Acepta / escala: `end_session(reason="servicio_aceptado", session_escalated=True, params={"call_summary": "..."})` + frase de espera.
+- Rechaza: `end_session(reason="servicio_rechazado", session_escalated=False)` + despedida.
+
+El gateway incluye fallback si el modelo verbaliza `end_session(...)` en el transcript; lo ideal es el evento estructurado.
+
+---
+
+## 10. Observabilidad y troubleshooting
+
+### Logs esperados (escalación OK)
+
+**audiosocket:**
 
 ```text
-Cliente -> Asterisk: llamada inbound/outbound conectada
-Asterisk -> Stasis App: StasisStart canal cliente
-Stasis App -> CallRegistry: crea CallContext
-Stasis App -> Asterisk: crea bridge principal
-Stasis App -> DistributionService: resuelve bot SIP para campaña
-DistributionService -> Asterisk: originate SIP leg a voicebot
-Asterisk -> Proveedor bot SIP: INVITE con headers de negocio
-Proveedor bot SIP -> Asterisk: 200 OK
-Asterisk -> Stasis App: StasisStart canal bot
-Stasis App -> Asterisk: agrega bot al bridge
-Cliente <-> Bot SIP: conversación
+Sesión iniciada con UUID de Asterisk: …
+Sesión OML cargada: Contact=… Campaign=… Call=… phone=****NNNN
+Conectado a Google CES: projects/…/apps/…/sessions/…
+endSession reason='…' session_escalated=True
+OML … OK …
+voicebot_handoff publicado en acd:commands:global …
+Llamada finalizada.
 ```
 
-### 5.2 Handoff vía SIP REFER
+**acd-app:**
 
 ```text
-Bot SIP -> Asterisk: REFER destino campaña/agente
-Asterisk -> Stasis App: ChannelTransfer / evento REFER
-Stasis App -> SipReferListener: parsea destino
-
-Si destino = agente:
-  SipReferListener -> TransferManager: blind_to_agent(call_id, agent_id)
-  TransferManager -> Asterisk: origina pierna agente
-  Asterisk -> Stasis App: agente entra a bridge
-
-Si destino = campaña:
-  SipReferListener -> Asterisk: remueve y cuelga leg bot
-  SipReferListener -> Asterisk: activa MOH en bridge cliente
-  SipReferListener -> DistributionService: registra waiter
-  Bot/Backend -> Redis Pub/Sub: voicebot_transfer_proceed
-  CommandListener -> CommandDispatcher: despierta waiter
-  DistributionService -> ACD: inicia distribución humana
+CommandDispatcher: voicebot_handoff OK call_id=…
+begin_voicebot_handoff: start_distribution call_id=… campaign_id=…
 ```
 
-### 5.3 Llamada atendida por bot vía AudioSocket
+### Señales de problema
 
-```text
-Cliente -> Asterisk: llamada conectada
-Asterisk -> Stasis App: StasisStart canal cliente
-Stasis App -> CallRegistry: crea CallContext
-Stasis App -> Asterisk: crea bridge principal
-Stasis App -> Bot Session Manager: start_bot_session(transport=audiosocket)
-Bot Session Manager -> AudioSocketBotAdapter: create session
-AudioSocketBotAdapter -> Asterisk ARI: POST /channels/externalMedia
-ARI externalMedia -> Bot Gateway: abre TCP AudioSocket
-Bot Gateway -> Proveedor bot IA: abre stream de media/control
-Asterisk -> Stasis App: StasisStart canal external media
-Stasis App -> Asterisk: agrega canal AudioSocket al bridge
-Cliente <-> Asterisk <-> AudioSocket <-> Bot Gateway <-> Bot IA: conversación
-```
+| Log / síntoma | Causa probable |
+|---------------|----------------|
+| `Agente: end_session(...)` / `print(default_api.end_session…)` sin `endSession reason=` | CES verbalizó la tool; revisar prompt / tool; el fallback debería disparar handoff tras el fix |
+| `1011 resource_exhausted` | Cuota / rate limit Google CES; esperar y reintentar |
+| `Healthcheck TCP (Docker): peer 127.0.0.1…` | Probe del `HEALTHCHECK` del contenedor; **no** es llamada |
+| Hangup inmediato sin UUID Asterisk desde IP no local | Peer cerró TCP sin protocolo |
+| `AUDIOSOCKET_ADDR vacío` | ACD no puede discar AudioSocket |
+| Webhook skip / error + handoff igual | Faltan credenciales OML o GESTION_BOT; handoff sigue |
 
-### 5.4 Handoff vía Redis Pub/Sub hacia cola humana
+---
 
-```text
-Bot IA -> Bot Gateway: intent=handoff_to_queue
-Bot Gateway -> Redis Pub/Sub: publish action=bot_handoff_queue
-CommandListener -> CommandDispatcher: consume comando
-CommandDispatcher -> Bot Session Manager: close bot leg
-Bot Session Manager -> Asterisk: remueve externalMedia del bridge
-CommandDispatcher -> Asterisk: MOH en bridge cliente
-CommandDispatcher -> DistributionService: start_distribution(campaign_id)
-DistributionService -> ACD: busca agentes humanos
-Agente -> Asterisk/Stasis: responde
-Stasis App -> Asterisk: agrega agente humano al bridge
-Cliente <-> Agente: atención humana
-```
+## 11. Seguridad operativa
 
-### 5.5 Fallback si el bot no responde
+- Contenedor `audiosocket`: usuario no-root, `HEALTHCHECK` TCP, deps pinneadas, secretos fuera del repo.
+- PII en logs: truncado/máscara; detalle con `AUDIOSOCKET_DEBUG_PII=1` solo en troubleshooting.
+- Redis de comandos no debe exponerse a proveedores externos; el gateway es el único publicador de `voicebot_handoff` desde el path CES.
+- Credenciales: rotar SA GCP y password del agente API (`GESTION_BOT` / webhook).
 
-```text
-Stasis App -> AudioSocketBotAdapter: inicia sesión bot
-AudioSocketBotAdapter -> Bot Gateway: connect
+Detalle ISO / CI: README de `audiosocket`.
 
-Si connect timeout o bot health fail:
-  AudioSocketBotAdapter -> Bot Session Manager: session_failed(reason)
-  Bot Session Manager -> CommandDispatcher: fallback_to_human
-  CommandDispatcher -> Asterisk: MOH si aplica
-  CommandDispatcher -> DistributionService: start_distribution(default_campaign)
+---
 
-Si bot se cae durante conversación:
-  Bot Gateway -> Redis Pub/Sub: bot_fallback_human
-  CommandDispatcher -> Asterisk: limpia leg bot
-  CommandDispatcher -> DistributionService: distribución humana
-```
+## 12. Extensión / fuera de alcance actual
 
-### 5.6 Finalización normal de la conversación
+**Implementado**
 
-```text
-Bot IA -> Bot Gateway: action=end_session
-Bot Gateway -> Redis Pub/Sub: bot_session_end
-CommandDispatcher -> Bot Session Manager: close session
-Bot Session Manager -> Asterisk: remueve/cuelga canal bot
+- Dual SIP + AudioSocket por `VOICEBOT_TRANSPORT`
+- Gateway CES + webhook Django + `voicebot_handoff`
+- Handoff a cola/campaña humana (misma campaña del contexto)
 
-Si política = hangup total:
-  Stasis App -> Asterisk: cuelga canal cliente
+**No implementado** (respecto a borradores anteriores)
 
-Si política = postbot workflow:
-  Stasis App -> siguiente estado:
-    - encuesta
-    - IVR final
-    - cierre administrativo
-```
+- Acciones Redis granulares `bot_handoff_agent` / `bot_session_end` / `bot_fallback_human` desde el gateway
+- `BotAdapter` / `Bot Session Manager` como capa abstracta formal
+- SIP REFER desde el path AudioSocket
+- Multi-vendor en producción más allá del contrato `VoicebotAdapter` + `VOICEBOT_VENDOR`
 
-### 5.7 Flujo general recomendado
+Para un vendor nuevo: implementar `adapters/<vendor>.py` en el repo `audiosocket` y registrar en `factory.py` (PCM 8 kHz + semántica `session_escalated`).
 
-```text
-                      +----------------------+
-                      |   Inicio de llamada  |
-                      +----------+-----------+
-                                 |
-                                 v
-                      +----------------------+
-                      | Stasis crea contexto |
-                      +----------+-----------+
-                                 |
-                                 v
-                 +---------------+---------------+
-                 | Resolver bot transport/profile|
-                 +---------------+---------------+
-                                 |
-                 +---------------+---------------+
-                 |                               |
-                 v                               v
-        +------------------+            +----------------------+
-        | SIP Bot Adapter  |            | AudioSocket Adapter  |
-        +--------+---------+            +----------+-----------+
-                 |                                 |
-                 v                                 v
-        +------------------+            +----------------------+
-        | Conversación bot |            | Conversación bot     |
-        +--------+---------+            +----------+-----------+
-                 |                                 |
-                 +---------------+-----------------+
-                                 |
-                                 v
-                     +---------------------------+
-                     | Acción bot: handoff/end   |
-                     | Control normalizado Redis |
-                     +-------------+-------------+
-                                   |
-                                   v
-                     +---------------------------+
-                     | ACD ejecuta transferencia |
-                     | o cierre final            |
-                     +---------------------------+
-```
+---
 
-## 6. Contratos internos
-
-### 6.1 Modelo conceptual de BotSession
-
-```ts
-type BotTransport = "sip" | "audiosocket";
-
-type BotSessionState =
-  | "CREATED"
-  | "CONNECTING"
-  | "ACTIVE"
-  | "HANDOFF_REQUESTED"
-  | "HANDOFF_IN_PROGRESS"
-  | "TERMINATING"
-  | "ENDED"
-  | "FAILED";
-
-interface BotSession {
-  bot_session_id: string;
-  tenant_id: string;
-  call_id: string;
-  bridge_id: string;
-  customer_channel_id: string;
-  bot_channel_id?: string;
-  transport: BotTransport;
-  provider_id: string;
-  campaign_id: string;
-  agent_id?: string;
-  state: BotSessionState;
-  metadata: Record<string, string>;
-  created_at: string;
-}
-```
-
-### 6.2 Contrato `BotAdapter`
-
-```ts
-interface BotAdapter {
-  startSession(req: StartBotSessionRequest): Promise<StartBotSessionResult>;
-  sendMediaEvent(evt: MediaEvent): Promise<void>;
-  receiveBotAction(action: BotAction): Promise<void>;
-  requestHandoff(req: HandoffRequest): Promise<void>;
-  closeSession(req: CloseBotSessionRequest): Promise<void>;
-}
-```
-
-### 6.3 Iniciar sesión bot
-
-```json
-{
-  "operation": "start_bot_session",
-  "tenant_id": "tenant-a",
-  "call_id": "1767206550.4",
-  "bot_session_id": "bs_01J...",
-  "campaign_id": "11",
-  "transport": "audiosocket",
-  "provider_id": "bot-verloop-audiosocket",
-  "customer_channel_id": "1739387599.22",
-  "bridge_id": "bridge-4f1a",
-  "media": {
-    "codec": "slin",
-    "sample_rate_hz": 8000,
-    "dtmf": true
-  },
-  "handoff_policy": {
-    "default_campaign_id": "11",
-    "allow_agent_transfer": true,
-    "allow_queue_transfer": true
-  },
-  "metadata": {
-    "id_customer": "26",
-    "phone_number": "54911...",
-    "call_type": "3"
-  }
-}
-```
-
-### 6.4 Enviar eventos de media/speech
-
-No conviene exponer al core del ACD frames crudos. El core debe recibir eventos lógicos.
-
-```json
-{
-  "operation": "bot_media_event",
-  "bot_session_id": "bs_01J...",
-  "call_id": "1767206550.4",
-  "event_type": "speech.partial",
-  "timestamp": "2026-03-10T18:04:11.221Z",
-  "payload": {
-    "text": "quiero hablar con una persona",
-    "confidence": 0.94,
-    "vendor_trace_id": "vx-8891"
-  }
-}
-```
-
-### 6.5 Recibir acciones del bot
-
-```json
-{
-  "operation": "bot_action",
-  "bot_session_id": "bs_01J...",
-  "call_id": "1767206550.4",
-  "action": "handoff_to_queue",
-  "reason": "user_requested_human",
-  "payload": {
-    "target_campaign_id": "11",
-    "queue_priority": "normal",
-    "context": {
-      "intent": "speak_to_agent",
-      "summary": "cliente pide operador"
-    }
-  }
-}
-```
-
-### 6.6 Solicitar handoff
-
-```ts
-interface HandoffRequest {
-  bot_session_id: string;
-  call_id: string;
-  tenant_id: string;
-  target_type: "queue" | "agent" | "human_fallback";
-  target_campaign_id?: string;
-  target_agent_id?: string;
-  reason: string;
-  context?: Record<string, string>;
-}
-```
-
-### 6.7 Cerrar sesión
-
-```json
-{
-  "operation": "close_bot_session",
-  "bot_session_id": "bs_01J...",
-  "call_id": "1767206550.4",
-  "reason": "normal_end",
-  "close_customer_call": false
-}
-```
-
-### 6.8 Publicar comando de transferencia en Redis
-
-```ts
-interface TransferCommand {
-  command_id: string;
-  timestamp: string;
-  source: "bot-gateway" | "sip-refer-listener" | "ari-app";
-  tenant_id: string;
-  node_id?: string;
-  call_id: string;
-  bot_session_id?: string;
-  action:
-    | "bot_handoff_queue"
-    | "bot_handoff_agent"
-    | "bot_session_end"
-    | "bot_fallback_human"
-    | "voicebot_transfer_proceed";
-  payload: Record<string, unknown>;
-}
-```
-
-## 7. Redis Pub/Sub para handoff
-
-### 7.1 Decisión
-
-Para el escenario nuevo, `Redis Pub/Sub` debe ser el mecanismo principal de handoff. SIP REFER queda soportado, pero no es el único ni el preferido para integraciones AudioSocket.
-
-### 7.2 Motivación
-
-Redis ya existe en el ACD como:
-
-- bus de comandos
-- fuente de estado distribuido
-- mecanismo de coordinación entre nodos
-
-Eso reduce impacto de implementación y evita crear otro canal de control.
-
-### 7.3 Formato lógico de mensajes
-
-Propongo publicar sobre los canales ya soportados:
-
-- `acd:commands:global`
-- `acd:commands:{NODE_ID}` cuando la llamada ya esté afinada a un nodo
-
-Payload canónico:
-
-```json
-{
-  "command_id": "cmd_01J8XYZ",
-  "timestamp": "2026-03-10T18:14:00.000Z",
-  "source": "bot-gateway",
-  "tenant_id": "tenant-a",
-  "call_id": "1767206550.4",
-  "bot_session_id": "bs_01J...",
-  "action": "bot_handoff_queue",
-  "payload": {
-    "target_campaign_id": "11",
-    "reason": "user_requested_human",
-    "transport": "audiosocket",
-    "provider_id": "verloop-audiosocket",
-    "call_summary": "cliente pidió operador",
-    "intent": "speak_to_agent"
-  }
-}
-```
-
-Mensajes concretos por acción:
-
-#### Transferencia a cola
-
-```json
-{
-  "command_id": "cmd_queue_001",
-  "timestamp": "2026-03-10T18:14:00.000Z",
-  "source": "bot-gateway",
-  "tenant_id": "tenant-a",
-  "call_id": "1767206550.4",
-  "bot_session_id": "bs_01J...",
-  "action": "bot_handoff_queue",
-  "payload": {
-    "target_campaign_id": "11",
-    "reason": "handoff_to_queue"
-  }
-}
-```
-
-#### Transferencia a agente
-
-```json
-{
-  "command_id": "cmd_agent_001",
-  "timestamp": "2026-03-10T18:14:03.000Z",
-  "source": "bot-gateway",
-  "tenant_id": "tenant-a",
-  "call_id": "1767206550.4",
-  "bot_session_id": "bs_01J...",
-  "action": "bot_handoff_agent",
-  "payload": {
-    "target_agent_id": "1001",
-    "reason": "premium_customer"
-  }
-}
-```
-
-#### Finalización de sesión bot
-
-```json
-{
-  "command_id": "cmd_end_001",
-  "timestamp": "2026-03-10T18:14:10.000Z",
-  "source": "bot-gateway",
-  "tenant_id": "tenant-a",
-  "call_id": "1767206550.4",
-  "bot_session_id": "bs_01J...",
-  "action": "bot_session_end",
-  "payload": {
-    "reason": "conversation_completed",
-    "close_customer_call": true
-  }
-}
-```
-
-#### Fallback a operador humano
-
-```json
-{
-  "command_id": "cmd_fallback_001",
-  "timestamp": "2026-03-10T18:14:15.000Z",
-  "source": "bot-gateway",
-  "tenant_id": "tenant-a",
-  "call_id": "1767206550.4",
-  "bot_session_id": "bs_01J...",
-  "action": "bot_fallback_human",
-  "payload": {
-    "target_campaign_id": "11",
-    "reason": "bot_timeout"
-  }
-}
-```
-
-### 7.4 Coordinación entre bot, Stasis y ACD
-
-El modelo recomendado es:
-
-1. `Bot Gateway` recibe una acción del proveedor bot.
-2. `Bot Gateway` publica comando canónico en Redis.
-3. `CommandListener` lo consume en la app ARI.
-4. `CommandDispatcher` lo traduce a operación interna:
-   - `bot_handoff_queue` -> liberar bot + MOH + `start_distribution`
-   - `bot_handoff_agent` -> liberar bot + `blind_to_agent`
-   - `bot_session_end` -> cerrar leg bot y finalizar o continuar flujo
-   - `bot_fallback_human` -> liberar bot + distribución humana por defecto
-5. `CallRegistry` actualiza `BotSession` y `CallContext`.
-6. `TransferManager` y `DistributionService` ejecutan la acción real.
-
-### 7.5 Convivencia entre SIP REFER y Redis
-
-Modelo híbrido recomendado:
-
-- `SIP bot legado`
-  - media por SIP
-  - control por SIP REFER
-
-- `SIP bot evolucionado`
-  - media por SIP
-  - control por Redis
-
-- `AudioSocket bot`
-  - media por AudioSocket
-  - control por Redis
-
-La regla del core del ACD debe ser:
-
-- el `transporte de media` no define el `mecanismo de handoff`
-- el `mecanismo de handoff` preferido es Redis
-- `SIP REFER` se mantiene por compatibilidad
-
-## 8. Compatibilidad SIP + AudioSocket
-
-### 8.1 Abstracción común
-
-El core del ACD no debe depender de si el bot fue alcanzado por SIP o por AudioSocket. Debe depender solo de una abstracción `BotSession`.
-
-Campos mínimos comunes:
-
-- `bot_session_id`
-- `call_id`
-- `bridge_id`
-- `tenant_id`
-- `transport`
-- `provider_id`
-- `bot_channel_id`
-- `state`
-- `handoff_capabilities`
-
-### 8.2 Contrato común de ejecución
-
-El core solo necesita cinco operaciones:
-
-1. `start_bot_session`
-2. `notify_bot_event`
-3. `request_handoff`
-4. `close_bot_session`
-5. `handle_bot_failure`
-
-Todo lo demás es trabajo del adapter.
-
-### 8.3 Backward compatibility
-
-La compatibilidad se preserva así:
-
-- `sip_refer_listener.py` no se elimina.
-- El flujo actual de `dial_voicebot_with_headers()` se mantiene.
-- Los payloads actuales de `CommandDispatcher` siguen válidos.
-- Los nuevos mensajes Redis se agregan como acciones nuevas, no reemplazan las existentes.
-- Las campañas existentes pueden seguir configuradas como `bot_transport=sip`.
-
-### 8.4 Estrategia de configuración por tenant
-
-Cada tenant o campaña debería poder definir:
-
-- `bot_enabled`
-- `bot_transport = sip | audiosocket`
-- `bot_provider_id`
-- `bot_endpoint`
-- `handoff_default_campaign_id`
-- `fallback_policy`
-- `sample_rate_hz`
-- `connect_timeout_ms`
-- `bot_action_timeout_ms`
-
-## 9. Riesgos y tradeoffs
-
-### 9.1 Por qué Stasis/ARI debe seguir siendo el centro
-
-Porque ya es el punto donde viven:
-
-- ciclo de vida de la llamada
-- bridges
-- transferencias
-- distribución
-- estado
-- reporting
-
-Mover la orquestación fuera de Stasis duplicaría estado y abriría carreras entre Asterisk y el bot runtime.
-
-### 9.2 Por qué desacoplar transporte de media de lógica de negocio
-
-Porque SIP y AudioSocket resuelven cosas distintas:
-
-- SIP resuelve signaling y establecimiento de sesiones telephony-grade.
-- AudioSocket resuelve streaming PCM simple hacia motores IA.
-
-La lógica de negocio del ACD no debe saber si el bot usa INVITE, REFER o frames PCM. Debe operar con eventos de alto nivel:
-
-- bot conectado
-- bot falló
-- bot pide handoff
-- bot finalizó
-
-### 9.3 Por qué Redis Pub/Sub es adecuado
-
-Porque:
-
-- ya está en la plataforma
-- ya existe listener y dispatcher
-- es rápido para control intra-plataforma
-- encaja con una arquitectura multi-nodo
-- elimina dependencia del signaling SIP para handoff
-
-Tradeoff:
-
-- Pub/Sub puro no garantiza replay. Para comandos críticos conviene agregar `command_id`, idempotencia y opcionalmente persistencia complementaria en Redis key/stream si más adelante se requiere auditoría estricta.
-
-### 9.4 Cuándo SIP seguirá siendo útil
-
-- bots que ya exponen UA SIP o SBC
-- integraciones donde el proveedor ya soporta REFER/transfer
-- escenarios con carrier/SBC, NAT, topologías de telefonía clásicas
-- migraciones de bajo impacto donde no conviene tocar media plane
-
-### 9.5 Cuándo AudioSocket aporta más flexibilidad
-
-- bots basados en STT/TTS/LLM que no quieren implementar SIP
-- proveedores IA que operan sobre PCM o WebSocket/gRPC
-- integraciones donde se quiera controlar speech, barge-in y vendor switching en el gateway
-- casos donde se necesite desacoplar completamente media del control de negocio
-
-### 9.6 Riesgos técnicos principales
-
-- `latencia`: transcoding y salto extra Asterisk -> Gateway -> Bot.
-- `resiliencia`: caída del Bot Gateway no debe colgar la llamada sin fallback.
-- `capacidad`: AudioSocket a gran escala implica CPU de codec, sockets y backpressure.
-- `observabilidad`: sin correlación fuerte, debugging de handoff será muy costoso.
-- `aislamiento multi-tenant`: no mezclar configuración, credenciales ni colas entre tenants.
-
-## 10. Recomendación final
-
-### 10.1 Requisitos no funcionales
-
-#### Latencia
-
-- objetivo de media agregado por plataforma: `< 80 ms` unidireccional
-- objetivo bot action -> comando Redis -> ejecución ACD: `< 300 ms`
-- baseline sugerido: `slin/8kHz` para minimizar transcoding en PSTN
-- habilitar `16kHz` solo por perfil de bot y con sizing explícito
-
-#### Resiliencia
-
-- `connect_timeout_ms` corto para sesión bot
-- `bot_action_timeout_ms` por intent/handoff
-- circuit breaker por proveedor bot
-- fallback automático a humano si el bot no conecta o no responde
-- Bot Gateway stateless y escalable horizontalmente
-
-#### Reintentos
-
-- no hacer retries infinitos sobre una llamada viva
-- máximo 1 retry rápido para conexión inicial del bot
-- cualquier falla posterior debe derivar a fallback o cierre ordenado
-
-#### Observabilidad
-
-Trazas y métricas obligatorias con:
-
-- `tenant_id`
-- `call_id`
-- `bot_session_id`
-- `bridge_id`
-- `customer_channel_id`
-- `bot_channel_id`
-- `provider_id`
-- `transport`
-- `command_id`
-
-Métricas mínimas:
-
-- sesiones bot iniciadas/fallidas
-- tiempo de conexión bot
-- tiempo de handoff
-- fallbacks automáticos
-- latencia media bot/gateway
-- errores por proveedor/tenant
-
-#### Escalabilidad multi-tenant
-
-- configuración por tenant/campaña
-- pools y límites por tenant
-- rate limiting para evitar que un tenant monopolice el gateway
-- aislamiento de `bot_session_id` y credenciales por espacio lógico
-
-#### Seguridad
-
-- allowlist o mTLS entre Asterisk y Bot Gateway
-- autenticación entre Bot Gateway y proveedor bot
-- no exponer Redis directamente a proveedores externos
-- sanitizar metadata y headers
-- minimizar PII en Pub/Sub
-
-#### Manejo de errores
-
-- todo comando de bot debe ser idempotente por `command_id`
-- toda limpieza de sesión debe tolerar doble ejecución
-- si el bot leg cae, la llamada del cliente debe permanecer viva mientras exista política de fallback
-
-### 10.2 Arquitectura recomendada para llevar a ingeniería
-
-La arquitectura concreta recomendada es:
-
-1. Mantener `Stasis/ARI` como plano de orquestación único.
-2. Mantener `SIP` como integración soportada sin cambios disruptivos.
-3. Incorporar `Bot Session Manager` y contrato `BotAdapter`.
-4. Implementar `AudioSocketBotAdapter` usando `ARI externalMedia` con `chan_audiosocket`.
-5. Introducir un `Bot Gateway` externo, stateless, multi-tenant y observable.
-6. Normalizar el handoff a `Redis Pub/Sub`.
-7. Extender `CommandDispatcher` con acciones de bot:
-   - `bot_handoff_queue`
-   - `bot_handoff_agent`
-   - `bot_session_end`
-   - `bot_fallback_human`
-8. Mantener `SIP REFER` como compatibilidad y opción híbrida.
-
-### 10.3 Tradeoff final
-
-Se agrega un componente nuevo, `Bot Gateway`, y con eso aumenta la complejidad operacional. Ese costo es correcto porque compra cuatro beneficios estructurales:
-
-- desacople real entre transporte y negocio
-- soporte simultáneo SIP + AudioSocket
-- handoff consistente independientemente del proveedor bot
-- base limpia para escalar voicebots multi-tenant en producción
-
-### 10.4 Recomendación ejecutiva
-
-La plataforma no debe elegir entre SIP y AudioSocket. Debe soportar ambos bajo un mismo modelo de `BotSession`, con `Stasis/ARI` como autoridad, `Redis Pub/Sub` como canal de handoff y `Bot Gateway` como punto de adaptación para AudioSocket.
-
-Ese es el diseño más evolutivo, compatible con producción y con menor riesgo de romper el ACD actual.
-
-## Referencias técnicas
+## 13. Referencias
 
 - Asterisk ARI `externalMedia`: [Channels REST API](https://docs.asterisk.org/Latest_API/API_Documentation/Asterisk_REST_Interface/Channels_REST_API/)
-- Asterisk `AudioSocket` protocol: [AudioSocket](https://docs.asterisk.org/Configuration/Channel-Drivers/AudioSocket/)
+- Protocolo AudioSocket: [AudioSocket](https://docs.asterisk.org/Configuration/Channel-Drivers/AudioSocket/)
+- Componente gateway: [`../../audiosocket/README.md`](../../audiosocket/README.md)
+- Código ACD clave:
+  - `source/ari-app/services/call_manager.py` → `dial_voicebot_audiosocket`
+  - `source/ari-app/services/command_dispatcher.py` → `voicebot_handoff`
+  - `source/ari-app/services/distribution_service.py` → loop transport + `begin_voicebot_handoff`
+  - `source/ari-app/sip_refer_listener.py` → path SIP

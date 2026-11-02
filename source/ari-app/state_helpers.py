@@ -81,7 +81,7 @@ def effective_queue_campaign_id(ctx: CallContext) -> Optional[int]:
     Tras blind_to_campaign difiere de id_camp (atribución CDR).
     """
     dist = getattr(ctx, "distribution_campaign_id", None)
-    if dist is not None:
+    if dist is not None and isinstance(dist, (int, str)):
         return dist
     return ctx.id_camp
 
@@ -91,9 +91,9 @@ def call_transfer_routing_active(ctx: Any) -> bool:
     True mientras hay transferencia en curso o blind con pierna pendiente de cierre de reporting,
     o ya hubo una transferencia finalizada (is_transferred). Usar en router en lugar de is_transferred solo.
     """
-    if getattr(ctx, "is_transferred", False):
+    if getattr(ctx, "is_transferred", False) is True:
         return True
-    if getattr(ctx, "transfer_in_progress", False):
+    if getattr(ctx, "transfer_in_progress", False) is True:
         return True
     if getattr(ctx, "blind_transfer_report_state", None) == "requested":
         return True
@@ -107,17 +107,19 @@ def call_has_prior_agent_handling(ctx: Any) -> bool:
     Tras blind_to_campaign el agente se desvincula (agent_connected_channel=None) mientras el cliente
     espera en la cola destino; no usar la ausencia de pierna de agente como proxy de «nunca atendida».
     """
-    if getattr(ctx, "transfer_in_progress", False):
+    if getattr(ctx, "transfer_in_progress", False) is True:
         return True
-    if getattr(ctx, "is_transferred", False):
+    if getattr(ctx, "is_transferred", False) is True:
         return True
-    try:
-        if int(getattr(ctx, "transfer_count", 0) or 0) > 0:
-            return True
-    except (TypeError, ValueError):
-        pass
-    segs = getattr(ctx, "agent_segments", None) or []
-    return bool(segs)
+    tc = getattr(ctx, "transfer_count", 0)
+    if isinstance(tc, (int, float, str)) and not isinstance(tc, bool):
+        try:
+            if int(tc or 0) > 0:
+                return True
+        except (TypeError, ValueError):
+            pass
+    segs = getattr(ctx, "agent_segments", None)
+    return isinstance(segs, (list, tuple)) and len(segs) > 0
 
 
 def finalize_current_agent_segment(ctx: CallContext) -> float:

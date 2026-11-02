@@ -69,15 +69,16 @@ end
 return 0
 """
 
-# KEYS[1]=offer KEYS[2]=OML:AGENT KEYS[3]=lock KEYS[4]=lease
+# KEYS[1]=offer KEYS[2]=OML:AGENT KEYS[3]=lock KEYS[4]=lease KEYS[5]=cooldown
 # ARGV[1]=call_id ARGV[2]=priority ARGV[3]=enqueued_at ARGV[4]=ttl
 # ARGV[5]=READY ARGV[6]=DIALING ARGV[7]=timestamp
-# No steal si STATUS≠READY o hay lock/lease. Claim+READY→DIALING atómico.
+# No steal si STATUS≠READY o hay lock/lease/cooldown. Claim+READY→DIALING atómico.
 _CLAIM_AND_RESERVE_SCRIPT = """
 local offer_key = KEYS[1]
 local agent_key = KEYS[2]
 local lock_key = KEYS[3]
 local lease_key = KEYS[4]
+local cooldown_key = KEYS[5]
 local my_call = ARGV[1]
 local my_pri = tonumber(ARGV[2])
 local my_enq = tonumber(ARGV[3])
@@ -95,6 +96,9 @@ if redis.call('EXISTS', lock_key) == 1 then
   return 0
 end
 if redis.call('EXISTS', lease_key) == 1 then
+  return 0
+end
+if redis.call('EXISTS', cooldown_key) == 1 then
   return 0
 end
 
@@ -144,6 +148,7 @@ if current2 ~= ready then
   return 0
 end
 redis.call('HSET', agent_key, 'STATUS', dialing, 'TIMESTAMP', ts, 'CALLID', my_call)
+redis.call('SET', cooldown_key, my_call, 'EX', ttl)
 return 1
 """
 
@@ -224,6 +229,7 @@ class OfferCoordinator:
         agent_key = f"OML:AGENT:{agent_id}"
         lock_key = RedisKeys.agent_lock(str(agent_id))
         lease_key = RedisKeys.agent_reservation_lease(str(agent_id))
+        cooldown_key = RedisKeys.agent_offer_cooldown(str(agent_id))
         ts = str(int(datetime.now().timestamp()))
         ready = AgentStatus.READY.value
         dialing = AgentStatus.DIAL_CALL.value
@@ -234,6 +240,7 @@ class OfferCoordinator:
                 agent_key,
                 lock_key,
                 lease_key,
+                cooldown_key,
                 call_id,
                 priority,
                 enqueued_at_ms,
@@ -244,7 +251,7 @@ class OfferCoordinator:
             )
         try:
             result = self._claim_and_reserve(
-                keys=[offer_key, agent_key, lock_key, lease_key],
+                keys=[offer_key, agent_key, lock_key, lease_key, cooldown_key],
                 args=[
                     str(call_id),
                     f"{float(priority):.6f}",
@@ -276,6 +283,7 @@ class OfferCoordinator:
                 agent_key,
                 lock_key,
                 lease_key,
+                cooldown_key,
                 call_id,
                 priority,
                 enqueued_at_ms,
@@ -321,6 +329,7 @@ class OfferCoordinator:
         agent_key: str,
         lock_key: str,
         lease_key: str,
+        cooldown_key: str,
         call_id: str,
         priority: float,
         enqueued_at_ms: float,
@@ -336,7 +345,11 @@ class OfferCoordinator:
                 status = status.decode("utf-8")
             if status != ready:
                 return False
-            if self.redis.exists(lock_key) or self.redis.exists(lease_key):
+            if (
+                self.redis.exists(lock_key)
+                or self.redis.exists(lease_key)
+                or self.redis.exists(cooldown_key)
+            ):
                 return False
 
             cur = self.redis.get(offer_key)
@@ -379,6 +392,7 @@ class OfferCoordinator:
                     "CALLID": str(call_id),
                 },
             )
+            self.redis.set(cooldown_key, str(call_id), ex=int(ttl_sec))
             return True
         except RedisError:
             # Fail-closed si no podemos leer/escribir estado

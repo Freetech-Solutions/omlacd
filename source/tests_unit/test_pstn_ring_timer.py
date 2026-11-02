@@ -105,6 +105,15 @@ class TestPstnRingTimerService(unittest.TestCase):
         time.sleep(1.2)
         self.assertFalse(fired.is_set())
 
+    def test_on_timeout_after_cancel_is_noop(self):
+        """Si _on_timeout despierta justo cuando cancel() ya quitó el timer, no debe colgar el canal."""
+        self.store.register(self.channel_id, {"local_cancel": False})
+        self.timer_svc.schedule(self.channel_id, 60)
+        self.timer_svc.cancel(self.channel_id)
+        self.timer_svc._on_timeout(self.channel_id)
+        self.mock_ari.hangup_channel.assert_not_called()
+        self.assertFalse(self.store.get(self.channel_id).get("local_cancel"))
+
 
 if __name__ == "__main__":
     unittest.main()
