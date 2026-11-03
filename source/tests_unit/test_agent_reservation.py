@@ -219,7 +219,8 @@ def test_handle_agent_answer_keeps_lock_and_marks_accepted(
     mock_redis.delete.assert_not_called()
     agent_status_service.try_transition_status.assert_not_called()
     assert ctx.distribution_answer_accepted is True
-    assert mock_redis.expire.call_count == 2
+    # lock + lease + offer cooldown
+    assert mock_redis.expire.call_count == 3
 
 
 def test_handle_agent_answer_no_op_when_channel_mismatch(mock_redis, agent_status_service):
@@ -236,7 +237,7 @@ def test_handle_agent_answer_no_op_when_channel_mismatch(mock_redis, agent_statu
 def test_handle_channel_failure_releases_lock_with_restore_ready(
     mock_redis, agent_status_service
 ):
-    agent_status_service.release_distribution_reservation = MagicMock(return_value=True)
+    agent_status_service.penalize_failed_distribution_offer = MagicMock(return_value=True)
     svc = _build_distribution_service(mock_redis, agent_status_service)
     channel_id = "agent-ch-1"
     with svc._dialing_lock:
@@ -245,9 +246,10 @@ def test_handle_channel_failure_releases_lock_with_restore_ready(
 
     assert svc.handle_channel_failure("call-1", channel_id) is True
 
-    agent_status_service.release_distribution_reservation.assert_called_once_with(
-        42, "call-1", restore_ready=True
-    )
+    agent_status_service.penalize_failed_distribution_offer.assert_called_once()
+    args, kwargs = agent_status_service.penalize_failed_distribution_offer.call_args
+    assert args[0] == 42
+    assert args[1] == "call-1"
     mock_redis.delete.assert_not_called()
 
 

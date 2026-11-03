@@ -93,7 +93,8 @@ class TestHandleAgentAnswer:
         assert ctx.distribution_answer_accepted is True
         assert ctx.agent_id == 42
         state_store.register_unsafe.assert_called()
-        assert redis_client.expire.call_count == 2
+        # lock + lease + offer cooldown
+        assert redis_client.expire.call_count == 3
         assert "call-1" not in svc._active_attempts
         assert "call-1" not in svc._active_attempt_agents
 

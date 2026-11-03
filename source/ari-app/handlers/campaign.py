@@ -161,6 +161,42 @@ class ProgressiveCampaignHandler(BaseHandler):
             return channel_id == pstn_channel or channel_id == uniqueid_pstn
         return self.pstn_channel_id is not None and channel_id == self.pstn_channel_id
 
+    def _discard_duplicate_setup_bridge(
+        self,
+        call_id: str,
+        channel_id: str,
+        loser_bridge_id: str,
+        winner_ctx: CallContext,
+    ) -> None:
+        """Segundo setup del mismo call_id: destruir bridge perdedor y canal duplicado."""
+        logger.warning(
+            "ProgressiveCampaignHandler: setup duplicado call_id=%s; destruyendo bridge "
+            "perdedor %s (ganador bridge=%s)",
+            call_id,
+            loser_bridge_id,
+            getattr(winner_ctx, "bridge_id", None),
+        )
+        try:
+            self.ari_client.destroy_bridge(loser_bridge_id)
+        except Exception:
+            logger.exception(
+                "ProgressiveCampaignHandler: error destruyendo bridge perdedor %s "
+                "call_id=%s",
+                loser_bridge_id,
+                call_id,
+            )
+        winner_pstn = getattr(winner_ctx, "pstn_channel", None)
+        if channel_id and channel_id != winner_pstn:
+            try:
+                self.ari_client.hangup_channel(channel_id)
+            except Exception:
+                logger.exception(
+                    "ProgressiveCampaignHandler: error colgando canal duplicado %s "
+                    "call_id=%s",
+                    channel_id,
+                    call_id,
+                )
+
     def _pstn_safety_net_cleanup(self, context: CallContext, call_id: str) -> None:
         """Purga recursos ARI cuando el PSTN se va (bridge, agentes, distribución)."""
         bridge_id = getattr(context, "bridge_id", None)
@@ -600,20 +636,6 @@ class ProgressiveCampaignHandler(BaseHandler):
             if treat_as_timeout:
                 self._pstn_hangup_initiated_by_app.discard(channel_id)
 
-        if not treat_as_timeout and context.queue_timeout_seconds is not None:
-            if is_post_voicebot_handoff:
-                if vb_end_ts:
-                    try:
-                        vb_end_dt = datetime.fromisoformat(vb_end_ts.replace("Z", "+00:00"))
-                        end_dt = datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
-                        wait_after_handoff = max(0.0, (end_dt - vb_end_dt).total_seconds())
-                        if wait_after_handoff >= max(0, context.queue_timeout_seconds - 1):
-                            treat_as_timeout = True
-                    except Exception:
-                        pass
-            elif bridge_wait_time >= max(0, context.queue_timeout_seconds - 1):
-                treat_as_timeout = True
-
         self._report_progressive_pstn_end(
             call_id=call_id,
             channel_id=channel_id,
@@ -806,10 +828,14 @@ class ProgressiveCampaignHandler(BaseHandler):
         uniqueid: str,
         progressive_data: Dict[str, Any],
         queue_timeout_seconds: Optional[int] = None,
+        pstn_answered_ts: Optional[str] = None,
     ) -> CallContext:
         with self.state_store.lock(call_id):
             existing = self.state_store.get(call_id)
             if existing:
+                if pstn_answered_ts and not getattr(existing, "pstn_answered_ts", None):
+                    existing.pstn_answered_ts = pstn_answered_ts
+                    self.state_store.register_unsafe(call_id, existing)
                 return existing
             id_camp = progressive_data.get("id_camp")
             id_customer = progressive_data.get("id_customer")
@@ -829,9 +855,15 @@ class ProgressiveCampaignHandler(BaseHandler):
                 call_type=call_type,
                 bridge_created_ts=datetime.now().isoformat(),
                 queue_timeout_seconds=queue_timeout_seconds,
+                pstn_answered_ts=pstn_answered_ts,
             )
             existing_after = self.state_store.get(call_id)
             if existing_after:
+                if pstn_answered_ts and not getattr(
+                    existing_after, "pstn_answered_ts", None
+                ):
+                    existing_after.pstn_answered_ts = pstn_answered_ts
+                    self.state_store.register_unsafe(call_id, existing_after)
                 return existing_after
             self.state_store.register_unsafe(call_id, context)
             return context
@@ -964,6 +996,32 @@ class ProgressiveCampaignHandler(BaseHandler):
                         channel_id=channel_id,
                     )
 
+            # Fail-closed: ya hay contexto para este call_id → no crear otro bridge.
+            try:
+                existing_early = self.state_store.get(call_id)
+            except Exception:
+                existing_early = None
+            if existing_early:
+                logger.warning(
+                    "ProgressiveCampaignHandler.on_start: contexto ya existe para "
+                    "call_id=%s (bridge=%s); omitiendo setup duplicado (channel=%s)",
+                    call_id,
+                    getattr(existing_early, "bridge_id", None),
+                    channel_id,
+                )
+                existing_pstn = getattr(existing_early, "pstn_channel", None)
+                if channel_id and channel_id != existing_pstn:
+                    try:
+                        self.ari_client.hangup_channel(channel_id)
+                    except Exception:
+                        logger.exception(
+                            "ProgressiveCampaignHandler.on_start: error colgando canal "
+                            "duplicado %s call_id=%s",
+                            channel_id,
+                            call_id,
+                        )
+                return
+
             bridge_id = self.call_service.create_bridge(bridge_type="mixing")
             if not bridge_id:
                 logger.error(
@@ -1018,11 +1076,38 @@ class ProgressiveCampaignHandler(BaseHandler):
         max_wait_time = campaign_cfg.get("max_wait_time", 3600)
         strategy = campaign_cfg.get("strategy", "fewestcalls")
         ring_timeout = campaign_cfg.get("ring_timeout", settings.DEFAULT_ORIGINATE_TIMEOUT)
+        if context_already_registered:
+            with self.state_store.lock(call_id):
+                existing_ctx = self.state_store.get(call_id)
+                if existing_ctx and not getattr(existing_ctx, "pstn_answered_ts", None):
+                    existing_ctx.pstn_answered_ts = datetime.now().isoformat()
+                    self.state_store.register_unsafe(call_id, existing_ctx)
+        pstn_answered_ts = None
         if not context_already_registered:
             try:
                 self.ari_client.answer(channel_id)
             except Exception:
-                logger.exception("Error respondiendo canal PSTN %s", channel_id)
+                logger.exception(
+                    "Error respondiendo canal PSTN %s; abortando setup progressive "
+                    "(bridge=%s, call_id=%s)",
+                    channel_id,
+                    bridge_id,
+                    call_id,
+                )
+                try:
+                    self.ari_client.destroy_bridge(bridge_id)
+                except Exception:
+                    logger.exception(
+                        "Error destruyendo bridge %s tras fallo de answer", bridge_id
+                    )
+                try:
+                    self.ari_client.hangup_channel(channel_id)
+                except Exception:
+                    logger.exception(
+                        "Error colgando canal PSTN %s tras fallo de answer", channel_id
+                    )
+                return
+            pstn_answered_ts = datetime.now().isoformat()
             try:
                 self.call_service.add_channel_to_bridge(bridge_id, channel_id)
             except Exception:
@@ -1036,14 +1121,20 @@ class ProgressiveCampaignHandler(BaseHandler):
             logger.exception("Error iniciando MOH en bridge %s", bridge_id)
 
         if not context_already_registered:
-            self._create_and_register_context(
+            ctx = self._create_and_register_context(
                 call_id=call_id,
                 channel_id=channel_id,
                 bridge_id=bridge_id,
                 uniqueid=uniqueid,
                 progressive_data=progressive_data,
                 queue_timeout_seconds=max_wait_time,
+                pstn_answered_ts=pstn_answered_ts,
             )
+            if getattr(ctx, "bridge_id", None) and str(ctx.bridge_id) != str(bridge_id):
+                self._discard_duplicate_setup_bridge(
+                    call_id, channel_id, bridge_id, ctx
+                )
+                return
 
         if self.queue_event_manager:
             try:
@@ -1318,6 +1409,30 @@ class ProgressiveCampaignHandler(BaseHandler):
             "voicebot_strategy": pending_data.get("voicebot_strategy", "random"),
         }
 
+        try:
+            existing_early = self.state_store.get(call_id)
+        except Exception:
+            existing_early = None
+        if existing_early:
+            logger.warning(
+                "ProgressiveCampaignHandler.on_amd_done: contexto ya existe para "
+                "call_id=%s; omitiendo setup duplicado (channel=%s)",
+                call_id,
+                channel_id,
+            )
+            existing_pstn = getattr(existing_early, "pstn_channel", None)
+            if channel_id and channel_id != existing_pstn:
+                try:
+                    self.ari_client.hangup_channel(channel_id)
+                except Exception:
+                    pass
+            if self.redis_client:
+                try:
+                    self.redis_client.delete(pending_key)
+                except Exception:
+                    pass
+            return
+
         bridge_id = self.call_service.create_bridge(bridge_type="mixing")
         if not bridge_id:
             logger.error(
@@ -1336,8 +1451,10 @@ class ProgressiveCampaignHandler(BaseHandler):
 
         # A2: registrar CallContext mínimo ANTES de Dial ANSWER al dialer,
         # para que un ChannelDestroyed en esta ventana no se clasifique mal.
+        pstn_answered_ts = None
         try:
             self.ari_client.answer(channel_id)
+            pstn_answered_ts = datetime.now().isoformat()
         except Exception:
             logger.exception(
                 "ProgressiveCampaignHandler.on_amd_done: error answer PSTN %s",
@@ -1364,13 +1481,14 @@ class ProgressiveCampaignHandler(BaseHandler):
             return
 
         try:
-            self._create_and_register_context(
+            ctx = self._create_and_register_context(
                 call_id=call_id,
                 channel_id=channel_id,
                 bridge_id=bridge_id,
                 uniqueid=uniqueid,
                 progressive_data=progressive_data,
                 queue_timeout_seconds=campaign_cfg.get("max_wait_time", 3600),
+                pstn_answered_ts=pstn_answered_ts,
             )
         except Exception:
             logger.exception(
@@ -1387,6 +1505,15 @@ class ProgressiveCampaignHandler(BaseHandler):
                 tel_customer=tel_customer,
                 call_id=call_id,
             )
+            return
+
+        if getattr(ctx, "bridge_id", None) and str(ctx.bridge_id) != str(bridge_id):
+            self._discard_duplicate_setup_bridge(call_id, channel_id, bridge_id, ctx)
+            if self.redis_client:
+                try:
+                    self.redis_client.delete(pending_key)
+                except Exception:
+                    pass
             return
 
         if self.redis_client:
@@ -1524,11 +1651,16 @@ class ProgressiveCampaignHandler(BaseHandler):
             agent_id_for_event: Optional[int] = None
             phone_number: Optional[str] = None
             pstn_for_redistribute: Optional[str] = None
+            is_voicebot_for_event = False
             with self.state_store.lock(call_id):
                 fresh = self.state_store.get(call_id)
                 if not fresh:
-                    return
-                if bridge_ok:
+                    logger.info(
+                        "ProgressiveCampaignHandler.on_agent_stasis_start: contexto "
+                        "desapareció tras bridge para call_id=%s",
+                        call_id,
+                    )
+                elif bridge_ok:
                     fresh.agent_connected_channel = channel_id
                     if fresh.agent_attempt_channel == channel_id:
                         fresh.agent_attempt_channel = None
@@ -1543,18 +1675,40 @@ class ProgressiveCampaignHandler(BaseHandler):
                             fresh.agent_id = int(agent_id_str)
                         except (ValueError, TypeError):
                             pass
+                    self.state_store.register_unsafe(call_id, fresh)
+                    id_camp = fresh.id_camp
+                    id_customer_for_event = getattr(fresh, "id_customer", None)
+                    agent_id_for_event = getattr(fresh, "agent_id", None)
+                    is_voicebot_for_event = getattr(fresh, "is_voicebot", False)
+                    queue_uniqueid = fresh.uniqueid_pstn or call_id
+                    phone_number = getattr(fresh, "phone_number", None)
+                    pstn_for_redistribute = getattr(fresh, "pstn_channel", None)
                 else:
                     fresh.distribution_answer_accepted = False
                     if fresh.agent_attempt_channel == channel_id:
                         fresh.agent_attempt_channel = None
-                self.state_store.register_unsafe(call_id, fresh)
-                id_camp = fresh.id_camp
-                id_customer_for_event = getattr(fresh, "id_customer", None)
-                agent_id_for_event = getattr(fresh, "agent_id", None)
-                is_voicebot_for_event = getattr(fresh, "is_voicebot", False)
-                queue_uniqueid = fresh.uniqueid_pstn or call_id
-                phone_number = getattr(fresh, "phone_number", None)
-                pstn_for_redistribute = getattr(fresh, "pstn_channel", None)
+                    self.state_store.register_unsafe(call_id, fresh)
+                    id_camp = fresh.id_camp
+                    id_customer_for_event = getattr(fresh, "id_customer", None)
+                    agent_id_for_event = getattr(fresh, "agent_id", None)
+                    is_voicebot_for_event = getattr(fresh, "is_voicebot", False)
+                    queue_uniqueid = fresh.uniqueid_pstn or call_id
+                    phone_number = getattr(fresh, "phone_number", None)
+                    pstn_for_redistribute = getattr(fresh, "pstn_channel", None)
+
+            if not fresh:
+                if agent_id_str and self.agent_status_service:
+                    try:
+                        self.agent_status_service.release_distribution_reservation(
+                            int(agent_id_str), call_id, restore_ready=True
+                        )
+                    except (ValueError, TypeError):
+                        pass
+                try:
+                    self.ari_client.hangup_channel(channel_id)
+                except Exception:
+                    pass
+                return
 
             if not bridge_ok:
                 if agent_id_for_event is not None and self.agent_status_service:
@@ -1763,29 +1917,36 @@ class ProgressiveCampaignHandler(BaseHandler):
                     return
 
             # Agente humano: pierna conectada destruida sin transferencia → POSTCALL
+            # y colgar PSTN/bridge (paridad con voicebot; HangupRequest puede no llegar).
             if (
                 is_agent_leg
                 and not getattr(context, "is_voicebot", False)
-                and getattr(context, "agent_id", None) is not None
                 and channel_id == active_agent_channel(context)
                 and not getattr(context, "transfer_in_progress", False)
                 and not getattr(context, "voicebot_transfer_waiting", False)
-                and self.agent_status_service
             ):
-                try:
-                    self.agent_status_service.set_postcall_and_clear_fields(
-                        context.agent_id,
-                        call_id=context.call_id,
-                        campaign_id=getattr(context, "id_camp", None),
-                    )
-                except Exception as e:
-                    logger.warning(
-                        "ProgressiveCampaignHandler.on_failure: error set_postcall agente %s "
-                        "call_id=%s: %s",
-                        context.agent_id,
-                        context.call_id,
-                        e,
-                    )
+                if (
+                    getattr(context, "agent_id", None) is not None
+                    and self.agent_status_service
+                ):
+                    try:
+                        self.agent_status_service.set_postcall_and_clear_fields(
+                            context.agent_id,
+                            call_id=context.call_id,
+                            campaign_id=getattr(context, "id_camp", None),
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "ProgressiveCampaignHandler.on_failure: error set_postcall agente %s "
+                            "call_id=%s: %s",
+                            context.agent_id,
+                            context.call_id,
+                            e,
+                        )
+                self._hangup_pstn_and_destroy_bridge_after_agent(
+                    context, source="human_agent_channel_destroyed"
+                )
+                return
 
             if not self._is_pstn_leg_channel(channel_id, context):
                 return

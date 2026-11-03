@@ -164,15 +164,20 @@ class InMemoryReservationRedis:
         raise ValueError(f"Script no soportado en mock: {script[:40]}")
 
     def _reserve(self, keys: list, args: list) -> int:
-        agent_key, lock_key, lease_key = keys
+        agent_key, lock_key, lease_key = keys[0], keys[1], keys[2]
+        cooldown_key = keys[3] if len(keys) > 3 else None
         ready_status, dialing_status, timestamp, call_id, ttl = args
         with self._lock:
             if self.hashes.get(agent_key, {}).get("STATUS") != ready_status:
                 return 0
             if lock_key in self.strings or lease_key in self.strings:
                 return 0
+            if cooldown_key and cooldown_key in self.strings:
+                return 0
             self.strings[lock_key] = call_id
             self.strings[lease_key] = call_id
+            if cooldown_key:
+                self.strings[cooldown_key] = call_id
             self.hashes.setdefault(agent_key, {})
             self.hashes[agent_key].update(
                 {
@@ -184,12 +189,14 @@ class InMemoryReservationRedis:
             return 1
 
     def _release(self, keys: list, args: list) -> int:
-        agent_key, lock_key, lease_key = keys
+        agent_key, lock_key, lease_key = keys[0], keys[1], keys[2]
+        cooldown_key = keys[3] if len(keys) > 3 else None
         call_id, dialing_status, ready_status, timestamp, restore_flag = args[:5]
         ringing_status = args[5] if len(args) > 5 else "RINGING"
         with self._lock:
             lock_val = self.strings.get(lock_key)
             lease_val = self.strings.get(lease_key)
+            cool_val = self.strings.get(cooldown_key) if cooldown_key else None
             if lock_val and lock_val != call_id:
                 return 0
             if lease_val and lease_val != call_id:
@@ -198,6 +205,8 @@ class InMemoryReservationRedis:
                 del self.strings[lock_key]
             if lease_val == call_id:
                 del self.strings[lease_key]
+            if cooldown_key and cool_val == call_id:
+                del self.strings[cooldown_key]
             if restore_flag == "1":
                 data = self.hashes.get(agent_key, {})
                 if data.get("STATUS") in (dialing_status, ringing_status):
@@ -209,7 +218,8 @@ class InMemoryReservationRedis:
             return 1
 
     def _revert_stale(self, keys: list, args: list) -> int:
-        agent_key, lock_key, lease_key = keys
+        agent_key, lock_key, lease_key = keys[0], keys[1], keys[2]
+        cooldown_key = keys[3] if len(keys) > 3 else None
         dialing_status, ready_status, timestamp = args[:3]
         ringing_status = args[3] if len(args) > 3 else "RINGING"
         with self._lock:
@@ -217,6 +227,8 @@ class InMemoryReservationRedis:
             if status not in (dialing_status, ringing_status):
                 return 0
             if lock_key in self.strings or lease_key in self.strings:
+                return 0
+            if cooldown_key and cooldown_key in self.strings:
                 return 0
             self.hashes.setdefault(agent_key, {})
             self.hashes[agent_key]["STATUS"] = ready_status
