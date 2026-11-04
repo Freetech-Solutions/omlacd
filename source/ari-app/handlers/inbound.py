@@ -90,11 +90,46 @@ class InboundCallHandler(BaseHandler):
         """True si channel_id es la pierna PSTN de la llamada inbound."""
         pstn_channel = getattr(context, "pstn_channel", None)
         uniqueid_pstn = getattr(context, "uniqueid_pstn", None)
-        return (
-            channel_id == pstn_channel
-            or channel_id == uniqueid_pstn
-            or (self.pstn_channel_id is not None and channel_id == self.pstn_channel_id)
+        if pstn_channel is not None or uniqueid_pstn is not None:
+            return channel_id == pstn_channel or channel_id == uniqueid_pstn
+        return self.pstn_channel_id is not None and channel_id == self.pstn_channel_id
+
+    def _discard_duplicate_setup_bridge(
+        self,
+        call_id: str,
+        channel_id: str,
+        loser_bridge_id: str,
+        winner_ctx: CallContext,
+    ) -> None:
+        """
+        Segundo setup del mismo call_id: destruir bridge perdedor y colgar canal
+        duplicado si no es el PSTN del contexto ganador.
+        """
+        logger.warning(
+            "InboundCallHandler: setup duplicado call_id=%s; destruyendo bridge perdedor %s "
+            "(ganador bridge=%s)",
+            call_id,
+            loser_bridge_id,
+            getattr(winner_ctx, "bridge_id", None),
         )
+        try:
+            self.ari_client.destroy_bridge(loser_bridge_id)
+        except Exception:
+            logger.exception(
+                "InboundCallHandler: error destruyendo bridge perdedor %s call_id=%s",
+                loser_bridge_id,
+                call_id,
+            )
+        winner_pstn = getattr(winner_ctx, "pstn_channel", None)
+        if channel_id and channel_id != winner_pstn:
+            try:
+                self.ari_client.hangup_channel(channel_id)
+            except Exception:
+                logger.exception(
+                    "InboundCallHandler: error colgando canal duplicado %s call_id=%s",
+                    channel_id,
+                    call_id,
+                )
 
     def _pstn_safety_net_cleanup(self, context: CallContext, call_id: str) -> None:
         """
@@ -251,17 +286,6 @@ class InboundCallHandler(BaseHandler):
             treat_as_timeout = channel_id in self._pstn_hangup_initiated_by_app
             if treat_as_timeout:
                 self._pstn_hangup_initiated_by_app.discard(channel_id)
-
-        if not treat_as_timeout and fresh_ctx.queue_timeout_seconds is not None:
-            if bridge_wait_time >= max(0, fresh_ctx.queue_timeout_seconds - 1):
-                treat_as_timeout = True
-                logger.info(
-                    "InboundCallHandler._report_inbound_pstn_end: EXIT_TIMEOUT por tiempo en cola "
-                    "(call_id=%s, bridge_wait_time=%.1fs, queue_timeout=%ss)",
-                    call_id,
-                    bridge_wait_time,
-                    fresh_ctx.queue_timeout_seconds,
-                )
 
         queue_camp = str(effective_queue_campaign_id(fresh_ctx) or "")
         prior_agent = call_has_prior_agent_handling(fresh_ctx)
@@ -635,6 +659,7 @@ class InboundCallHandler(BaseHandler):
         uniqueid: str,
         inbound_data: Dict[str, Any],
         queue_timeout_seconds: Optional[int] = None,
+        pstn_answered_ts: Optional[str] = None,
     ) -> CallContext:
         """
         Crea y registra un nuevo contexto de llamada inbound de forma thread-safe.
@@ -646,6 +671,11 @@ class InboundCallHandler(BaseHandler):
                     "Contexto inbound ya existe para call_id=%s, reutilizando contexto existente",
                     call_id,
                 )
+                if pstn_answered_ts and not getattr(
+                    existing_context, "pstn_answered_ts", None
+                ):
+                    existing_context.pstn_answered_ts = pstn_answered_ts
+                    self.state_store.register_unsafe(call_id, existing_context)
                 return existing_context
 
             id_camp = inbound_data.get("id_camp")
@@ -669,6 +699,7 @@ class InboundCallHandler(BaseHandler):
                 call_type=call_type,
                 bridge_created_ts=datetime.now().isoformat(),
                 queue_timeout_seconds=queue_timeout_seconds,
+                pstn_answered_ts=pstn_answered_ts,
             )
 
             # Doble chequeo para evitar race conditions
@@ -679,6 +710,11 @@ class InboundCallHandler(BaseHandler):
                     "descartando contexto local y usando el existente",
                     call_id,
                 )
+                if pstn_answered_ts and not getattr(
+                    existing_after, "pstn_answered_ts", None
+                ):
+                    existing_after.pstn_answered_ts = pstn_answered_ts
+                    self.state_store.register_unsafe(call_id, existing_after)
                 return existing_after
 
             self.state_store.register_unsafe(call_id, context)
@@ -738,6 +774,32 @@ class InboundCallHandler(BaseHandler):
             call_id = inbound_data.get("callid") or channel_id
             uniqueid = inbound_data.get("uniqueid") or channel_id
 
+            # Fail-closed: ya hay contexto para este call_id → no crear otro bridge.
+            try:
+                existing_early = self.state_store.get(call_id)
+            except Exception:
+                existing_early = None
+            if existing_early:
+                logger.warning(
+                    "InboundCallHandler.on_start: contexto ya existe para call_id=%s "
+                    "(bridge=%s); omitiendo setup duplicado (channel=%s)",
+                    call_id,
+                    getattr(existing_early, "bridge_id", None),
+                    channel_id,
+                )
+                existing_pstn = getattr(existing_early, "pstn_channel", None)
+                if channel_id and channel_id != existing_pstn:
+                    try:
+                        self.ari_client.hangup_channel(channel_id)
+                    except Exception:
+                        logger.exception(
+                            "InboundCallHandler.on_start: error colgando canal "
+                            "duplicado %s call_id=%s",
+                            channel_id,
+                            call_id,
+                        )
+                return
+
             # Crear bridge
             bridge_id = self.call_service.create_bridge(bridge_type="mixing")
             if not bridge_id:
@@ -752,7 +814,27 @@ class InboundCallHandler(BaseHandler):
             try:
                 self.ari_client.answer(channel_id)
             except Exception:
-                logger.exception("Error respondiendo canal PSTN %s", channel_id)
+                logger.exception(
+                    "Error respondiendo canal PSTN %s; abortando setup inbound "
+                    "(bridge=%s)",
+                    channel_id,
+                    bridge_id,
+                )
+                try:
+                    self.ari_client.destroy_bridge(bridge_id)
+                except Exception:
+                    logger.exception(
+                        "Error destruyendo bridge %s tras fallo de answer", bridge_id
+                    )
+                try:
+                    self.ari_client.hangup_channel(channel_id)
+                except Exception:
+                    logger.exception(
+                        "Error colgando canal PSTN %s tras fallo de answer", channel_id
+                    )
+                return
+
+            pstn_answered_ts = datetime.now().isoformat()
 
             try:
                 self.call_service.add_channel_to_bridge(bridge_id, channel_id)
@@ -778,14 +860,21 @@ class InboundCallHandler(BaseHandler):
                 logger.exception("Error iniciando MOH en bridge %s", bridge_id)
 
             # Crear y registrar contexto de llamada
-            self._create_and_register_context(
+            ctx = self._create_and_register_context(
                 call_id=call_id,
                 channel_id=channel_id,
                 bridge_id=bridge_id,
                 uniqueid=uniqueid,
                 inbound_data=inbound_data,
                 queue_timeout_seconds=max_wait_time,
+                pstn_answered_ts=pstn_answered_ts,
             )
+            # Carrera: otro thread ganó el register con otro bridge_id.
+            if getattr(ctx, "bridge_id", None) and str(ctx.bridge_id) != str(bridge_id):
+                self._discard_duplicate_setup_bridge(
+                    call_id, channel_id, bridge_id, ctx
+                )
+                return
 
             # Reportar entrada a cola
             try:
@@ -1028,6 +1117,7 @@ class InboundCallHandler(BaseHandler):
             agent_id_for_event: Optional[int] = None
             phone_number: Optional[str] = None
             pstn_for_redistribute: Optional[str] = None
+            is_voicebot_for_event = False
 
             with self.state_store.lock(call_id):
                 fresh_ctx = self.state_store.get(call_id)
@@ -1036,8 +1126,7 @@ class InboundCallHandler(BaseHandler):
                         "InboundCallHandler.on_agent_stasis_start: contexto desapareció tras bridge para call_id=%s",
                         call_id,
                     )
-                    return
-                if bridge_ok:
+                elif bridge_ok:
                     fresh_ctx.agent_connected_channel = channel_id
                     if fresh_ctx.agent_attempt_channel == channel_id:
                         fresh_ctx.agent_attempt_channel = None
@@ -1053,17 +1142,38 @@ class InboundCallHandler(BaseHandler):
                             fresh_ctx.agent_id = int(agent_id_str)
                         except (ValueError, TypeError):
                             pass
+                    self.state_store.register_unsafe(call_id, fresh_ctx)
+                    queue_uniqueid = fresh_ctx.uniqueid_pstn or fresh_ctx.call_id
+                    id_camp = effective_queue_campaign_id(fresh_ctx)
+                    agent_id_for_event = getattr(fresh_ctx, "agent_id", None)
+                    is_voicebot_for_event = getattr(fresh_ctx, "is_voicebot", False)
+                    phone_number = getattr(fresh_ctx, "phone_number", None)
+                    pstn_for_redistribute = getattr(fresh_ctx, "pstn_channel", None)
                 else:
                     fresh_ctx.distribution_answer_accepted = False
                     if fresh_ctx.agent_attempt_channel == channel_id:
                         fresh_ctx.agent_attempt_channel = None
-                self.state_store.register_unsafe(call_id, fresh_ctx)
-                queue_uniqueid = fresh_ctx.uniqueid_pstn or fresh_ctx.call_id
-                id_camp = effective_queue_campaign_id(fresh_ctx)
-                agent_id_for_event = getattr(fresh_ctx, "agent_id", None)
-                is_voicebot_for_event = getattr(fresh_ctx, "is_voicebot", False)
-                phone_number = getattr(fresh_ctx, "phone_number", None)
-                pstn_for_redistribute = getattr(fresh_ctx, "pstn_channel", None)
+                    self.state_store.register_unsafe(call_id, fresh_ctx)
+                    queue_uniqueid = fresh_ctx.uniqueid_pstn or fresh_ctx.call_id
+                    id_camp = effective_queue_campaign_id(fresh_ctx)
+                    agent_id_for_event = getattr(fresh_ctx, "agent_id", None)
+                    is_voicebot_for_event = getattr(fresh_ctx, "is_voicebot", False)
+                    phone_number = getattr(fresh_ctx, "phone_number", None)
+                    pstn_for_redistribute = getattr(fresh_ctx, "pstn_channel", None)
+
+            if not fresh_ctx:
+                if agent_id_str and self.agent_status_service:
+                    try:
+                        self.agent_status_service.release_distribution_reservation(
+                            int(agent_id_str), call_id, restore_ready=True
+                        )
+                    except (ValueError, TypeError):
+                        pass
+                try:
+                    self.ari_client.hangup_channel(channel_id)
+                except Exception:
+                    pass
+                return
 
             if not bridge_ok:
                 if agent_id_for_event is not None and self.agent_status_service:
@@ -1309,29 +1419,36 @@ class InboundCallHandler(BaseHandler):
                     return
 
             # Agente humano: pierna conectada destruida sin transferencia → POSTCALL
+            # y colgar PSTN/bridge (paridad con voicebot; HangupRequest puede no llegar).
             if (
                 is_agent_leg
                 and not getattr(context, "is_voicebot", False)
-                and getattr(context, "agent_id", None) is not None
                 and channel_id == active_agent_channel(context)
                 and not getattr(context, "transfer_in_progress", False)
                 and not getattr(context, "voicebot_transfer_waiting", False)
-                and self.agent_status_service
             ):
-                try:
-                    self.agent_status_service.set_postcall_and_clear_fields(
-                        context.agent_id,
-                        call_id=context.call_id,
-                        campaign_id=getattr(context, "id_camp", None),
-                    )
-                except Exception as e:
-                    logger.warning(
-                        "InboundCallHandler.on_failure: error set_postcall agente %s "
-                        "call_id=%s: %s",
-                        context.agent_id,
-                        context.call_id,
-                        e,
-                    )
+                if (
+                    getattr(context, "agent_id", None) is not None
+                    and self.agent_status_service
+                ):
+                    try:
+                        self.agent_status_service.set_postcall_and_clear_fields(
+                            context.agent_id,
+                            call_id=context.call_id,
+                            campaign_id=getattr(context, "id_camp", None),
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "InboundCallHandler.on_failure: error set_postcall agente %s "
+                            "call_id=%s: %s",
+                            context.agent_id,
+                            context.call_id,
+                            e,
+                        )
+                self._hangup_pstn_and_destroy_bridge_after_agent(
+                    context, source="human_agent_channel_destroyed"
+                )
+                return
 
             pstn_channel = getattr(context, "pstn_channel", None)
             uniqueid_pstn = getattr(context, "uniqueid_pstn", None)

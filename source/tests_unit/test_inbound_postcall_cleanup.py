@@ -69,6 +69,7 @@ class TestInboundPostcallCleanup(unittest.TestCase):
         self.mock_agent_status.set_postcall_and_clear_fields.assert_called_with(
             33,
             call_id=call_id,
+            campaign_id=5,
         )
         self.mock_agent_status.release_voicebot_from_context.assert_called()
 

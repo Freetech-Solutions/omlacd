@@ -727,6 +727,73 @@ class DistributionService:
         with self._on_queue_timeout_callbacks_lock:
             self._on_queue_timeout_callbacks.pop(call_id, None)
 
+    def _cancel_queue_timer(self, call_id: str) -> None:
+        """Cancela y elimina el Timer de cola de call_id si existe."""
+        with self._call_events_lock:
+            old_timer = self._queue_timers.pop(call_id, None)
+        if old_timer is not None:
+            try:
+                old_timer.cancel()
+            except Exception:
+                logger.debug(
+                    "DistributionService._cancel_queue_timer: error cancelando "
+                    "call_id=%s",
+                    call_id,
+                    exc_info=True,
+                )
+
+    def _replace_queue_timer(self, call_id: str, timer: threading.Timer) -> None:
+        """
+        Registra un nuevo Timer de cola cancelando el anterior (si existe).
+
+        Evita Timers huérfanos cuando start_distribution / start_voicebot_distribution
+        se reentran para el mismo call_id sin pasar por stop_distribution.
+        """
+        with self._call_events_lock:
+            old_timer = self._queue_timers.pop(call_id, None)
+            self._queue_timers[call_id] = timer
+        if old_timer is not None:
+            try:
+                old_timer.cancel()
+            except Exception:
+                logger.debug(
+                    "DistributionService._replace_queue_timer: error cancelando timer "
+                    "previo call_id=%s",
+                    call_id,
+                    exc_info=True,
+                )
+
+    def _should_skip_start_distribution(self, call_id: str) -> bool:
+        """
+        True si no debe arrancar loop/timer: llamada ya finalizada o con agente consolidado.
+        """
+        try:
+            with self.state_store.lock(call_id):
+                ctx = self.state_store.get(call_id)
+                if not ctx:
+                    return False
+                if getattr(ctx, "call_ended", False):
+                    logger.info(
+                        "DistributionService: omitiendo start_* call_id=%s (call_ended)",
+                        call_id,
+                    )
+                    return True
+                if active_agent_channel(ctx):
+                    logger.info(
+                        "DistributionService: omitiendo start_* call_id=%s "
+                        "(agente ya conectado=%s)",
+                        call_id,
+                        ctx.agent_connected_channel,
+                    )
+                    return True
+                return False
+        except Exception:
+            logger.exception(
+                "DistributionService._should_skip_start_distribution: error call_id=%s",
+                call_id,
+            )
+            return False
+
     def _agent_lock_ttl(self, ring_timeout: int) -> int:
         """TTL del lock de agente: ring_timeout + margen configurable."""
         return ring_timeout + settings.AGENT_RESERVATION_MARGIN_SEC
@@ -844,6 +911,11 @@ class DistributionService:
             distribution_metadata: Dict para dial_agent_with_headers (id_customer, id_camp, etc.).
             on_queue_timeout_callback: Invocado al dispararse el timeout (call_id, pstn_channel_id).
         """
+        if self._should_skip_start_distribution(call_id):
+            # No arrancar loop/timer nuevo; igual cancelar residual (p.ej. redistribute).
+            self._cancel_queue_timer(call_id)
+            return
+
         loop_gen = self._bump_loop_generation(call_id)
         stop_event, attempt_finished = self._get_or_create_call_events(call_id)
         # Despierta loop previo (si hay) y deja stop limpio para el nuevo.
@@ -903,8 +975,7 @@ class DistributionService:
 
         timer = threading.Timer(queue_timeout_sec, timeout_target)
         timer.daemon = True
-        with self._call_events_lock:
-            self._queue_timers[call_id] = timer
+        self._replace_queue_timer(call_id, timer)
         timer.start()
 
         threading.Thread(
@@ -934,6 +1005,10 @@ class DistributionService:
         Inicia el loop de distribución hacia voicebots (trunk externo) y el timer de timeout de cola.
         Respeta MAXQCALLS vía contadores OML:CALLDATA:VOICEBOT-CALLS:{id_camp}:{id_agent_voicebot}.
         """
+        if self._should_skip_start_distribution(call_id):
+            self._cancel_queue_timer(call_id)
+            return
+
         stop_event, attempt_finished = self._get_or_create_call_events(call_id)
         stop_event.clear()
         attempt_finished.clear()
@@ -952,8 +1027,7 @@ class DistributionService:
 
         timer = threading.Timer(queue_timeout_sec, timeout_target)
         timer.daemon = True
-        with self._call_events_lock:
-            self._queue_timers[call_id] = timer
+        self._replace_queue_timer(call_id, timer)
         timer.start()
 
         meta = distribution_metadata or {}
@@ -1555,6 +1629,7 @@ class DistributionService:
         Tras fallo de bridge / ONCALL post-answer: limpia flags, asegura waiting ZSET
         y reinicia start_distribution con el tiempo de cola restante.
         """
+        cancel_residual_timer = False
         try:
             with self.state_store.lock(call_id):
                 context = self.state_store.get(call_id)
@@ -1563,39 +1638,47 @@ class DistributionService:
                         "redistribute_after_failed_consolidation: sin contexto call_id=%s",
                         call_id,
                     )
-                    return False
-                if getattr(context, "call_ended", False):
-                    return False
-                if getattr(context, "is_voicebot", False):
-                    return False
-                if active_agent_channel(context):
-                    # Ya consolidado; no redistribuir
-                    return False
+                    cancel_residual_timer = True
+                    context = None
+                elif getattr(context, "call_ended", False):
+                    cancel_residual_timer = True
+                    context = None
+                elif getattr(context, "is_voicebot", False):
+                    context = None
+                elif active_agent_channel(context):
+                    # Ya consolidado; no redistribuir (cancelar residual de cola).
+                    cancel_residual_timer = True
+                    context = None
+                else:
+                    context.distribution_answer_accepted = False
+                    context.distribution_offering = False
+                    context.agent_attempt_channel = None
+                    if getattr(context, "agent_connected_channel", None):
+                        context.agent_connected_channel = None
+                    self.state_store.register_unsafe(call_id, context)
 
-                context.distribution_answer_accepted = False
-                context.distribution_offering = False
-                context.agent_attempt_channel = None
-                if getattr(context, "agent_connected_channel", None):
-                    context.agent_connected_channel = None
-                self.state_store.register_unsafe(call_id, context)
-
-                campaign_id = effective_queue_campaign_id(context)
-                bridge_id = getattr(context, "bridge_id", None)
-                strategy = getattr(context, "distribution_strategy", None) or "fewestcalls"
-                ring_timeout = int(getattr(context, "distribution_ring_timeout", None) or 45)
-                meta = getattr(context, "distribution_metadata", None) or {}
-                uniqueid = getattr(context, "distribution_uniqueid", None) or call_id
-                original_timeout = getattr(context, "distribution_queue_timeout_sec", None)
-                if original_timeout is None:
-                    original_timeout = getattr(context, "queue_timeout_seconds", None) or 3600
-                original_timeout = float(original_timeout)
-                started_ts = getattr(context, "distribution_started_at_ts", None)
-                pstn = pstn_channel_id or getattr(context, "pstn_channel", None)
+                    campaign_id = effective_queue_campaign_id(context)
+                    bridge_id = getattr(context, "bridge_id", None)
+                    strategy = getattr(context, "distribution_strategy", None) or "fewestcalls"
+                    ring_timeout = int(getattr(context, "distribution_ring_timeout", None) or 45)
+                    meta = getattr(context, "distribution_metadata", None) or {}
+                    uniqueid = getattr(context, "distribution_uniqueid", None) or call_id
+                    original_timeout = getattr(context, "distribution_queue_timeout_sec", None)
+                    if original_timeout is None:
+                        original_timeout = getattr(context, "queue_timeout_seconds", None) or 3600
+                    original_timeout = float(original_timeout)
+                    started_ts = getattr(context, "distribution_started_at_ts", None)
+                    pstn = pstn_channel_id or getattr(context, "pstn_channel", None)
         except Exception:
             logger.exception(
                 "redistribute_after_failed_consolidation: error leyendo contexto call_id=%s",
                 call_id,
             )
+            return False
+
+        if cancel_residual_timer:
+            self._cancel_queue_timer(call_id)
+        if context is None:
             return False
 
         if not campaign_id or not bridge_id:
@@ -1616,14 +1699,7 @@ class DistributionService:
             )
             return False
 
-        # Cancelar timer residual sin sacar del ZSET (answer path / campaign)
-        with self._call_events_lock:
-            old_timer = self._queue_timers.pop(call_id, None)
-        if old_timer:
-            try:
-                old_timer.cancel()
-            except Exception:
-                pass
+        # El timer residual lo cancela start_distribution vía _replace_queue_timer.
 
         # Asegurar ZSET (preservar score si ya existe)
         if self._queue_weight_enabled() and self._waiting_inventory:

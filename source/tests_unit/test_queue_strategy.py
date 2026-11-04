@@ -37,6 +37,8 @@ def test_get_candidates_uses_membership_penalty_not_agent_hash():
         _agent_hash(sip="SIP/1001", last_call_time="100"),
         _agent_hash(sip="SIP/1002", last_call_time="50"),
     ]
+    # Sin lock/lease/cooldown activos (MagicMock.exists es truthy por defecto).
+    redis.exists.return_value = 0
     redis.hgetall.return_value = {
         "10": "0",
         "20": "5",
@@ -66,6 +68,7 @@ def test_get_candidates_same_agent_different_campaign_penalties():
         _agent_hash(sip="SIP/1002", last_call_time="20"),
     ]
     pipe.execute.return_value = agent_data
+    redis.exists.return_value = 0
 
     engine = QueueStrategyEngine(redis_client=redis)
 
@@ -99,6 +102,7 @@ def test_get_candidates_missing_penalty_hash_defaults_to_zero():
         _agent_hash(sip="SIP/1001", last_call_time="30"),
         _agent_hash(sip="SIP/1002", last_call_time="10"),
     ]
+    redis.exists.return_value = 0
     redis.hgetall.return_value = {}
 
     engine = QueueStrategyEngine(redis_client=redis)

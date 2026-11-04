@@ -51,7 +51,7 @@ class TestStopDistributionReleasesReservation:
             42,
             "call-1",
             RedisKeys.agent_lock("42"),
-            restore_ready=True,
+            failure_cooldown=True,
             use_status_reservation=True,
         )
         svc.ari_client.hangup_channel.assert_called_once_with("agent-ch-1")

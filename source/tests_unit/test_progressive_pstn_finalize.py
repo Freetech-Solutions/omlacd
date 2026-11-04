@@ -534,7 +534,7 @@ class TestQueueTimeoutDialerCallback(unittest.TestCase):
         legacy_forwarder = MagicMock()
         pstn_reported_store = MagicMock()
         context = _progressive_context(agent_answered=False)
-        context.target_campaign_id = "22"
+        context.distribution_campaign_id = 22
         context.agent_segments = [
             {
                 "agent_id": 7,

@@ -78,7 +78,7 @@ def _get_with_max_iterations(state_store, ctx, max_iterations=2):
     state_store.get.side_effect = _get
 
 
-def _run_loop(svc, max_qcalls=10):
+def _run_loop(svc, max_qcalls=10, external_host="voicebot.example"):
     svc._run_voicebot_distribution_loop(
         call_id="call-1",
         id_camp="23",
@@ -92,7 +92,7 @@ def _run_loop(svc, max_qcalls=10):
         },
         strategy="random",
         ring_timeout=30,
-        external_host="",
+        external_host=external_host,
         max_qcalls=max_qcalls,
         caller_channel_id=None,
     )
@@ -144,7 +144,7 @@ def test_voicebot_lock_libre_origina_al_voicebot():
     redis_client.smembers.return_value = {b"11"}
     redis_client.get.return_value = b"0"
     redis_client.set.return_value = True  # lock adquirido
-    redis_client.hget.return_value = None  # sin VOICEBOT_ADDR
+    redis_client.hget.return_value = None  # sin VOICEBOT_ADDR; usa external_host
     svc, state_store, call_service, strategy_engine = _build_service(redis_client)
     state_store.get.return_value = _Ctx()
     strategy_engine.get_voicebot_candidates.return_value = [_voicebot_candidate()]

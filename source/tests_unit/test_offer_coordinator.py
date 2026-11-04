@@ -58,7 +58,7 @@ def test_claim_and_reserve_ready_empty_offer():
     redis.hget.return_value = AgentStatus.READY.value
     redis.exists.return_value = 0
     redis.get.return_value = None
-    redis.set.side_effect = [True, True, True]  # offer, lock NX, lease NX
+    redis.set.side_effect = [True, True, True, True]  # offer, lock, lease, cooldown
 
     assert coord.try_claim_and_reserve(7, "call-1", 0.20, 1000.0, 40) is True
     redis.hset.assert_called()
@@ -108,7 +108,7 @@ def test_claim_and_reserve_higher_priority_wins_on_ready():
     ]
     redis.exists.return_value = 0
     redis.get.return_value = "call-low|0.100000|2000.000"
-    redis.set.side_effect = [True, True, True]
+    redis.set.side_effect = [True, True, True, True]  # offer, lock, lease, cooldown
 
     assert coord.try_claim_and_reserve(7, "call-high", 0.80, 1000.0, 40) is True
     redis.hset.assert_called()

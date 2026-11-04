@@ -86,7 +86,10 @@ def test_on_amd_done_registers_context_before_dial_answer():
 
     def _ctx(*a, **k):
         order.append("context")
-        return MagicMock()
+        ctx = MagicMock()
+        # Debe coincidir con create_bridge; si no, B3 descarta el setup como duplicado.
+        ctx.bridge_id = "bridge-1"
+        return ctx
 
     def _ans(*a, **k):
         order.append("answer")
