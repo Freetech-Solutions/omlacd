@@ -40,6 +40,25 @@ from models import (
 
 RINGBACK_MEDIA = "tone:ringback"
 
+# StasisStart con estos estados es el canal creado, no el answer.
+# Sin state (originate clásico y tests) se sigue tratando como contestado.
+_PRE_ANSWER_CHANNEL_STATES = frozenset({
+    "down",
+    "rsrvd",
+    "reserved",
+    "ring",
+    "ringing",
+    "dialing",
+    "busy",
+    "offhook",
+})
+
+
+def _is_pre_answer_channel_state(state: Optional[str]) -> bool:
+    if not state or not str(state).strip():
+        return False
+    return str(state).strip().lower() in _PRE_ANSWER_CHANNEL_STATES
+
 
 class ManualCallHandler(BaseHandler):
     """
@@ -239,8 +258,8 @@ class ManualCallHandler(BaseHandler):
                 except Exception:
                     pass
                 return
-            # Si ya contestó PSTN entre play y persist, cortar de inmediato
-            if ctx.pstn_answered_ts or ctx.pstn_channel_bridged:
+            # Si ya contestó PSTN o hay early media, cortar de inmediato
+            if ctx.pstn_answered_ts or ctx.pstn_channel_bridged or ctx.pstn_early_media:
                 try:
                     self.ari_client.stop_playback(effective_id)
                 except Exception:
@@ -324,7 +343,12 @@ class ManualCallHandler(BaseHandler):
                 current_id = getattr(ctx, "ringback_playback_id", None)
                 if not current_id or current_id != finished_id:
                     return
-                if ctx.pstn_answered_ts or ctx.pstn_channel_bridged or ctx.call_ended:
+                if (
+                    ctx.pstn_answered_ts
+                    or ctx.pstn_channel_bridged
+                    or ctx.pstn_early_media
+                    or ctx.call_ended
+                ):
                     ctx.ringback_playback_id = None
                     self.state_store.register_unsafe(call_id, ctx)
                     return
@@ -347,7 +371,17 @@ class ManualCallHandler(BaseHandler):
                 exc_info=True,
             )
 
-    def _handle_pstn_leg_start(self, channel_id: str, bridge_id: str) -> bool:
+    def _handle_pstn_leg_start(
+        self,
+        channel_id: str,
+        bridge_id: str,
+        channel_state: Optional[str] = None,
+    ) -> bool:
+        # Create+dial entra a Stasis en Down. Eso no es el answer: no cortar
+        # el ring timer, no marcar contestada y no mezclar audio todavía.
+        if _is_pre_answer_channel_state(channel_state):
+            return self._register_pstn_leg_waiting(channel_id, bridge_id)
+
         if self.pstn_ring_timer and channel_id:
             self.pstn_ring_timer.cancel(channel_id)
         if not bridge_id:
@@ -381,8 +415,8 @@ class ManualCallHandler(BaseHandler):
             if not context.uniqueid_pstn:
                 context.uniqueid_pstn = channel_id
 
-            # Marcar pstn_answered_ts SOLAMENTE en StasisStart del canal PSTN
-            # StasisStart implica que el canal está "Up", no es necesario verificar
+            # Originate clásico: StasisStart llega con el canal ya Up.
+            # Create+dial no entra acá; el answer se marca en on_pstn_answered.
             if not context.pstn_answered_ts:
                 context.pstn_answered_ts = datetime.now().isoformat()
                 logging.debug(f"📞 Canal PSTN {channel_id} marcado como contestado en StasisStart")
@@ -597,7 +631,8 @@ class ManualCallHandler(BaseHandler):
             related_call_id=call_id,
             metadata=metadata,
             external_sip_trunk=args_dict.get('external_sip_trunk'),
-            timeout=timeout_value
+            timeout=timeout_value,
+            early_media=True,
         )
 
         if pstn_channel_id:
@@ -667,8 +702,18 @@ class ManualCallHandler(BaseHandler):
             bridge_id = args_dict.get('bridge_id')
 
             if channel_type == ChannelType.TO_PSTN.value:
-                # Handle PSTN leg start
-                self._handle_pstn_leg_start(channel_id, bridge_id)
+                channel_state = None
+                if isinstance(event, StasisStartEvent):
+                    channel_state = event.channel.state
+                elif isinstance(event, dict):
+                    raw_channel = event.get("channel") or {}
+                    if isinstance(raw_channel, dict):
+                        channel_state = raw_channel.get("state")
+                self._handle_pstn_leg_start(
+                    channel_id,
+                    bridge_id,
+                    channel_state=channel_state,
+                )
                 return
 
             # Agent leg logic
@@ -764,15 +809,179 @@ class ManualCallHandler(BaseHandler):
 
     def on_up(self, event: Union[ChannelStateChangeEvent, Dict[str, Any]]) -> None:
         """
-        Maneja cuando un canal pasa a estado "Up" (contestado).
-        Los timestamps de respuesta (agent_answered_ts y pstn_answered_ts)
-        se marcan en StasisStart, no aquí.
-        Este método se mantiene por compatibilidad pero no realiza ninguna acción.
+        Answer real de la pierna PSTN creada con create+dial.
+
+        El agente ya se marca en StasisStart. La PSTN solo se marca acá,
+        cuando el canal pasa a Up (200). El originate clásico ya dejó
+        pstn_answered_ts en StasisStart y esta llamada queda en no-op.
         """
-        # Los timestamps se marcan en StasisStart:
-        # - agent_answered_ts se marca en on_start() cuando channel_type=to_agent
-        # - pstn_answered_ts se marca en _handle_pstn_leg_start() cuando channel_type=to_pstn
-        pass
+        channel_id = self._channel_id_from_event(event)
+        if not channel_id:
+            return
+        context = self.state_store.get_by_channel(channel_id)
+        if not context or context.pstn_channel != channel_id:
+            return
+        self.on_pstn_answered(channel_id)
+
+    def on_pstn_progress(self, channel_id: str, call_id: Optional[str] = None) -> None:
+        """
+        183 Session Progress de la pierna manual: corta el ringback y mete
+        la PSTN al bridge. No marca la llamada como contestada.
+        """
+        context = self._manual_context_for_pstn(channel_id, call_id)
+        if not context or not context.call_id:
+            return
+        call_id = context.call_id
+        bridge_id = None
+        with self.state_store.lock(call_id):
+            ctx = self.state_store.get(call_id)
+            if not ctx:
+                return
+            if should_block_operation_for_transfer(ctx, operation="on_pstn_progress"):
+                return
+            if ctx.pstn_channel and ctx.pstn_channel != channel_id:
+                return
+            if ctx.pstn_answered_ts or ctx.pstn_channel_bridged or ctx.pstn_early_media:
+                return
+            ctx.pstn_channel = channel_id
+            ctx.pstn_early_media = True
+            if not ctx.uniqueid_pstn:
+                ctx.uniqueid_pstn = channel_id
+            bridge_id = ctx.bridge_id
+            self.state_store.register_unsafe(call_id, ctx)
+
+        logging.info(
+            "Early media PSTN call_id=%s channel=%s: se corta ringback y se une al bridge",
+            call_id,
+            channel_id,
+        )
+        self._stop_ringback(call_id)
+        if bridge_id:
+            self._bridge_pstn_if_needed(call_id, bridge_id, channel_id)
+
+    def on_pstn_answered(self, channel_id: str, call_id: Optional[str] = None) -> None:
+        """Marca el answer PSTN (200 / estado Up) y asegura el bridge."""
+        context = self._manual_context_for_pstn(channel_id, call_id)
+        if not context or not context.call_id:
+            return
+        if context.pstn_channel and context.pstn_channel != channel_id:
+            return
+        call_id = context.call_id
+        marked = self._mark_pstn_answered(call_id, channel_id)
+        if not marked:
+            return
+        if self.pstn_ring_timer and channel_id:
+            self.pstn_ring_timer.cancel(channel_id)
+        bridge_id, needs_bridge = marked
+        self._stop_ringback(call_id)
+        if needs_bridge and bridge_id:
+            self._bridge_pstn_if_needed(call_id, bridge_id, channel_id)
+
+    def _mark_pstn_answered(self, call_id: str, channel_id: str):
+        with self.state_store.lock(call_id):
+            ctx = self.state_store.get(call_id)
+            blocked = ctx and should_block_operation_for_transfer(
+                ctx,
+                operation="on_pstn_answered",
+            )
+            if not ctx or blocked or (ctx.pstn_channel and ctx.pstn_channel != channel_id):
+                return None
+            ctx.pstn_channel = channel_id
+            if not ctx.uniqueid_pstn:
+                ctx.uniqueid_pstn = channel_id
+            if not ctx.pstn_answered_ts:
+                ctx.pstn_answered_ts = datetime.now().isoformat()
+                logging.info(
+                    "Canal PSTN %s contestado call_id=%s",
+                    channel_id,
+                    call_id,
+                )
+            needs_bridge = not ctx.pstn_channel_bridged
+            bridge_id = ctx.bridge_id
+            self.state_store.register_unsafe(call_id, ctx)
+            return bridge_id, needs_bridge
+
+    def _channel_id_from_event(
+        self,
+        event: Union[BaseARIEvent, Dict[str, Any]],
+    ) -> Optional[str]:
+        if isinstance(event, dict):
+            channel = event.get("channel") or {}
+            if isinstance(channel, dict):
+                return channel.get("id")
+            return None
+        channel = getattr(event, "channel", None)
+        return getattr(channel, "id", None) if channel else None
+
+    def _manual_context_for_pstn(
+        self,
+        channel_id: str,
+        call_id: Optional[str] = None,
+    ) -> Optional[CallContext]:
+        context = self.state_store.get_by_channel(channel_id)
+        if context is None and call_id:
+            context = self.state_store.get(call_id)
+        if not context:
+            return None
+        call_type = getattr(context.type, "value", context.type)
+        if call_type != CallType.MANUAL.value and str(getattr(context, "call_type", "")) != "1":
+            return None
+        return context
+
+    def _register_pstn_leg_waiting(self, channel_id: str, bridge_id: str) -> bool:
+        """Asocia la pierna PSTN en Down/Ring sin tratarla como contestada."""
+        if not channel_id or not bridge_id:
+            return False
+        context = self.state_store.get_by_bridge_id(bridge_id)
+        if not context or not context.call_id:
+            return False
+        call_id = context.call_id
+        with self.state_store.lock(call_id):
+            ctx = self.state_store.get(call_id)
+            if not ctx:
+                return False
+            if should_block_operation_for_transfer(
+                ctx,
+                operation="_register_pstn_leg_waiting",
+            ):
+                return False
+            ctx.pstn_channel = channel_id
+            if not ctx.uniqueid_pstn:
+                ctx.uniqueid_pstn = channel_id
+            self.state_store.register_unsafe(call_id, ctx)
+        logging.info(
+            "Canal PSTN %s en Stasis antes del answer (call_id=%s)",
+            channel_id,
+            call_id,
+        )
+        return True
+
+    def _bridge_pstn_if_needed(self, call_id: str, bridge_id: str, channel_id: str) -> None:
+        with self.state_store.lock(call_id):
+            ctx = self.state_store.get(call_id)
+            if not ctx or ctx.pstn_channel_bridged or ctx.transfer_in_progress:
+                return
+        try:
+            if self.call_service:
+                ok = self.call_service.add_channel_to_bridge(bridge_id, channel_id)
+            else:
+                ok = self.ari_client.add_channel_to_bridge(bridge_id, channel_id)
+        except Exception as exc:
+            logging.error(
+                "Error agregando canal %s al bridge %s: %s",
+                channel_id,
+                bridge_id,
+                exc,
+                exc_info=True,
+            )
+            return
+        if not ok:
+            return
+        with self.state_store.lock(call_id):
+            fresh = self.state_store.get(call_id)
+            if fresh:
+                fresh.pstn_channel_bridged = True
+                self.state_store.register_unsafe(call_id, fresh)
 
     def _is_call_answered(self, context: CallContext) -> bool:
         """

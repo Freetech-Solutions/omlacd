@@ -158,6 +158,33 @@ class LegacyEventForwarder:
             return None
         return {**payload, **fields}
 
+    @staticmethod
+    def _optional_attempt_id(*sources: Any) -> Optional[str]:
+        """M0: attempt_id opcional desde args Dial / pending meta / kwargs."""
+        for source in sources:
+            if not isinstance(source, dict):
+                continue
+            value = source.get("attempt_id")
+            if value not in (None, ""):
+                return str(value)
+        return None
+
+    @staticmethod
+    def _with_attempt_id(payload: Dict[str, Any], attempt_id: Optional[str]) -> Dict[str, Any]:
+        if not attempt_id:
+            return payload
+        return {**payload, "attempt_id": attempt_id}
+
+    def _attempt_id_from_pending(self, channel_id: Optional[str]) -> Optional[str]:
+        """M0: lee attempt_id del pending dial store si el canal aún está registrado."""
+        if not channel_id or not self.pending_dial_store:
+            return None
+        try:
+            meta = self.pending_dial_store.get(str(channel_id)) or {}
+        except Exception:
+            return None
+        return self._optional_attempt_id(meta if isinstance(meta, dict) else {})
+
     def handle_dial_event(self, event: Dict[str, Any]) -> None:
         """
         Envía a process-event (Gearman) eventos DIAL con call_type=2 (DIALER)
@@ -225,19 +252,24 @@ class LegacyEventForwarder:
                 )
                 return
             callid = self._get_callid(args)
-            event_with_call_type = {
-                **event,
-                "call_type": call_type_value,
-                **business_fields,
-                "callid": callid,
-            }
+            stored_meta_early = (
+                (self.pending_dial_store.get(str(peer_id)) or {})
+                if (peer_id and self.pending_dial_store)
+                else {}
+            )
+            resolved_aid = self._optional_attempt_id(args, stored_meta_early)
+            event_with_call_type = self._with_attempt_id(
+                {
+                    **event,
+                    "call_type": call_type_value,
+                    **business_fields,
+                    "callid": callid,
+                },
+                resolved_aid,
+            )
             # ART: solo Dial ANSWER to_pstn con originate_ts en pending (campo opcional).
             if is_pstn and dialstatus == "ANSWER":
-                stored_meta = (
-                    (self.pending_dial_store.get(str(peer_id)) or {})
-                    if (peer_id and self.pending_dial_store)
-                    else {}
-                )
+                stored_meta = stored_meta_early
                 if peer_id and self.pending_dial_store:
                     ring_duration = self._compute_ring_duration_from_pending(
                         str(peer_id), event.get("timestamp"),
@@ -464,6 +496,9 @@ class LegacyEventForwarder:
         )
         if not payload_dict:
             return
+        payload_dict = self._with_attempt_id(
+            payload_dict, self._optional_attempt_id(metadata),
+        )
 
         event_json = json.dumps(payload_dict)
         payload_bytes = bytes(event_json, encoding="utf8")
@@ -562,6 +597,9 @@ class LegacyEventForwarder:
         contact_id: Any,
         number: str,
         callid: Optional[str] = None,
+        *,
+        channel_id: Optional[str] = None,
+        attempt_id: Optional[str] = None,
     ) -> None:
         """Envía a process-event un Dial con el dialstatus indicado (to_pstn)."""
         context = f"submit_dial_{dialstatus.lower()}"
@@ -579,6 +617,10 @@ class LegacyEventForwarder:
         )
         if not payload_dict:
             return
+        resolved_aid = self._optional_attempt_id(
+            {"attempt_id": attempt_id},
+        ) or self._attempt_id_from_pending(channel_id)
+        payload_dict = self._with_attempt_id(payload_dict, resolved_aid)
         if not self.client:
             self._connect()
         if not self.client:
@@ -598,7 +640,14 @@ class LegacyEventForwarder:
         )
 
     def submit_dial_cancel(
-        self, campaign_id: Any, contact_id: Any, number: str, callid: Optional[str] = None
+        self,
+        campaign_id: Any,
+        contact_id: Any,
+        number: str,
+        callid: Optional[str] = None,
+        *,
+        channel_id: Optional[str] = None,
+        attempt_id: Optional[str] = None,
     ) -> None:
         """
         Envía a process-event un evento Dial con dialstatus=CANCEL para que el dialer
@@ -606,7 +655,15 @@ class LegacyEventForwarder:
         marcado (set_contact_status, decrement, send-reports). Usado en lugar de
         ChannelDestroyed cuando la llamada se clasifica como CANCEL.
         """
-        self._submit_dial_status("CANCEL", campaign_id, contact_id, number, callid=callid)
+        self._submit_dial_status(
+            "CANCEL",
+            campaign_id,
+            contact_id,
+            number,
+            callid=callid,
+            channel_id=channel_id,
+            attempt_id=attempt_id,
+        )
 
     def submit_dial_invalid_number(
         self, campaign_id: Any, contact_id: Any, number: str, callid: Optional[str] = None
@@ -622,7 +679,14 @@ class LegacyEventForwarder:
         )
 
     def submit_dial_not_found(
-        self, campaign_id: Any, contact_id: Any, number: str, callid: Optional[str] = None
+        self,
+        campaign_id: Any,
+        contact_id: Any,
+        number: str,
+        callid: Optional[str] = None,
+        *,
+        channel_id: Optional[str] = None,
+        attempt_id: Optional[str] = None,
     ) -> None:
         """
         Envía a process-event un Dial 404_NOT_FOUND (SIP 404 / cause 1).
@@ -630,11 +694,24 @@ class LegacyEventForwarder:
         y libera OML:CALLS vía CALLS_DECR_DIAL_STATUSES.
         """
         self._submit_dial_status(
-            "404_NOT_FOUND", campaign_id, contact_id, number, callid=callid
+            "404_NOT_FOUND",
+            campaign_id,
+            contact_id,
+            number,
+            callid=callid,
+            channel_id=channel_id,
+            attempt_id=attempt_id,
         )
 
     def submit_dial_chanunavail(
-        self, campaign_id: Any, contact_id: Any, number: str, callid: Optional[str] = None
+        self,
+        campaign_id: Any,
+        contact_id: Any,
+        number: str,
+        callid: Optional[str] = None,
+        *,
+        channel_id: Optional[str] = None,
+        attempt_id: Optional[str] = None,
     ) -> None:
         """
         Envía a process-event un Dial CHANUNAVAIL (p. ej. SIP 603 Decline /
@@ -648,11 +725,24 @@ class LegacyEventForwarder:
         cuando está en CALLS_DECR_DIAL_STATUSES.
         """
         self._submit_dial_status(
-            "CHANUNAVAIL", campaign_id, contact_id, number, callid=callid
+            "CHANUNAVAIL",
+            campaign_id,
+            contact_id,
+            number,
+            callid=callid,
+            channel_id=channel_id,
+            attempt_id=attempt_id,
         )
 
     def submit_dial_congestion(
-        self, campaign_id: Any, contact_id: Any, number: str, callid: Optional[str] = None
+        self,
+        campaign_id: Any,
+        contact_id: Any,
+        number: str,
+        callid: Optional[str] = None,
+        *,
+        channel_id: Optional[str] = None,
+        attempt_id: Optional[str] = None,
     ) -> None:
         """
         Envía a process-event un Dial CONGESTION (p. ej. SIP 500/502/503 o
@@ -660,22 +750,48 @@ class LegacyEventForwarder:
         de incidencia y libera OML:CALLS vía CALLS_DECR_DIAL_STATUSES.
         """
         self._submit_dial_status(
-            "CONGESTION", campaign_id, contact_id, number, callid=callid
+            "CONGESTION",
+            campaign_id,
+            contact_id,
+            number,
+            callid=callid,
+            channel_id=channel_id,
+            attempt_id=attempt_id,
         )
 
     def submit_dial_busy(
-        self, campaign_id: Any, contact_id: Any, number: str, callid: Optional[str] = None
+        self,
+        campaign_id: Any,
+        contact_id: Any,
+        number: str,
+        callid: Optional[str] = None,
+        *,
+        channel_id: Optional[str] = None,
+        attempt_id: Optional[str] = None,
     ) -> None:
         """
         Envía a process-event un Dial BUSY (Q.850 17 / SIP 486) cuando el fallo
         temprano no llegó como DialStatus de Asterisk.
         """
         self._submit_dial_status(
-            "BUSY", campaign_id, contact_id, number, callid=callid
+            "BUSY",
+            campaign_id,
+            contact_id,
+            number,
+            callid=callid,
+            channel_id=channel_id,
+            attempt_id=attempt_id,
         )
 
     def submit_dial_noanswer(
-        self, campaign_id: Any, contact_id: Any, number: str, callid: Optional[str] = None
+        self,
+        campaign_id: Any,
+        contact_id: Any,
+        number: str,
+        callid: Optional[str] = None,
+        *,
+        channel_id: Optional[str] = None,
+        attempt_id: Optional[str] = None,
     ) -> None:
         """
         Envía a process-event un Dial NOANSWER (p. ej. SIP 487 Request Terminated /
@@ -683,11 +799,24 @@ class LegacyEventForwarder:
         aplicar reglas de incidencia para rellamar.
         """
         self._submit_dial_status(
-            "NOANSWER", campaign_id, contact_id, number, callid=callid
+            "NOANSWER",
+            campaign_id,
+            contact_id,
+            number,
+            callid=callid,
+            channel_id=channel_id,
+            attempt_id=attempt_id,
         )
 
     def submit_dial_temporarily_unavailable(
-        self, campaign_id: Any, contact_id: Any, number: str, callid: Optional[str] = None
+        self,
+        campaign_id: Any,
+        contact_id: Any,
+        number: str,
+        callid: Optional[str] = None,
+        *,
+        channel_id: Optional[str] = None,
+        attempt_id: Optional[str] = None,
     ) -> None:
         """
         Envía a process-event un Dial 480_TEMPORARILY_UNAVAILABLE (SIP 480).
@@ -699,6 +828,8 @@ class LegacyEventForwarder:
             contact_id,
             number,
             callid=callid,
+            channel_id=channel_id,
+            attempt_id=attempt_id,
         )
 
     def submit_dial_originate_failed(
@@ -1002,6 +1133,8 @@ class LegacyEventForwarder:
         )
         if not payload_dict:
             return
+        resolved_aid = self._attempt_id_from_pending(channel_id)
+        payload_dict = self._with_attempt_id(payload_dict, resolved_aid)
         if not self.client:
             self._connect()
         if not self.client:
@@ -1067,6 +1200,7 @@ class LegacyEventForwarder:
         number: str,
         callid: Optional[str] = None,
         amd_duration: Optional[float] = None,
+        attempt_id: Optional[str] = None,
     ) -> None:
         """
         Envía a process-event un evento Dial con dialstatus=AMD para que el dialer
@@ -1076,6 +1210,7 @@ class LegacyEventForwarder:
 
         P0: si amd_duration está presente se embebe en el mismo job (el dialer
         actualiza AMD_LATENCY sin job AmdLatency separado).
+        M0: attempt_id opcional (eco; el dialer no keyea DECR por él aún).
         """
         base_payload: Dict[str, Any] = {
             "type": "Dial",
@@ -1097,6 +1232,8 @@ class LegacyEventForwarder:
         )
         if not payload_dict:
             return
+        resolved_aid = self._optional_attempt_id({"attempt_id": attempt_id})
+        payload_dict = self._with_attempt_id(payload_dict, resolved_aid)
         if not self.client:
             self._connect()
         if not self.client:
@@ -1115,7 +1252,14 @@ class LegacyEventForwarder:
         )
 
     def submit_dial_exit_shortcall(
-        self, campaign_id: Any, contact_id: Any, number: str, callid: Optional[str] = None
+        self,
+        campaign_id: Any,
+        contact_id: Any,
+        number: str,
+        callid: Optional[str] = None,
+        *,
+        channel_id: Optional[str] = None,
+        attempt_id: Optional[str] = None,
     ) -> None:
         """
         Envía a process-event un evento Dial con dialstatus=EXIT_SHORTCALL para que el dialer
@@ -1124,7 +1268,13 @@ class LegacyEventForwarder:
         Usado desde ProgressiveCampaignHandler cuando hubo bridge ACD–agente.
         """
         self._submit_dial_status(
-            "EXIT_SHORTCALL", campaign_id, contact_id, number, callid=callid
+            "EXIT_SHORTCALL",
+            campaign_id,
+            contact_id,
+            number,
+            callid=callid,
+            channel_id=channel_id,
+            attempt_id=attempt_id,
         )
 
     def submit_dial_exit_abandon(
@@ -1140,7 +1290,14 @@ class LegacyEventForwarder:
         )
 
     def submit_dial_exit_timeout(
-        self, campaign_id: Any, contact_id: Any, number: str, callid: Optional[str] = None
+        self,
+        campaign_id: Any,
+        contact_id: Any,
+        number: str,
+        callid: Optional[str] = None,
+        *,
+        channel_id: Optional[str] = None,
+        attempt_id: Optional[str] = None,
     ) -> None:
         """
         Envía a process-event un Dial EXIT_TIMEOUT (PSTN contestó, timeout de cola
@@ -1148,7 +1305,13 @@ class LegacyEventForwarder:
         y libera OML:CALLS.
         """
         self._submit_dial_status(
-            "EXIT_TIMEOUT", campaign_id, contact_id, number, callid=callid
+            "EXIT_TIMEOUT",
+            campaign_id,
+            contact_id,
+            number,
+            callid=callid,
+            channel_id=channel_id,
+            attempt_id=attempt_id,
         )
 
     def submit_dial_exit_answered(
@@ -1158,6 +1321,9 @@ class LegacyEventForwarder:
         number: str,
         agent_duration: float,
         callid: Optional[str] = None,
+        *,
+        channel_id: Optional[str] = None,
+        attempt_id: Optional[str] = None,
     ) -> None:
         """
         Envía a process-event un Dial EXIT_ANSWERED con agent_duration para que el
@@ -1183,6 +1349,10 @@ class LegacyEventForwarder:
         )
         if not payload_dict:
             return
+        resolved_aid = self._optional_attempt_id(
+            {"attempt_id": attempt_id},
+        ) or self._attempt_id_from_pending(channel_id)
+        payload_dict = self._with_attempt_id(payload_dict, resolved_aid)
         if not self.client:
             self._connect()
         if not self.client:

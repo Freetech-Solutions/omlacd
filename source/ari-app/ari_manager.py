@@ -1,5 +1,5 @@
 import logging
-from typing import Any, Optional, TypedDict
+from typing import Any, Dict, Optional, TypedDict
 import os
 import requests
 from requests.exceptions import RequestException
@@ -496,6 +496,74 @@ class ARI:
             error=f"Respuesta inesperada de originate_channel: {type(raw)}",
             code=None,
         )
+
+    def create_stasis_channel_op(
+        self,
+        endpoint: str,
+        app: str,
+        app_args: Optional[str] = None,
+        channel_id: Optional[str] = None,
+    ) -> ARIOperationResult:
+        """
+        Crea un canal en Stasis sin marcar (POST /channels/create).
+
+        El canal entra a la app en Down y emite StasisStart antes del INVITE.
+        El INVITE lo dispara dial_channel_op.
+        """
+        params: Dict[str, Any] = {"endpoint": endpoint, "app": app}
+        if app_args:
+            params["appArgs"] = app_args
+        if channel_id:
+            params["channelId"] = channel_id
+
+        @retry_with_backoff(
+            max_retries=3,
+            initial_delay=0.5,
+            max_delay=5.0,
+            operation_name=f"create_stasis_channel({endpoint})",
+        )
+        def _create_with_retry() -> ARIOperationResult:
+            result = self.post("channels/create", params=params)
+            if not result.get("ok"):
+                raise RequestException(
+                    f"create channel falló para {endpoint}: {result.get('error')}"
+                )
+            data = result.get("data")
+            if not isinstance(data, dict) or not data.get("id"):
+                raise RequestException(
+                    f"create channel respuesta inválida para {endpoint}: {data}"
+                )
+            return result
+
+        try:
+            return _create_with_retry()
+        except Exception as e:
+            logger.error(
+                "create_stasis_channel_op: error creando canal hacia %s: %s",
+                endpoint,
+                e,
+                exc_info=True,
+            )
+            return self._build_result(ok=False, data=None, error=str(e), code=None)
+
+    def dial_channel_op(
+        self,
+        channel_id: str,
+        caller: Optional[str] = None,
+        timeout: Optional[int] = None,
+    ) -> ARIOperationResult:
+        """
+        Marca un canal ya creado en Stasis (POST /channels/{id}/dial).
+
+        caller y timeout van como query params, que es lo que espera ARI.
+        """
+        params: Dict[str, Any] = {}
+        if caller:
+            params["caller"] = caller
+        if timeout is not None:
+            params["timeout"] = int(timeout)
+        logger.info("Marcando canal %s (timeout=%s)", channel_id, timeout)
+        return self.post(f"channels/{channel_id}/dial", params=params)
 
     def hangup_channel(self, channel_id):
         """

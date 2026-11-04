@@ -13,6 +13,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "ari-app"))
 
 sys.modules.setdefault("redis", MagicMock())
 sys.modules.setdefault("gearman", MagicMock())
+# requests debe ser el paquete real si está instalado (ari_manager lo usa).
+# No mockearlo aquí para no contaminar otros tests de la misma sesión.
 
 # Mock liviano de config/settings para evitar depender de envs reales en import.
 if "config" not in sys.modules:
@@ -114,6 +116,28 @@ def test_handle_channel_destroyed_includes_callid_from_metadata():
     assert forwarder.client.submit_job.call_count == 1
     payload = _decode_payload(forwarder.client.submit_job.call_args_list[0])
     assert payload["callid"] == "1739372776.2"
+    assert "attempt_id" not in payload
+
+
+def test_handle_channel_destroyed_echoes_attempt_id():
+    pending_store = PendingDialMetadataStore()
+    pending_store.register(
+        "PJSIP-m0",
+        {
+            "call_type": "2",
+            "channel_type": "to_pstn",
+            "id_camp": "4",
+            "id_customer": "1",
+            "tel_customer": "6093017590",
+            "callid": "c-m0",
+            "attempt_id": "att-echo-1",
+        },
+    )
+    forwarder = LegacyEventForwarder(pending_dial_store=pending_store)
+    forwarder.client = MagicMock()
+    forwarder.handle_channel_destroyed("PJSIP-m0")
+    payload = _decode_payload(forwarder.client.submit_job.call_args_list[0])
+    assert payload["attempt_id"] == "att-echo-1"
 
 
 def test_submit_dial_originate_failed_includes_business_fields():
@@ -703,6 +727,26 @@ def test_submit_dial_amd_embeds_amd_duration():
     assert payload["amd_duration"] == 4.5
     assert payload["id_campaign"] == "5"
     assert payload["contact_id"] == "99"
+    assert "attempt_id" not in payload
+
+
+def test_submit_dial_amd_echoes_attempt_id():
+    forwarder = LegacyEventForwarder()
+    forwarder.client = MagicMock()
+    forwarder.submit_dial_amd(
+        "5", "99", "11001100", callid="c-amd-2", amd_duration=1.0,
+        attempt_id="att-amd-1",
+    )
+    payload = _decode_payload(forwarder.client.submit_job.call_args_list[0])
+    assert payload["attempt_id"] == "att-amd-1"
+
+
+def test_optional_attempt_id_helpers():
+    """M0 helpers: echo solo si hay valor; omitir si falta."""
+    assert LegacyEventForwarder._optional_attempt_id({"attempt_id": "a1"}) == "a1"
+    assert LegacyEventForwarder._optional_attempt_id({}, {"x": 1}) is None
+    assert LegacyEventForwarder._with_attempt_id({"t": 1}, None) == {"t": 1}
+    assert LegacyEventForwarder._with_attempt_id({"t": 1}, "a1")["attempt_id"] == "a1"
 
 
 def test_submit_amd_latency_skipped_on_backlog():

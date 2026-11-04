@@ -141,11 +141,16 @@ class ProgressiveCampaignHandler(BaseHandler):
                     phone,
                     prior_talk,
                     callid=call_id or "",
+                    channel_id=pstn_channel_id,
                 )
                 self.legacy_forwarder.cleanup_pending_dial(pstn_channel_id)
             else:
                 self.legacy_forwarder.submit_dial_exit_timeout(
-                    id_camp, id_customer, phone, callid=call_id or ""
+                    id_camp,
+                    id_customer,
+                    phone,
+                    callid=call_id or "",
+                    channel_id=pstn_channel_id,
                 )
                 self.legacy_forwarder.cleanup_pending_dial(pstn_channel_id)
         except Exception:
@@ -386,11 +391,16 @@ class ProgressiveCampaignHandler(BaseHandler):
                             phone,
                             prior_talk,
                             callid=dialer_callid,
+                            channel_id=context.pstn_channel or channel_id,
                         )
                     else:
                         if treat_as_timeout:
                             self.legacy_forwarder.submit_dial_exit_timeout(
-                                context.id_camp, id_customer, phone, callid=dialer_callid
+                                context.id_camp,
+                                id_customer,
+                                phone,
+                                callid=dialer_callid,
+                                channel_id=context.pstn_channel or channel_id,
                             )
                         else:
                             self.legacy_forwarder.submit_dial_exit_abandon(
@@ -542,6 +552,7 @@ class ProgressiveCampaignHandler(BaseHandler):
                             phone,
                             agent_duration,
                             callid=dialer_callid,
+                            channel_id=context.pstn_channel or channel_id,
                         )
                 except Exception:
                     logger.exception(
@@ -1214,12 +1225,17 @@ class ProgressiveCampaignHandler(BaseHandler):
                 eff_customer = id_customer if id_customer is not None else (meta.get("contact_id") if isinstance(meta, dict) else "")
                 eff_tel = tel_customer if tel_customer is not None else (meta.get("number") if isinstance(meta, dict) else "")
                 eff_callid = call_id or (meta.get("callid") if isinstance(meta, dict) else "") or channel_id
+                eff_attempt = (
+                    meta.get("attempt_id") if isinstance(meta, dict) else None
+                )
                 if eff_camp is not None:
                     self.legacy_forwarder.submit_dial_chanunavail(
                         eff_camp,
                         eff_customer or "",
                         eff_tel or "",
                         callid=eff_callid,
+                        channel_id=channel_id,
+                        attempt_id=eff_attempt,
                     )
                     self.legacy_forwarder.cleanup_pending_dial(channel_id)
                     if self.pstn_reported_store and channel_id:
@@ -1347,12 +1363,25 @@ class ProgressiveCampaignHandler(BaseHandler):
             if self.legacy_forwarder and id_camp is not None:
                 # Un solo job Dial AMD (amd_duration embebido). ChannelDestroyed posterior
                 # no debe reenviar a process-event (pstn_reported credit_via_dial_amd).
+                dial_meta = self.legacy_forwarder.get_pending_dial_metadata(
+                    channel_id,
+                )
+                attempt_id = None
+                if isinstance(dial_meta, dict):
+                    attempt_id = dial_meta.get("attempt_id")
+                if attempt_id in (None, ""):
+                    attempt_id = pending_data.get("attempt_id")
+                if attempt_id in (None, ""):
+                    attempt_id = None
+                else:
+                    attempt_id = str(attempt_id)
                 self.legacy_forwarder.submit_dial_amd(
                     id_camp,
                     id_customer or "",
                     tel_customer or "",
                     callid=call_id or "",
                     amd_duration=amd_duration,
+                    attempt_id=attempt_id,
                 )
                 self.legacy_forwarder.cleanup_pending_dial(channel_id)
                 dial_amd_submitted = True

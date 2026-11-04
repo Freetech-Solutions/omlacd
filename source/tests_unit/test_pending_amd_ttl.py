@@ -3,6 +3,7 @@
 
 import json
 import os
+import sys
 from unittest.mock import MagicMock
 
 # Settings se instancia al importar ari_manager/config.
@@ -11,6 +12,9 @@ os.environ.setdefault("ARI_PASSWORD", "test")
 os.environ.setdefault("ARI_APP", "test-app")
 os.environ.setdefault("ARI_URL", "http://127.0.0.1:8088")
 os.environ.setdefault("REDIS_URL", "redis://127.0.0.1:6379/0")
+
+sys.modules.setdefault("redis", MagicMock())
+sys.modules.setdefault("gearman", MagicMock())
 
 from constants import PENDING_AMD_TTL_SEC, RedisKeys
 
@@ -147,7 +151,12 @@ def test_on_amd_done_missing_pending_amd_notifies_dialer_chanunavail():
 
     handler.on_amd_done(event, args_list=["amd_done", "HUMAN", "HUMAN"])
     forwarder.submit_dial_chanunavail.assert_called_once_with(
-        "5", "99", "11555", callid="c-amd-exp"
+        "5",
+        "99",
+        "11555",
+        callid="c-amd-exp",
+        channel_id="chan-amd-exp",
+        attempt_id=None,
     )
     forwarder.cleanup_pending_dial.assert_called_once_with("chan-amd-exp")
     ari_client.hangup_channel.assert_called_once_with("chan-amd-exp")
@@ -172,6 +181,9 @@ def test_on_amd_done_machine_submits_dial_amd_only():
     state_store.node_id = "n1"
     forwarder = MagicMock()
     forwarder.compute_amd_duration_sec.return_value = 2.5
+    forwarder.get_pending_dial_metadata.return_value = {
+        "attempt_id": "att-m0-1",
+    }
     pstn_reported_store = MagicMock()
     ari_client = MagicMock()
 
@@ -195,6 +207,7 @@ def test_on_amd_done_machine_submits_dial_amd_only():
 
     forwarder.submit_dial_amd.assert_called_once_with(
         "5", "99", "11555", callid="c-machine-1", amd_duration=2.5,
+        attempt_id="att-m0-1",
     )
     forwarder.submit_amd_latency.assert_not_called()
     forwarder.cleanup_pending_dial.assert_called_once_with("chan-machine-1")
