@@ -14,6 +14,7 @@ COPY build/requirements.txt /
 RUN apt update && apt upgrade -y && apt install -y --no-install-recommends \
     sngrep \
     git \
+    libgsm1 \
     && pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r /requirements.txt \
     && pip install --no-cache-dir --upgrade 'wheel>=0.46.2' 'jaraco.context>=6.1.0' \

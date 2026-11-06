@@ -154,11 +154,13 @@ class RouteValidator:
     _ROUTE_INDEX_CACHE_LOCK = threading.RLock()
     
     # Cache local de troncales SIP: {campaign_id: (trunk_name, expires_at_ts)}
-    # Compartido entre todas las instancias para eficiencia
+    # Compartido entre todas las instancias para eficiencia.
+    # TTL corto (igual que ROUTE_CACHE_TTL) para propagar cambios de troncal
+    # hechos desde Django (ruta saliente) sin reiniciar acd-app.
     _TRUNK_CACHE = {}
     _TRUNK_CACHE_LOCK = threading.RLock()  # Lock para proteger _TRUNK_CACHE
     _TRUNK_CACHE_BY_ROUTE = {}
-    TRUNK_CACHE_TTL = 3600  # 1 hora en segundos
+    TRUNK_CACHE_TTL = ROUTE_CACHE_TTL
 
     # Cache local de RINGTIME por ruta: {route_id: (ringtime_or_None, expires_at_ts)}
     # TTL corto alineado con ROUTE_CACHE_TTL para propagar cambios de rutas.
@@ -477,10 +479,11 @@ class RouteValidator:
             return None
 
     # Cache local de CALLERID por campaña: {campaign_id: (callerid_value, expires_at_ts)}
+    # TTL corto alineado con ROUTE_CACHE_TTL / TRUNK_CACHE_TTL.
     _CALLERID_CACHE = {}
     _CALLERID_CACHE_LOCK = threading.RLock()
     _CALLERID_CACHE_BY_ROUTE = {}
-    CALLERID_CACHE_TTL = 3600  # 1 hora, igual que troncales
+    CALLERID_CACHE_TTL = ROUTE_CACHE_TTL
 
     def get_trunk_callerid(self, id_campaign, override_route_id: Optional[str] = None):
         """

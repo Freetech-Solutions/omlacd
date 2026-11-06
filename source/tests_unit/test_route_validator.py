@@ -2,7 +2,7 @@
 Tests unitarios para RouteValidator, en particular get_trunk_callerid.
 """
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 import sys
 import os
 
@@ -300,6 +300,47 @@ class TestRouteValidatorRouteResolution(unittest.TestCase):
         self.redis.hget.side_effect = hget_side_effect
         trunk_name = self.validator.get_sip_trunk("42", override_route_id="55")
         self.assertEqual(trunk_name, "TroncalSIP7")
+
+    def test_get_sip_trunk_cache_expires_and_rereads_redis(self):
+        """Tras vencer TRUNK_CACHE_TTL debe releer Redis (cambio de troncal en Django)."""
+        self.assertEqual(
+            self.RouteValidator.TRUNK_CACHE_TTL,
+            self.RouteValidator.ROUTE_CACHE_TTL,
+        )
+        trunk_by_call = {"name": "TroncalVieja"}
+
+        def hget_side_effect(key, field):
+            key_text = str(key)
+            if field == "OUTR":
+                return "1"
+            if key_text == "OML:OUTR:1" and field == "TRUNK-1":
+                return "10"
+            if key_text == "OML:TRUNK:10" and field == "NAME":
+                return trunk_by_call["name"]
+            return None
+
+        self.redis.hget.side_effect = hget_side_effect
+        t0 = 1_000_000.0
+        with patch("services.route_validator.time.time", return_value=t0):
+            self.assertEqual(self.validator.get_sip_trunk("42"), "TroncalVieja")
+
+        trunk_by_call["name"] = "TroncalNueva"
+        with patch("services.route_validator.time.time", return_value=t0 + 1):
+            self.assertEqual(
+                self.validator.get_sip_trunk("42"),
+                "TroncalVieja",
+                "Dentro del TTL debe seguir sirviendo el cache",
+            )
+
+        with patch(
+            "services.route_validator.time.time",
+            return_value=t0 + self.RouteValidator.TRUNK_CACHE_TTL + 1,
+        ):
+            self.assertEqual(
+                self.validator.get_sip_trunk("42"),
+                "TroncalNueva",
+                "Vencido el TTL debe releer Redis",
+            )
 
     def test_campaign_with_explicit_outr_keeps_fail_closed_behavior(self):
         def hget_side_effect(key, field):
