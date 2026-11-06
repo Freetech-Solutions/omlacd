@@ -30,6 +30,7 @@ from state_helpers import (
     active_agent_channel,
     call_has_prior_agent_handling,
     effective_queue_campaign_id,
+    overflow_custom_data_from_context,
     queue_timeout_should_suppress_cleanup,
 )
 from utils import compute_bot_agent_durations
@@ -69,6 +70,8 @@ class DistributionService:
         self.queue_event_manager = queue_event_manager
         self.route_validator = route_validator
         self.agent_status_service = agent_status_service
+        # Inyectado desde TransferManager (evita ciclo DI): (call_id, target_camp_id) -> bool
+        self._overflow_to_campaign: Optional[Callable[[str, str], bool]] = None
 
         self._call_events: Dict[str, Tuple[threading.Event, threading.Event]] = {}
         self._call_events_lock = threading.Lock()
@@ -96,6 +99,11 @@ class DistributionService:
         self._waiting_enqueued_at_lock = threading.Lock()
         self._waiting_inventory = WaitingInventory(redis_client) if redis_client else None
         self._offer_coordinator = OfferCoordinator(redis_client) if redis_client else None
+
+    def set_overflow_to_campaign(
+        self, fn: Optional[Callable[[str, str], bool]]
+    ) -> None:
+        self._overflow_to_campaign = fn
 
     def _queue_weight_enabled(self) -> bool:
         return bool(getattr(settings, "ACD_QUEUE_WEIGHT_ENABLED", True))
@@ -2227,6 +2235,180 @@ class DistributionService:
                     loop_gen,
                 )
 
+    def _attempt_queue_overflow(
+        self,
+        call_id: str,
+        id_camp: str,
+        uniqueid: Optional[str],
+        pstn_channel_id: Optional[str],
+        bridge_id: Optional[str],
+        context_for_report: Optional[CallContext],
+    ) -> bool:
+        """
+        Si FAILOVER apunta a otra campaña y hay handler, reporta EXIT_OVERFLOW
+        (flow-out en A) y desborda sin hangup PSTN. True = overflow OK (caller return).
+        """
+        overflow_fn = self._overflow_to_campaign
+        if overflow_fn is None:
+            return False
+
+        try:
+            cfg = get_campaign_config_with_defaults(self.redis_client, str(id_camp))
+        except Exception:
+            logger.exception(
+                "_attempt_queue_overflow: error leyendo config campaña %s call_id=%s",
+                id_camp,
+                call_id,
+            )
+            return False
+
+        if not cfg or not cfg.get("failover"):
+            return False
+
+        dst_tipo = cfg.get("failover_dst_tipo")
+        dst_id = cfg.get("failover_dst_id")
+        if dst_tipo != 1 or not dst_id:
+            logger.info(
+                "_attempt_queue_overflow: FAILOVER no es campaña (tipo=%s dst=%s) "
+                "call_id=%s → hangup",
+                dst_tipo,
+                dst_id,
+                call_id,
+            )
+            return False
+
+        target_camp_id = str(dst_id)
+        if target_camp_id == str(id_camp):
+            logger.info(
+                "_attempt_queue_overflow: destino igual a origen camp=%s call_id=%s → hangup",
+                id_camp,
+                call_id,
+            )
+            return False
+
+        ctx = context_for_report or self.state_store.get(call_id)
+        if not ctx or getattr(ctx, "call_ended", False):
+            return False
+
+        max_hops = int(getattr(settings, "MAX_OVERFLOW_HOPS", 5) or 5)
+        if int(getattr(ctx, "overflow_count", 0) or 0) >= max_hops:
+            logger.info(
+                "_attempt_queue_overflow: hops agotados (%s/%s) call_id=%s → hangup",
+                getattr(ctx, "overflow_count", 0),
+                max_hops,
+                call_id,
+            )
+            return False
+
+        if self.queue_event_manager:
+            try:
+                self.queue_event_manager.on_timeout(
+                    callid=call_id,
+                    uniqueid=uniqueid or call_id,
+                    campana_id=str(id_camp),
+                )
+            except Exception:
+                logger.exception(
+                    "_attempt_queue_overflow: error on_timeout call_id=%s", call_id
+                )
+
+        if self.reporter and uniqueid:
+            try:
+                camp_id_int = int(id_camp) if str(id_camp).isdigit() else 0
+                target_int = (
+                    int(target_camp_id) if str(target_camp_id).isdigit() else target_camp_id
+                )
+                custom_data = {
+                    "is_overflow": True,
+                    "overflow_pending": True,
+                    "overflow_to_campaign_id": target_int,
+                    "overflow_count": int(getattr(ctx, "overflow_count", 0) or 0),
+                    "overflow_origin_campaign_id": getattr(
+                        ctx, "overflow_origin_campaign_id", None
+                    )
+                    or camp_id_int,
+                    "overflow_path": list(getattr(ctx, "overflow_path", None) or []),
+                }
+                end_iso = datetime.now().isoformat()
+                bridge_wait_time = 0.0
+                duracion_llamada = 0.0
+                if getattr(ctx, "bridge_created_ts", None):
+                    try:
+                        start_dt = datetime.fromisoformat(ctx.bridge_created_ts)
+                        end_dt = datetime.fromisoformat(end_iso)
+                        duracion_llamada = max(0.0, (end_dt - start_dt).total_seconds())
+                        bridge_wait_time = duracion_llamada
+                    except Exception:
+                        pass
+                call_data = {
+                    "callid": call_id,
+                    "id_camp": camp_id_int or getattr(ctx, "id_camp", None),
+                    "id_customer": getattr(ctx, "id_customer", None),
+                    "phone_number": getattr(ctx, "phone_number", None),
+                    "tel_dialed": getattr(ctx, "tel_dialed", None),
+                    "call_type": getattr(ctx, "call_type", None) or 0,
+                    "is_voicebot": bool(getattr(ctx, "is_voicebot", False)),
+                    "is_voicebot_transfer": bool(
+                        getattr(ctx, "is_voicebot_transfer", False)
+                    ),
+                    "transfer_count": int(getattr(ctx, "transfer_count", 0) or 0),
+                    "agent_segments": list(getattr(ctx, "agent_segments", None) or []),
+                    "ts_start_iso": getattr(ctx, "bridge_created_ts", None),
+                    "ts_answer_iso": getattr(ctx, "pstn_answered_ts", None)
+                    or getattr(ctx, "agent_answered_ts", None),
+                }
+                self.reporter.log_segment_end(
+                    call_data=call_data,
+                    event_final=HangupCause.EXIT_OVERFLOW.value,
+                    is_transfer=False,
+                    quien_corto=0,
+                    uniqueid=uniqueid,
+                    callid=call_id,
+                    end_iso=end_iso,
+                    bridge_wait_time=bridge_wait_time,
+                    duracion_llamada=duracion_llamada,
+                    channel_leg="PSTN",
+                    channel_leg_id=getattr(ctx, "uniqueid_pstn", None) or pstn_channel_id,
+                    channel_leg_name=getattr(ctx, "pstn_channel", None) or pstn_channel_id,
+                    channel_leg_start_ts=getattr(ctx, "bridge_created_ts", None),
+                    channel_leg_answer_ts=getattr(ctx, "pstn_answered_ts", None),
+                    channel_leg_end_ts=end_iso,
+                    custom_data=custom_data,
+                )
+            except Exception:
+                logger.exception(
+                    "_attempt_queue_overflow: error reportando EXIT_OVERFLOW call_id=%s",
+                    call_id,
+                )
+
+        try:
+            ok = bool(overflow_fn(call_id, target_camp_id))
+        except Exception:
+            logger.exception(
+                "_attempt_queue_overflow: overflow_to_campaign falló call_id=%s A=%s B=%s",
+                call_id,
+                id_camp,
+                target_camp_id,
+            )
+            return False
+
+        if ok:
+            logger.info(
+                "_attempt_queue_overflow: desborde OK call_id=%s %s→%s",
+                call_id,
+                id_camp,
+                target_camp_id,
+            )
+            return True
+
+        logger.warning(
+            "_attempt_queue_overflow: overflow rechazado call_id=%s %s→%s → hangup",
+            call_id,
+            id_camp,
+            target_camp_id,
+        )
+        return False
+
     def _on_queue_timeout(
         self,
         call_id: str,
@@ -2236,8 +2418,8 @@ class DistributionService:
         uniqueid: str,
     ) -> None:
         """
-        Maneja timeout de cola en dos fases: claim del intento y luego commit
-        destructivo (dequeue, callback, mark, report, hangups).
+        Maneja timeout de cola: claim del intento; si FAILOVER aplica, desborda
+        sin hangup PSTN; si no, commit destructivo (callback, mark, report, hangups).
 
         Si la contestación ya fue aceptada o el canal de intento está Up, aborta
         antes de mark/report (un solo closer: answer o timeout completo).
@@ -2369,6 +2551,28 @@ class DistributionService:
                 use_status_reservation=True,
             )
 
+        if current_agent_channel:
+            try:
+                self.ari_client.hangup_channel(current_agent_channel)
+            except Exception:
+                logger.exception(
+                    "_on_queue_timeout: error colgando canal intento %s (pre-overflow) call_id=%s",
+                    current_agent_channel,
+                    call_id,
+                )
+            current_agent_channel = None
+
+        # Desborde FAILOVER → campaña (antes de mark_call_ended / hangup PSTN)
+        if self._attempt_queue_overflow(
+            call_id=call_id,
+            id_camp=str(id_camp),
+            uniqueid=uniqueid,
+            pstn_channel_id=pstn_channel_id,
+            bridge_id=bridge_id,
+            context_for_report=context_for_report,
+        ):
+            return
+
         try:
             mark_result = self.state_store.mark_call_ended_atomic(call_id)
             if mark_result is False:
@@ -2486,6 +2690,8 @@ class DistributionService:
                     channel_leg_start_ts=context_for_report.bridge_created_ts,
                     channel_leg_answer_ts=context_for_report.pstn_answered_ts,
                     channel_leg_end_ts=end_iso,
+                    custom_data=overflow_custom_data_from_context(context_for_report)
+                    or None,
                 )
             except Exception:
                 logger.exception(

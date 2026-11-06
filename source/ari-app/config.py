@@ -92,6 +92,11 @@ class Settings(BaseSettings):
         ge=1,
         description="Umbral en segundos: con agente, talk menor al umbral se reporta como EXIT_SHORTCALL",
     )
+    MAX_OVERFLOW_HOPS: int = Field(
+        default=5,
+        ge=1,
+        description="Tope de desbordes encadenados por timeout de cola (FAILOVER)",
+    )
     TRANSFER_TIMEOUT: int = Field(default=30, ge=1, description="Timeout para transferencias ciegas")
     CONSULT_TIMEOUT: int = Field(default=45, ge=1, description="Timeout para transferencias consultivas")
 

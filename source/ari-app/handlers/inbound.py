@@ -26,6 +26,7 @@ from state_helpers import (
     finalize_current_agent_segment,
     is_agent_leg_channel,
     is_consult_initiator_channel,
+    overflow_custom_data_from_context,
 )
 from utils import compute_bot_agent_durations, parse_ari_args
 
@@ -262,6 +263,7 @@ class InboundCallHandler(BaseHandler):
                     channel_leg_start_ts=fresh_ctx.bridge_created_ts,
                     channel_leg_answer_ts=fresh_ctx.pstn_answered_ts,
                     channel_leg_end_ts=end_iso,
+                    custom_data=overflow_custom_data_from_context(fresh_ctx) or None,
                 )
             except Exception:
                 logger.exception(
@@ -344,6 +346,8 @@ class InboundCallHandler(BaseHandler):
                         channel_leg_answer_ts=fresh_ctx.pstn_answered_ts,
                         channel_leg_end_ts=end_iso,
                         transfer_count=transfer_count_val,
+                        custom_data=overflow_custom_data_from_context(fresh_ctx)
+                        or None,
                     )
                 except Exception:
                     logger.exception(
@@ -385,6 +389,7 @@ class InboundCallHandler(BaseHandler):
                     channel_leg_answer_ts=fresh_ctx.pstn_answered_ts,
                     channel_leg_end_ts=end_iso,
                     transfer_count=transfer_count_val,
+                    custom_data=overflow_custom_data_from_context(fresh_ctx) or None,
                 )
             except Exception:
                 logger.exception(

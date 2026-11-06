@@ -98,6 +98,13 @@ class CallContext(BaseModel):
     transfer_count: int = 0
     transfer_phase: str = TRANSFER_PHASE_NONE
     transfer_in_progress: bool = False
+    # Desborde por timeout de cola (FAILOVER → campaña); distinto de is_transferred
+    is_overflow: bool = False
+    overflow_count: int = 0
+    overflow_origin_campaign_id: Optional[int] = None
+    overflow_from_campaign_id: Optional[int] = None
+    overflow_path: List[Dict[str, Any]] = Field(default_factory=list)
+    entry_reason: Optional[str] = None  # "overflow" al re-encolar tras desborde
     pstn_channel_bridged: bool = False
     # True tras Dial PROGRESS (183): early media ya va al bridge y el ringback no se rearma
     pstn_early_media: bool = False

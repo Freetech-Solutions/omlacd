@@ -118,6 +118,10 @@ class TransferManager:
         self.asterisk_app = settings.ARI_APP
         # Node ID para reportes
         self.node_id = settings.NODE_ID
+        if distribution_service is not None and hasattr(
+            distribution_service, "set_overflow_to_campaign"
+        ):
+            distribution_service.set_overflow_to_campaign(self.overflow_to_campaign)
 
     # ----------------- Helpers -----------------
     def _get_context(self, call_id: str) -> Optional[CallContext]:
@@ -1211,6 +1215,7 @@ class TransferManager:
             tel_customer = ctx.phone_number
             call_type_val = ctx.call_type
             callid_meta = ctx.call_id
+            entry_reason = getattr(ctx, "entry_reason", None)
 
         if self.queue_event_manager:
             try:
@@ -1234,6 +1239,8 @@ class TransferManager:
             if call_type_val is not None
             else CallType.INBOUND_ID,
         }
+        if entry_reason:
+            distribution_metadata["entry_reason"] = entry_reason
 
         on_queue_timeout_callback = None
         if self.inbound_handler and hasattr(
@@ -1270,6 +1277,164 @@ class TransferManager:
                 distribution_metadata=distribution_metadata,
                 on_queue_timeout_callback=on_queue_timeout_callback,
             )
+
+    # -------------------------------------------------------------------------
+    # 2a) Overflow por timeout de cola -> Campaña (sin agente)
+    # -------------------------------------------------------------------------
+    def overflow_to_campaign(self, call_id: str, target_camp_id: str) -> bool:
+        """
+        Re-encola la misma llamada en otra campaña tras timeout de cola (FAILOVER).
+
+        No cuelga PSTN ni marca is_transferred. Actualiza id_camp a la cola destino
+        (atribución = última cola). Emite TRANSFER OVERFLOW SYSTEM.
+        """
+        try:
+            target_id = int(target_camp_id)
+        except (TypeError, ValueError):
+            self.logger.error(
+                "overflow_to_campaign: target_camp_id inválido %r call_id=%s",
+                target_camp_id,
+                call_id,
+            )
+            return False
+
+        max_hops = int(getattr(settings, "MAX_OVERFLOW_HOPS", 5) or 5)
+
+        with self.state_store.lock(call_id):
+            ctx = self.state_store.get(call_id)
+            if not ctx or getattr(ctx, "call_ended", False):
+                self.logger.warning(
+                    "overflow_to_campaign: contexto ausente o finalizado call_id=%s",
+                    call_id,
+                )
+                return False
+            if not ctx.bridge_id or not ctx.pstn_channel:
+                self.logger.warning(
+                    "overflow_to_campaign: sin bridge/PSTN call_id=%s",
+                    call_id,
+                )
+                return False
+
+            source_camp_id = int(
+                getattr(ctx, "distribution_campaign_id", None)
+                or ctx.id_camp
+                or 0
+            )
+            if source_camp_id <= 0:
+                self.logger.warning(
+                    "overflow_to_campaign: sin campaña origen call_id=%s",
+                    call_id,
+                )
+                return False
+            if target_id == source_camp_id:
+                self.logger.warning(
+                    "overflow_to_campaign: destino igual a origen %s call_id=%s",
+                    target_id,
+                    call_id,
+                )
+                return False
+
+            overflow_count = int(getattr(ctx, "overflow_count", 0) or 0)
+            if overflow_count >= max_hops:
+                self.logger.warning(
+                    "overflow_to_campaign: hops %s >= MAX_OVERFLOW_HOPS=%s call_id=%s",
+                    overflow_count,
+                    max_hops,
+                    call_id,
+                )
+                return False
+
+            now_iso = datetime.now().astimezone().isoformat()
+            path = list(getattr(ctx, "overflow_path", None) or [])
+            path.append(
+                {
+                    "from_campaign_id": source_camp_id,
+                    "to_campaign_id": target_id,
+                    "reason": "QUEUE_TIMEOUT",
+                    "at": now_iso,
+                }
+            )
+            if not getattr(ctx, "is_overflow", False):
+                ctx.overflow_origin_campaign_id = source_camp_id
+            ctx.is_overflow = True
+            ctx.overflow_count = overflow_count + 1
+            ctx.overflow_from_campaign_id = source_camp_id
+            ctx.overflow_path = path
+            ctx.entry_reason = "overflow"
+            # Atribución = última cola
+            ctx.id_camp = target_id
+            ctx.distribution_campaign_id = target_id
+            ctx.agent_id = None
+            ctx.agent_attempt_channel = None
+            ctx.agent_connected_channel = None
+            ctx.agent_answered_ts = None
+
+            bridge_id = ctx.bridge_id
+            pstn_channel_id = ctx.pstn_channel
+            id_customer = ctx.id_customer
+            call_type = ctx.call_type
+            self.state_store.register_unsafe(call_id, ctx)
+
+        # MOH de campaña destino
+        moh_class = None
+        if self.get_campaign_config:
+            try:
+                camp_cfg = self.get_campaign_config(str(target_id)) or {}
+                moh_class = camp_cfg.get("moh_sound")
+            except Exception:
+                self.logger.exception(
+                    "overflow_to_campaign: error leyendo cfg campaña %s",
+                    target_id,
+                )
+        try:
+            if moh_class:
+                self.ari.post(
+                    f"bridges/{bridge_id}/moh",
+                    params={"mohClass": moh_class},
+                )
+            else:
+                self._start_moh(bridge_id)
+        except Exception:
+            self.logger.exception(
+                "overflow_to_campaign: error MOH bridge=%s call_id=%s",
+                bridge_id,
+                call_id,
+            )
+
+        self._log_transfer_result(
+            ctx=None,
+            initiator="SYSTEM",
+            transfer_type="OVERFLOW",
+            destination_type="CAMPAIGN",
+            endpoint="",
+            result="OK",
+            target_camp_id=target_id,
+            call_id=call_id,
+            id_customer=id_customer,
+            id_camp=source_camp_id,
+            call_type=call_type,
+            agent_id=None,
+        )
+
+        try:
+            self._start_redistribution_after_blind_to_campaign(
+                call_id, str(target_id)
+            )
+            self.logger.info(
+                "overflow_to_campaign: call_id=%s re-encolada %s -> %s (hops=%s)",
+                call_id,
+                source_camp_id,
+                target_id,
+                overflow_count + 1,
+            )
+            return True
+        except Exception:
+            self.logger.exception(
+                "overflow_to_campaign: fallo redistribution call_id=%s target=%s",
+                call_id,
+                target_id,
+            )
+            return False
 
     # -------------------------------------------------------------------------
     # 2) Blind Transfer -> Campaña (Re-encolar)

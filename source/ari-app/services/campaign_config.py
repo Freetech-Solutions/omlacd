@@ -29,6 +29,9 @@ DEFAULT_CAMPAIGN_CFG = {
     "weight": 0,
     "wrapuptime": 0,
     "auto_unpause": 0,
+    "failover": False,
+    "failover_dst_tipo": None,
+    "failover_dst_id": None,
 }
 
 
@@ -164,6 +167,26 @@ def fetch_campaign_cfg_from_redis(
     if auto_unpause < 0:
         auto_unpause = 0
 
+    failover_raw = normalized.get("failover")
+    if failover_raw is not None and isinstance(failover_raw, bytes):
+        failover_raw = failover_raw.decode("utf-8")
+    failover = failover_raw in (True, "true", "1", "True", "yes", "Yes")
+
+    failover_dst_tipo = None
+    failover_dst_id = None
+    failover_dst_raw = normalized.get("failoverdst")
+    if failover_dst_raw is not None:
+        if isinstance(failover_dst_raw, bytes):
+            failover_dst_raw = failover_dst_raw.decode("utf-8")
+        parts = str(failover_dst_raw).strip().split(",")
+        if len(parts) >= 2:
+            try:
+                failover_dst_tipo = int(parts[0].strip())
+                failover_dst_id = int(parts[1].strip())
+            except (TypeError, ValueError):
+                failover_dst_tipo = None
+                failover_dst_id = None
+
     return {
         "moh_sound": moh_sound,
         "max_wait_time": max_wait_time,
@@ -178,6 +201,9 @@ def fetch_campaign_cfg_from_redis(
         "weight": weight,
         "wrapuptime": wrapuptime,
         "auto_unpause": auto_unpause,
+        "failover": failover,
+        "failover_dst_tipo": failover_dst_tipo,
+        "failover_dst_id": failover_dst_id,
     }
 
 

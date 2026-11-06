@@ -1,7 +1,7 @@
 import logging
 from contextlib import contextmanager
 from datetime import datetime
-from typing import Any, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from state import CallRegistry, CallContext
 
@@ -84,6 +84,27 @@ def effective_queue_campaign_id(ctx: CallContext) -> Optional[int]:
     if dist is not None and isinstance(dist, (int, str)):
         return dist
     return ctx.id_camp
+
+
+def overflow_custom_data_from_context(ctx: Any) -> Dict[str, Any]:
+    """
+    Campos JSONB channel_data / custom_data para desborde FAILOVER.
+    Vacío si la llamada no es overflow.
+    """
+    if not ctx or not getattr(ctx, "is_overflow", False):
+        return {}
+    data: Dict[str, Any] = {
+        "is_overflow": True,
+        "overflow_count": int(getattr(ctx, "overflow_count", 0) or 0),
+        "overflow_path": list(getattr(ctx, "overflow_path", None) or []),
+    }
+    origin = getattr(ctx, "overflow_origin_campaign_id", None)
+    if origin is not None:
+        data["overflow_origin_campaign_id"] = origin
+    from_camp = getattr(ctx, "overflow_from_campaign_id", None)
+    if from_camp is not None:
+        data["overflow_from_campaign_id"] = from_camp
+    return data
 
 
 def call_transfer_routing_active(ctx: Any) -> bool:
