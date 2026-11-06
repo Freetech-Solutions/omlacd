@@ -57,7 +57,12 @@ def fetch_campaign_cfg_from_redis(
             continue
         normalized[str(k).lower()] = v
 
-    moh_sound = normalized.get("moh_sound") or normalized.get("mohclass") or None
+    moh_sound = (
+        normalized.get("moh")
+        or normalized.get("moh_sound")
+        or normalized.get("mohclass")
+        or None
+    )
 
     max_wait_raw = (
         normalized.get("max_wait_time")
