@@ -99,6 +99,8 @@ class CallContext(BaseModel):
     transfer_phase: str = TRANSFER_PHASE_NONE
     transfer_in_progress: bool = False
     pstn_channel_bridged: bool = False
+    # True tras Dial PROGRESS (183): early media ya va al bridge y el ringback no se rearma
+    pstn_early_media: bool = False
     consultation: Optional[ConsultationData] = None
     custom_sip_headers: Optional[Dict[str, str]] = None
     target_agent_id: Optional[int] = None  # ID del agente destino en transferencias blind

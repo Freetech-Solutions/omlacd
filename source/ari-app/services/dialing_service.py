@@ -374,6 +374,11 @@ class DialingService:
             "tel_customer": number,
             "callid": uniqueid,
         }
+        # M0: echo dialer-owned attempt_id into pending dial (optional).
+        incoming_meta = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+        attempt_id = data.get("attempt_id") or incoming_meta.get("attempt_id")
+        if attempt_id not in (None, ""):
+            metadata["attempt_id"] = str(attempt_id)
         if effective_route_id:
             metadata["effective_route_id"] = effective_route_id
 

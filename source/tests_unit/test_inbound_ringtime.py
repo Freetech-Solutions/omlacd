@@ -138,6 +138,30 @@ def test_load_campaign_cfg_maps_ringtime_and_queuetime(mock_ari_client, mock_red
     assert cfg["moh_sound"] == "moh-class"
 
 
+def test_load_campaign_cfg_maps_moh_key_from_redis(mock_ari_client, mock_redis, mock_os_env, state_store):
+    """Django escribe MOH en OML:CAMP; el parser debe mapearlo a moh_sound."""
+    mock_redis.hgetall.return_value = {
+        "MOH": "test1",
+        "QUEUETIME": "30",
+        "strategy": "rrmemory",
+        "RINGTIME": "12",
+    }
+
+    handler = _build_handler(
+        mock_ari_client=mock_ari_client,
+        mock_redis=mock_redis,
+        state_store=state_store,
+        queue_strategy_engine=MagicMock(),
+        call_service=MagicMock(),
+    )
+
+    cfg = handler._load_campaign_cfg("2")
+
+    assert cfg["moh_sound"] == "test1"
+    assert cfg["max_wait_time"] == 30
+    assert cfg["ring_timeout"] == 12
+
+
 def test_load_campaign_cfg_reads_queuetime_key_from_redis(mock_ari_client, mock_redis, mock_os_env, state_store):
     """
     Verifica que cuando Redis tiene la clave QUEUETIME (como escribe Django),

@@ -415,7 +415,8 @@ class CallActionService:
         related_call_id: str,
         metadata: Dict[str, Any],
         external_sip_trunk: Optional[str] = None,
-        timeout: Optional[int] = None
+        timeout: Optional[int] = None,
+        early_media: bool = False,
     ) -> Optional[str]:
         """
         Origina una llamada hacia PSTN.
@@ -439,6 +440,9 @@ class CallActionService:
                 Si no se proporciona, se usa config.SIP_TRUNK como fallback.
             timeout: Timeout en segundos para el intento de llamada (opcional).
                 Si no se proporciona, se usa 30 como valor por defecto.
+            early_media: Si es True, crea el canal en Stasis y después marca.
+                El 183 se puede unir al bridge antes del answer. Solo la
+                llamada manual lo activa; el dialer sigue con originate.
         
         Returns:
             ID del canal PSTN creado, o None si falla
@@ -517,6 +521,10 @@ class CallActionService:
             "local_cancel": False,
             "amd": amd_enabled,
         }
+        # M0: preserve dialer attempt_id for process-event echo.
+        attempt_id = metadata.get("attempt_id")
+        if attempt_id not in (None, ""):
+            stored_meta["attempt_id"] = str(attempt_id)
         if related_call_id:
             stored_meta["related_call_id"] = related_call_id
         callid = metadata.get("callid") or metadata.get("uniqueid") or related_call_id
@@ -531,15 +539,24 @@ class CallActionService:
             f"related_call_id={related_call_id})"
         )
 
-        result = self.ari_client.originate_channel_op(
-            endpoint=endpoint,
-            app=self.config['ARI_APP'],
-            callerId=caller_id,
-            appArgs=app_args,
-            variables=variables,
-            timeout=ari_timeout,
-            channelId=pre_channel_id,
-        )
+        if early_media:
+            result = self._create_and_dial_pstn(
+                endpoint=endpoint,
+                caller_id=caller_id,
+                app_args=app_args,
+                timeout=ari_timeout,
+                channel_id=pre_channel_id,
+            )
+        else:
+            result = self.ari_client.originate_channel_op(
+                endpoint=endpoint,
+                app=self.config['ARI_APP'],
+                callerId=caller_id,
+                appArgs=app_args,
+                variables=variables,
+                timeout=ari_timeout,
+                channelId=pre_channel_id,
+            )
 
         if not result.get("ok"):
             self.logger.error(
@@ -570,7 +587,52 @@ class CallActionService:
 
         self.logger.info(f"✅ Canal PSTN creado: {pstn_channel_id}")
         return pstn_channel_id
-    
+
+    def _create_and_dial_pstn(
+        self,
+        endpoint: str,
+        caller_id: Optional[str],
+        app_args: Optional[str],
+        timeout: int,
+        channel_id: str,
+    ) -> Dict[str, Any]:
+        """
+        Create en Stasis y luego dial. Si el dial falla, cuelga el canal creado.
+        """
+        created = self.ari_client.create_stasis_channel_op(
+            endpoint=endpoint,
+            app=self.config["ARI_APP"],
+            app_args=app_args,
+            channel_id=channel_id,
+        )
+        if not created.get("ok"):
+            return created
+
+        data = created.get("data") or {}
+        created_id = data.get("id") or channel_id
+        dialed = self.ari_client.dial_channel_op(
+            created_id,
+            caller=caller_id,
+            timeout=timeout,
+        )
+        if dialed.get("ok"):
+            return created
+
+        self.logger.error(
+            "Dial de early media falló para %s: %s",
+            created_id,
+            dialed.get("error"),
+        )
+        try:
+            self.ari_client.hangup_channel_op(created_id)
+        except Exception as exc:
+            self.logger.warning(
+                "No se pudo colgar %s tras fallo de dial: %s",
+                created_id,
+                exc,
+            )
+        return dialed
+
     def dial_agent(
         self,
         agent_id: str,

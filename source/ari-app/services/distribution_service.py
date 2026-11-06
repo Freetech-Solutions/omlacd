@@ -2248,6 +2248,12 @@ class DistributionService:
             id_camp,
         )
 
+        # Capturar el callback ANTES de stop_event: el finally del distribution
+        # loop hace pop al salir y, si corre primero, CALLDATA se reporta sin
+        # acusar EXIT_TIMEOUT al dialer (has_cb=false).
+        with self._on_queue_timeout_callbacks_lock:
+            cb = self._on_queue_timeout_callbacks.pop(call_id, None)
+
         stop_event, attempt_finished = self._get_or_create_call_events(call_id)
         stop_event.set()
         attempt_finished.set()
@@ -2362,9 +2368,6 @@ class DistributionService:
                 failure_cooldown=True,
                 use_status_reservation=True,
             )
-
-        with self._on_queue_timeout_callbacks_lock:
-            cb = self._on_queue_timeout_callbacks.pop(call_id, None)
 
         try:
             mark_result = self.state_store.mark_call_ended_atomic(call_id)

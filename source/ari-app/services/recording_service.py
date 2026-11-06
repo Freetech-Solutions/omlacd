@@ -174,7 +174,22 @@ class RecordingService:
             
             # Verificar condición de disparo según tipo de llamada
             should_start = self._check_trigger_condition(call_type, channel_type, channels_count)
-            
+
+            # Manual: el 183 mete la PSTN al bridge antes del answer. No grabar
+            # el anuncio de red; la grabación arranca cuando hay pstn_answered_ts.
+            if (
+                should_start
+                and call_type == CallType.MANUAL
+                and not getattr(context, "pstn_answered_ts", None)
+            ):
+                self.logger.info(
+                    "Grabación manual diferida hasta el answer PSTN "
+                    "(bridge=%s channel=%s)",
+                    bridge_id,
+                    channel_id,
+                )
+                should_start = False
+
             if should_start:
                 self.logger.info(
                     f"Condición de grabación cumplida: call_type={call_type.value}, "
