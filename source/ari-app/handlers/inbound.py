@@ -1100,21 +1100,23 @@ class InboundCallHandler(BaseHandler):
                 call_id, channel_id
             )
             if not answer_accepted:
-                # Loop pudo marcar answer por canal Up (lag del event worker).
-                if not self.distribution_service.is_answer_already_accepted_for_channel(
+                # Loop/timeout pudo marcar answer por canal Up, o el slot ya no existe.
+                if self.distribution_service.recover_or_drop_late_agent_leg(
                     call_id, channel_id
                 ):
+                    logger.info(
+                        "InboundCallHandler.on_agent_stasis_start: StasisStart tardío "
+                        "recuperado call_id=%s channel=%s",
+                        call_id,
+                        channel_id,
+                    )
+                else:
                     logger.debug(
-                        "InboundCallHandler.on_agent_stasis_start: canal %s no es el agente actual, ignorando",
+                        "InboundCallHandler.on_agent_stasis_start: canal %s no consolidable "
+                        "(huérfano o no agente actual), ignorando",
                         channel_id,
                     )
                     return
-                logger.info(
-                    "InboundCallHandler.on_agent_stasis_start: StasisStart tardío para "
-                    "call_id=%s channel=%s (answer ya aceptada por recover Up)",
-                    call_id,
-                    channel_id,
-                )
 
             # Cancelar timer de timeout de cola: handle_agent_answer ya detiene el loop pero no el Timer.
             # No dequeue aún: la salida del ZSET es tras ONCALL (o redistribute si falla).

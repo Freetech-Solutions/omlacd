@@ -38,10 +38,10 @@ def test_enqueue_waiting_touches_alive():
 
     with patch("services.distribution_service.settings") as st:
         st.ACD_QUEUE_WEIGHT_ENABLED = True
-        st.ACD_WAITING_ALIVE_TTL_SEC = 90
+        st.ACD_WAITING_ALIVE_TTL_SEC = 15
         svc._enqueue_waiting("10", "call-a")
 
-    redis.set.assert_called_with(RedisKeys.waiting_alive("call-a"), "1", ex=90)
+    redis.set.assert_called_with(RedisKeys.waiting_alive("call-a"), "1", ex=15)
     assert svc._waiting_enqueued_at["call-a"] is not None
 
 

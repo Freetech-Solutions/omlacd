@@ -233,12 +233,13 @@ class Settings(BaseSettings):
         ),
     )
     ACD_WAITING_ALIVE_TTL_SEC: int = Field(
-        default=90,
+        default=15,
         ge=15,
         le=600,
         description=(
             "TTL del heartbeat acd:queue:waiting:alive:{call_id}. El loop lo refresca; "
-            "tras crash de acd-app, heads huérfanos dejan de bloquear en ≤ este TTL."
+            "tras crash de acd-app, heads huérfanos dejan de bloquear en ≤ este TTL "
+            "(default 15s; el bucle también dequea al detectar PSTN muerto)."
         ),
     )
     ACD_CALL_PRIORITY_TAU_SEC: float = Field(

@@ -173,7 +173,7 @@ def test_distribution_loop_skips_dial_when_cas_fails(mock_redis, agent_status_se
         mock_settings.AGENTS_CACHE_TTL_SEC = 5
         mock_settings.DISTRIBUTION_LOOP_IDLE_INTERVAL_SEC = 3.0
         mock_settings.ACD_QUEUE_WEIGHT_ENABLED = True
-        mock_settings.ACD_WAITING_ALIVE_TTL_SEC = 90
+        mock_settings.ACD_WAITING_ALIVE_TTL_SEC = 15
         svc._run_distribution_loop(
             call_id="call-1",
             id_camp="123",

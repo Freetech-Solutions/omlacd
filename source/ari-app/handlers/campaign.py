@@ -1690,16 +1690,17 @@ class ProgressiveCampaignHandler(BaseHandler):
                 call_id, channel_id
             )
             if not answer_accepted:
-                if not self.distribution_service.is_answer_already_accepted_for_channel(
+                if self.distribution_service.recover_or_drop_late_agent_leg(
                     call_id, channel_id
                 ):
+                    logger.info(
+                        "ProgressiveCampaignHandler.on_agent_stasis_start: StasisStart "
+                        "tardío recuperado call_id=%s channel=%s",
+                        call_id,
+                        channel_id,
+                    )
+                else:
                     return
-                logger.info(
-                    "ProgressiveCampaignHandler.on_agent_stasis_start: StasisStart tardío "
-                    "call_id=%s channel=%s (answer ya aceptada por recover Up)",
-                    call_id,
-                    channel_id,
-                )
             # Parar loop + timer; no dequeue hasta ONCALL / redistribute
             self.distribution_service.stop_distribution(
                 call_id,
