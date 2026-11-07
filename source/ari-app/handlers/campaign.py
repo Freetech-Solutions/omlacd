@@ -37,6 +37,7 @@ from services.call_manager import CallActionService
 from services.distribution_service import DistributionService
 from services.queue_welcome import (
     RESUME_DIALER,
+    claim_welcome_resume,
     clear_welcome_flags,
     start_welcome_or_continue,
     stop_welcome_if_playing,
@@ -582,9 +583,11 @@ class ProgressiveCampaignHandler(BaseHandler):
         if not call_id:
             return False
 
+        stop_welcome_if_playing(
+            self.ari_client, context, self.state_store, call_id
+        )
         with self._welcome_deferred_lock:
             self._welcome_deferred.pop(call_id, None)
-        stop_welcome_if_playing(self.ari_client, context)
 
         self._pstn_safety_net_cleanup(context, call_id)
 
@@ -1189,6 +1192,17 @@ class ProgressiveCampaignHandler(BaseHandler):
         self, call_id: str, deferred: Dict[str, Any]
     ) -> None:
         """MOH + on_enter_queue + distribución progressive (tras welcome o sin audio)."""
+        with self.state_store.lock(call_id):
+            ctx = self.state_store.get(call_id)
+            if not ctx or getattr(ctx, "call_ended", False):
+                logger.info(
+                    "Progressive _begin_queue_hold: omitiendo call_id=%s (ended/sin ctx)",
+                    call_id,
+                )
+                return
+            clear_welcome_flags(ctx)
+            self.state_store.register_unsafe(call_id, ctx)
+
         bridge_id = deferred["bridge_id"]
         channel_id = deferred["channel_id"]
         uniqueid = deferred["uniqueid"]
@@ -1198,12 +1212,6 @@ class ProgressiveCampaignHandler(BaseHandler):
         max_wait_time = deferred["max_wait_time"]
         strategy = deferred["strategy"]
         ring_timeout = deferred["ring_timeout"]
-
-        with self.state_store.lock(call_id):
-            ctx = self.state_store.get(call_id)
-            if ctx:
-                clear_welcome_flags(ctx)
-                self.state_store.register_unsafe(call_id, ctx)
 
         # MOH dialer: clase fija DIALER_MOH_CLASS si no hay MOH de campaña.
         moh_class = (
@@ -1277,17 +1285,20 @@ class ProgressiveCampaignHandler(BaseHandler):
 
     def on_welcome_finished(self, call_id: str) -> None:
         """Tras WELCOMEPLAY: MOH + enter_queue + distribución progressive."""
+        if not claim_welcome_resume(self.state_store, call_id):
+            with self._welcome_deferred_lock:
+                self._welcome_deferred.pop(call_id, None)
+            logger.info(
+                "Progressive on_welcome_finished: resume no autorizado call_id=%s",
+                call_id,
+            )
+            return
         with self._welcome_deferred_lock:
             deferred = self._welcome_deferred.pop(call_id, None)
         if not deferred:
             logger.warning(
                 "Progressive on_welcome_finished: sin deferred call_id=%s", call_id
             )
-            with self.state_store.lock(call_id):
-                ctx = self.state_store.get(call_id)
-                if ctx:
-                    clear_welcome_flags(ctx)
-                    self.state_store.register_unsafe(call_id, ctx)
             return
         self._begin_dialer_queue_hold_and_distribute(call_id, deferred)
 

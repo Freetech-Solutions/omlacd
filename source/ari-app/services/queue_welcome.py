@@ -41,12 +41,79 @@ def is_our_welcome_playback(ctx: Any, playback_id: Optional[str]) -> bool:
     return bool(stored and str(stored) == str(playback_id))
 
 
-def stop_welcome_if_playing(ari_client: Any, ctx: Any) -> None:
-    """Detiene playback de welcome en hangup; limpia flags."""
-    if not ctx or not getattr(ctx, "welcome_pending", False):
-        return
-    playback_id = getattr(ctx, "welcome_playback_id", None)
-    clear_welcome_flags(ctx)
+def invalidate_welcome(state_store: Any, call_id: Optional[str], ctx: Any = None) -> Optional[str]:
+    """
+    Cancela welcome pendiente (hangup): limpia flags en Redis bajo lock.
+
+    Returns:
+        playback_id a detener en ARI, o None.
+    """
+    playback_id = None
+    if ctx is not None and getattr(ctx, "welcome_pending", False):
+        playback_id = getattr(ctx, "welcome_playback_id", None)
+        clear_welcome_flags(ctx)
+
+    if not state_store or not call_id:
+        return playback_id
+
+    try:
+        with state_store.lock(call_id):
+            fresh = state_store.get(call_id)
+            if not fresh:
+                return playback_id
+            if getattr(fresh, "welcome_pending", False):
+                playback_id = playback_id or getattr(fresh, "welcome_playback_id", None)
+            clear_welcome_flags(fresh)
+            state_store.register_unsafe(call_id, fresh)
+    except Exception:
+        logger.exception("invalidate_welcome: error persistiendo call_id=%s", call_id)
+    return playback_id
+
+
+def claim_welcome_resume(state_store: Any, call_id: str) -> bool:
+    """
+    Bajo lock: autoriza MOH+dist tras PlaybackFinished.
+
+    Requiere contexto vivo, welcome_pending y not call_ended; limpia flags.
+    Returns False si hangup/otro hilo ya invalidó o la llamada terminó.
+    """
+    if not state_store or not call_id:
+        return False
+    try:
+        with state_store.lock(call_id):
+            ctx = state_store.get(call_id)
+            if not ctx:
+                return False
+            if getattr(ctx, "call_ended", False):
+                clear_welcome_flags(ctx)
+                state_store.register_unsafe(call_id, ctx)
+                return False
+            if not getattr(ctx, "welcome_pending", False):
+                return False
+            clear_welcome_flags(ctx)
+            state_store.register_unsafe(call_id, ctx)
+            return True
+    except Exception:
+        logger.exception("claim_welcome_resume: error call_id=%s", call_id)
+        return False
+
+
+def stop_welcome_if_playing(
+    ari_client: Any,
+    ctx: Any,
+    state_store: Any = None,
+    call_id: Optional[str] = None,
+) -> None:
+    """Detiene playback de welcome en hangup; limpia flags en ctx y Redis."""
+    cid = call_id or (getattr(ctx, "call_id", None) if ctx is not None else None)
+    if state_store and cid:
+        playback_id = invalidate_welcome(state_store, cid, ctx)
+    else:
+        if not ctx or not getattr(ctx, "welcome_pending", False):
+            return
+        playback_id = getattr(ctx, "welcome_playback_id", None)
+        clear_welcome_flags(ctx)
+
     if not playback_id or not ari_client:
         return
     try:

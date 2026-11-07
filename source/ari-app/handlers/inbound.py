@@ -19,6 +19,7 @@ from services.distribution_service import DistributionService
 from services.queue_strategy import QueueStrategyEngine
 from services.queue_welcome import (
     RESUME_INBOUND,
+    claim_welcome_resume,
     clear_welcome_flags,
     start_welcome_or_continue,
     stop_welcome_if_playing,
@@ -422,9 +423,13 @@ class InboundCallHandler(BaseHandler):
         if not call_id:
             return False
 
+        # Invalidar welcome en Redis antes del pop deferred para ganar la carrera
+        # contra PlaybackFinished (claim_welcome_resume verá pending=False).
+        stop_welcome_if_playing(
+            self.ari_client, context, self.state_store, call_id
+        )
         with self._welcome_deferred_lock:
             self._welcome_deferred.pop(call_id, None)
-        stop_welcome_if_playing(self.ari_client, context)
 
         self._pstn_safety_net_cleanup(context, call_id)
 
@@ -915,6 +920,17 @@ class InboundCallHandler(BaseHandler):
         self, call_id: str, deferred: Dict[str, Any]
     ) -> None:
         """MOH + log_queue + on_enter_queue + distribución (tras welcome o sin audio)."""
+        with self.state_store.lock(call_id):
+            ctx = self.state_store.get(call_id)
+            if not ctx or getattr(ctx, "call_ended", False):
+                logger.info(
+                    "Inbound _begin_queue_hold: omitiendo call_id=%s (ended/sin ctx)",
+                    call_id,
+                )
+                return
+            clear_welcome_flags(ctx)
+            self.state_store.register_unsafe(call_id, ctx)
+
         bridge_id = deferred["bridge_id"]
         channel_id = deferred["channel_id"]
         channel_name = deferred.get("channel_name")
@@ -926,12 +942,6 @@ class InboundCallHandler(BaseHandler):
         max_wait_time = deferred["max_wait_time"]
         strategy = deferred["strategy"]
         ring_timeout = deferred["ring_timeout"]
-
-        with self.state_store.lock(call_id):
-            ctx = self.state_store.get(call_id)
-            if ctx:
-                clear_welcome_flags(ctx)
-                self.state_store.register_unsafe(call_id, ctx)
 
         try:
             if moh_sound:
@@ -1035,6 +1045,15 @@ class InboundCallHandler(BaseHandler):
 
     def on_welcome_finished(self, call_id: str) -> None:
         """PlaybackFinished de WELCOMEPLAY: arranca MOH + cola + distribución."""
+        # Claim atómico primero: si hangup ya invalidó flags / call_ended, no seguir.
+        if not claim_welcome_resume(self.state_store, call_id):
+            with self._welcome_deferred_lock:
+                self._welcome_deferred.pop(call_id, None)
+            logger.info(
+                "InboundCallHandler.on_welcome_finished: resume no autorizado call_id=%s",
+                call_id,
+            )
+            return
         with self._welcome_deferred_lock:
             deferred = self._welcome_deferred.pop(call_id, None)
         if not deferred:
@@ -1042,11 +1061,6 @@ class InboundCallHandler(BaseHandler):
                 "InboundCallHandler.on_welcome_finished: sin deferred call_id=%s",
                 call_id,
             )
-            with self.state_store.lock(call_id):
-                ctx = self.state_store.get(call_id)
-                if ctx:
-                    clear_welcome_flags(ctx)
-                    self.state_store.register_unsafe(call_id, ctx)
             return
         self._begin_inbound_queue_hold_and_distribute(call_id, deferred)
 

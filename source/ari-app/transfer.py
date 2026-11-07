@@ -25,9 +25,9 @@ from state_helpers import (
 from utils import build_oml_sip_headers
 from services.queue_welcome import (
     RESUME_REDISTRIBUTE,
+    claim_welcome_resume,
     clear_welcome_flags,
     start_welcome_or_continue,
-    stop_welcome_if_playing,
 )
 
 # Estados de reporting para blind transfer (ver blind_to_endpoint / on_transfer_leg_start)
@@ -1282,6 +1282,18 @@ class TransferManager:
         self, call_id: str, deferred: Dict[str, Any]
     ) -> None:
         """MOH destino + on_enter_queue + distribución (tras welcome o sin audio)."""
+        with self.state_store.lock(call_id):
+            ctx = self.state_store.get(call_id)
+            if not ctx or getattr(ctx, "call_ended", False):
+                self.logger.info(
+                    "TransferManager _begin_redistribution: omitiendo call_id=%s "
+                    "(ended/sin ctx)",
+                    call_id,
+                )
+                return
+            clear_welcome_flags(ctx)
+            self.state_store.register_unsafe(call_id, ctx)
+
         target_camp_id = deferred["target_camp_id"]
         campaign_cfg = deferred.get("campaign_cfg") or {}
         strategy = deferred["strategy"]
@@ -1295,12 +1307,6 @@ class TransferManager:
         call_type_val = deferred.get("call_type_val")
         callid_meta = deferred.get("callid_meta")
         entry_reason = deferred.get("entry_reason")
-
-        with self.state_store.lock(call_id):
-            ctx = self.state_store.get(call_id)
-            if ctx:
-                clear_welcome_flags(ctx)
-                self.state_store.register_unsafe(call_id, ctx)
 
         moh_class = campaign_cfg.get("moh_sound")
         try:
@@ -1384,6 +1390,14 @@ class TransferManager:
 
     def on_welcome_finished(self, call_id: str) -> None:
         """PlaybackFinished de WELCOMEPLAY en overflow/blind redistrib."""
+        if not claim_welcome_resume(self.state_store, call_id):
+            with self._welcome_deferred_lock:
+                self._welcome_deferred.pop(call_id, None)
+            self.logger.info(
+                "TransferManager.on_welcome_finished: resume no autorizado call_id=%s",
+                call_id,
+            )
+            return
         with self._welcome_deferred_lock:
             deferred = self._welcome_deferred.pop(call_id, None)
         if not deferred:
@@ -1391,11 +1405,6 @@ class TransferManager:
                 "TransferManager.on_welcome_finished: sin deferred call_id=%s",
                 call_id,
             )
-            with self.state_store.lock(call_id):
-                ctx = self.state_store.get(call_id)
-                if ctx:
-                    clear_welcome_flags(ctx)
-                    self.state_store.register_unsafe(call_id, ctx)
             return
         self._begin_redistribution_queue_hold_and_distribute(call_id, deferred)
 

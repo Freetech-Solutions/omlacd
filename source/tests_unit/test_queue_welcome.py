@@ -35,7 +35,10 @@ from services.queue_welcome import (  # noqa: E402
     RESUME_DIALER,
     RESUME_INBOUND,
     RESUME_REDISTRIBUTE,
+    claim_welcome_resume,
+    invalidate_welcome,
     start_welcome_or_continue,
+    stop_welcome_if_playing,
 )
 from state import CallContext  # noqa: E402
 from transfer import TransferManager  # noqa: E402
@@ -188,6 +191,9 @@ class TestDialerWelcomeDefer(unittest.TestCase):
         self.dist.start_distribution.assert_not_called()
         self.assertIn("dial-wel", self.handler._welcome_deferred)
 
+        self.ctx.welcome_pending = True
+        self.ctx.welcome_playback_id = "pb-d"
+        self.ctx.welcome_resume_action = RESUME_DIALER
         self.handler.on_welcome_finished("dial-wel")
         self.dist.start_distribution.assert_called_once()
 
@@ -250,6 +256,125 @@ class TestRedistribWelcomeDefer(unittest.TestCase):
             self.dist.start_distribution.call_args.kwargs["campaign_id"], "9"
         )
         self.assertFalse(ctx.welcome_pending)
+
+
+class TestWelcomeRaceHangup(unittest.TestCase):
+    def test_claim_fails_after_invalidate(self):
+        ctx = CallContext(
+            call_id="race-1",
+            type=CallType.INBOUND,
+            call_type=3,
+            welcome_pending=True,
+            welcome_playback_id="pb-race",
+            welcome_resume_action=RESUME_INBOUND,
+        )
+        store = MagicMock()
+        store.lock.return_value = nullcontext()
+        store.get.return_value = ctx
+
+        pb = invalidate_welcome(store, "race-1", ctx)
+        self.assertEqual(pb, "pb-race")
+        self.assertFalse(ctx.welcome_pending)
+        self.assertFalse(claim_welcome_resume(store, "race-1"))
+
+    def test_claim_fails_when_call_ended(self):
+        ctx = CallContext(
+            call_id="race-2",
+            type=CallType.INBOUND,
+            call_type=3,
+            welcome_pending=True,
+            welcome_playback_id="pb-2",
+            call_ended=True,
+        )
+        store = MagicMock()
+        store.lock.return_value = nullcontext()
+        store.get.return_value = ctx
+        self.assertFalse(claim_welcome_resume(store, "race-2"))
+        self.assertFalse(ctx.welcome_pending)
+
+    def test_hangup_then_welcome_finished_skips_dist(self):
+        ctx = CallContext(
+            call_id="race-3",
+            type=CallType.INBOUND,
+            call_type=3,
+            pstn_channel="pstn-r3",
+            bridge_id="br-r3",
+            welcome_pending=True,
+            welcome_playback_id="pb-3",
+            welcome_resume_action=RESUME_INBOUND,
+        )
+        store = MagicMock()
+        store.lock.return_value = nullcontext()
+        store.get.return_value = ctx
+        ari = MagicMock()
+        dist = MagicMock()
+        handler = InboundCallHandler.__new__(InboundCallHandler)
+        handler.ari_client = ari
+        handler.state_store = store
+        handler.reporter = MagicMock()
+        handler.call_service = MagicMock()
+        handler.distribution_service = dist
+        handler.queue_event_manager = MagicMock()
+        handler._welcome_deferred = {
+            "race-3": {
+                "bridge_id": "br-r3",
+                "channel_id": "pstn-r3",
+                "channel_name": "SIP/x",
+                "uniqueid": "uq",
+                "id_camp": 2,
+                "inbound_data": {"id_camp": 2},
+                "campaign_cfg": {"voicebot": False},
+                "moh_sound": None,
+                "max_wait_time": 60,
+                "strategy": "fewestcalls",
+                "ring_timeout": 15,
+            }
+        }
+        handler._welcome_deferred_lock = __import__("threading").Lock()
+
+        stop_welcome_if_playing(ari, ctx, store, "race-3")
+        with handler._welcome_deferred_lock:
+            handler._welcome_deferred.pop("race-3", None)
+
+        handler.on_welcome_finished("race-3")
+        dist.start_distribution.assert_not_called()
+        ari.stop_playback.assert_called_once_with("pb-3")
+
+    def test_begin_skips_when_call_ended(self):
+        ctx = CallContext(
+            call_id="race-4",
+            type=CallType.INBOUND,
+            call_type=3,
+            call_ended=True,
+        )
+        store = MagicMock()
+        store.lock.return_value = nullcontext()
+        store.get.return_value = ctx
+        dist = MagicMock()
+        handler = InboundCallHandler.__new__(InboundCallHandler)
+        handler.state_store = store
+        handler.ari_client = MagicMock()
+        handler.reporter = MagicMock()
+        handler.call_service = MagicMock()
+        handler.distribution_service = dist
+        handler.queue_event_manager = MagicMock()
+
+        handler._begin_inbound_queue_hold_and_distribute(
+            "race-4",
+            {
+                "bridge_id": "br",
+                "channel_id": "ch",
+                "uniqueid": "uq",
+                "id_camp": 1,
+                "inbound_data": {},
+                "campaign_cfg": {},
+                "moh_sound": None,
+                "max_wait_time": 60,
+                "strategy": "fewestcalls",
+                "ring_timeout": 15,
+            },
+        )
+        dist.start_distribution.assert_not_called()
 
 
 class TestRouterWelcomePlayback(unittest.TestCase):
