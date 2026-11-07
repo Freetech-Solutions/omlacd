@@ -35,6 +35,12 @@ from queue_events import QueueEventManager
 from services.agent_status_service import AgentStatusService
 from services.call_manager import CallActionService
 from services.distribution_service import DistributionService
+from services.queue_welcome import (
+    RESUME_DIALER,
+    clear_welcome_flags,
+    start_welcome_or_continue,
+    stop_welcome_if_playing,
+)
 from state import CallContext, CallRegistry
 from state_helpers import (
     active_agent_channel,
@@ -87,6 +93,8 @@ class ProgressiveCampaignHandler(BaseHandler):
         self.pstn_channel_id: Optional[str] = None
         self._pstn_hangup_initiated_by_app: Set[str] = set()
         self._pstn_hangup_lock = threading.Lock()
+        self._welcome_deferred: Dict[str, Dict[str, Any]] = {}
+        self._welcome_deferred_lock = threading.Lock()
 
     def _mark_pstn_hangup_by_app(self, channel_id: str) -> None:
         with self._pstn_hangup_lock:
@@ -574,6 +582,10 @@ class ProgressiveCampaignHandler(BaseHandler):
         if not call_id:
             return False
 
+        with self._welcome_deferred_lock:
+            self._welcome_deferred.pop(call_id, None)
+        stop_welcome_if_playing(self.ari_client, context)
+
         self._pstn_safety_net_cleanup(context, call_id)
 
         refreshed: Optional[CallContext] = None
@@ -797,6 +809,7 @@ class ProgressiveCampaignHandler(BaseHandler):
         if not self.redis_client:
             return {
                 "moh_sound": None,
+                "welcome_sound": None,
                 "max_wait_time": 3600,
                 "strategy": "fewestcalls",
                 "ring_timeout": settings.DEFAULT_ORIGINATE_TIMEOUT,
@@ -806,6 +819,7 @@ class ProgressiveCampaignHandler(BaseHandler):
         except Exception:
             return {
                 "moh_sound": None,
+                "welcome_sound": None,
                 "max_wait_time": 3600,
                 "strategy": "fewestcalls",
                 "ring_timeout": settings.DEFAULT_ORIGINATE_TIMEOUT,
@@ -1123,13 +1137,6 @@ class ProgressiveCampaignHandler(BaseHandler):
                 self.call_service.add_channel_to_bridge(bridge_id, channel_id)
             except Exception:
                 logger.exception("Error agregando PSTN %s al bridge %s", channel_id, bridge_id)
-        try:
-            self.ari_client.post(
-                f"bridges/{bridge_id}/moh",
-                params={"mohClass": DIALER_MOH_CLASS},
-            )
-        except Exception:
-            logger.exception("Error iniciando MOH en bridge %s", bridge_id)
 
         if not context_already_registered:
             ctx = self._create_and_register_context(
@@ -1147,6 +1154,71 @@ class ProgressiveCampaignHandler(BaseHandler):
                 )
                 return
 
+        deferred = {
+            "bridge_id": bridge_id,
+            "channel_id": channel_id,
+            "uniqueid": uniqueid,
+            "id_camp": id_camp,
+            "progressive_data": progressive_data,
+            "campaign_cfg": dict(campaign_cfg),
+            "max_wait_time": max_wait_time,
+            "strategy": strategy,
+            "ring_timeout": ring_timeout,
+        }
+        welcome_sound = campaign_cfg.get("welcome_sound")
+        if start_welcome_or_continue(
+            self.ari_client,
+            self.state_store,
+            call_id,
+            channel_id,
+            welcome_sound,
+            RESUME_DIALER,
+        ):
+            with self._welcome_deferred_lock:
+                self._welcome_deferred[call_id] = deferred
+            logger.info(
+                "Progressive: WELCOMEPLAY pendiente call_id=%s sound=%s",
+                call_id,
+                welcome_sound,
+            )
+            return
+
+        self._begin_dialer_queue_hold_and_distribute(call_id, deferred)
+
+    def _begin_dialer_queue_hold_and_distribute(
+        self, call_id: str, deferred: Dict[str, Any]
+    ) -> None:
+        """MOH + on_enter_queue + distribución progressive (tras welcome o sin audio)."""
+        bridge_id = deferred["bridge_id"]
+        channel_id = deferred["channel_id"]
+        uniqueid = deferred["uniqueid"]
+        id_camp = deferred["id_camp"]
+        progressive_data = deferred["progressive_data"]
+        campaign_cfg = deferred["campaign_cfg"]
+        max_wait_time = deferred["max_wait_time"]
+        strategy = deferred["strategy"]
+        ring_timeout = deferred["ring_timeout"]
+
+        with self.state_store.lock(call_id):
+            ctx = self.state_store.get(call_id)
+            if ctx:
+                clear_welcome_flags(ctx)
+                self.state_store.register_unsafe(call_id, ctx)
+
+        # MOH dialer: clase fija DIALER_MOH_CLASS si no hay MOH de campaña.
+        moh_class = (
+            campaign_cfg.get("moh_sound")
+            if campaign_cfg.get("moh_sound")
+            else DIALER_MOH_CLASS
+        )
+        try:
+            self.ari_client.post(
+                f"bridges/{bridge_id}/moh",
+                params={"mohClass": moh_class},
+            )
+        except Exception:
+            logger.exception("Error iniciando MOH en bridge %s", bridge_id)
+
         if self.queue_event_manager:
             try:
                 self.queue_event_manager.on_enter_queue(
@@ -1159,7 +1231,8 @@ class ProgressiveCampaignHandler(BaseHandler):
 
         if not self.distribution_service:
             logger.error(
-                "ProgressiveCampaignHandler._start_progressive_distribution: distribution_service no inyectado para %s",
+                "ProgressiveCampaignHandler._begin_dialer_queue_hold_and_distribute: "
+                "distribution_service no inyectado para %s",
                 call_id,
             )
             return
@@ -1201,6 +1274,22 @@ class ProgressiveCampaignHandler(BaseHandler):
                 )
         except Exception:
             logger.exception("Error iniciando distribución para %s", call_id)
+
+    def on_welcome_finished(self, call_id: str) -> None:
+        """Tras WELCOMEPLAY: MOH + enter_queue + distribución progressive."""
+        with self._welcome_deferred_lock:
+            deferred = self._welcome_deferred.pop(call_id, None)
+        if not deferred:
+            logger.warning(
+                "Progressive on_welcome_finished: sin deferred call_id=%s", call_id
+            )
+            with self.state_store.lock(call_id):
+                ctx = self.state_store.get(call_id)
+                if ctx:
+                    clear_welcome_flags(ctx)
+                    self.state_store.register_unsafe(call_id, ctx)
+            return
+        self._begin_dialer_queue_hold_and_distribute(call_id, deferred)
 
     def _abort_amd_before_answer(
         self,

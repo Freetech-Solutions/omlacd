@@ -23,6 +23,12 @@ from state_helpers import (
     resolve_consult_initiator_channel,
 )
 from utils import build_oml_sip_headers
+from services.queue_welcome import (
+    RESUME_REDISTRIBUTE,
+    clear_welcome_flags,
+    start_welcome_or_continue,
+    stop_welcome_if_playing,
+)
 
 # Estados de reporting para blind transfer (ver blind_to_endpoint / on_transfer_leg_start)
 _BLIND_TF_REQUESTED = "requested"
@@ -118,6 +124,8 @@ class TransferManager:
         self.asterisk_app = settings.ARI_APP
         # Node ID para reportes
         self.node_id = settings.NODE_ID
+        self._welcome_deferred: Dict[str, Dict[str, Any]] = {}
+        self._welcome_deferred_lock = threading.Lock()
         if distribution_service is not None and hasattr(
             distribution_service, "set_overflow_to_campaign"
         ):
@@ -1165,10 +1173,22 @@ class TransferManager:
             )
             return False
 
+    def _stop_bridge_moh(self, bridge_id: Optional[str]) -> None:
+        if not bridge_id:
+            return
+        try:
+            self.ari.delete(f"bridges/{bridge_id}/moh")
+        except Exception:
+            self.logger.debug(
+                "_stop_bridge_moh: bridge=%s (puede no haber MOH activo)",
+                bridge_id,
+                exc_info=True,
+            )
+
     def _start_redistribution_after_blind_to_campaign(self, call_id: str, target_camp_id: str) -> None:
         """
-        Tras blind_to_campaign: cancela timer/eventos de la distribución previa e inicia
-        el loop de cola hacia la campaña destino (misma mecánica que InboundCallHandler.on_start).
+        Tras blind_to_campaign / overflow: cancela timer/eventos de la distribución previa
+        e inicia cola hacia la campaña destino (welcome → MOH → dist si aplica).
         """
         if not self.distribution_service:
             self.logger.error(
@@ -1190,7 +1210,7 @@ class TransferManager:
             call_id, cancel_timer=True, hangup_agent_channel=False
         )
 
-        campaign_cfg = self.get_campaign_config(target_camp_id)
+        campaign_cfg = self.get_campaign_config(target_camp_id) or {}
         strategy = str(campaign_cfg.get("strategy") or "fewestcalls")
         ring_timeout = int(
             campaign_cfg.get("ring_timeout")
@@ -1216,6 +1236,87 @@ class TransferManager:
             call_type_val = ctx.call_type
             callid_meta = ctx.call_id
             entry_reason = getattr(ctx, "entry_reason", None)
+
+        deferred = {
+            "target_camp_id": str(target_camp_id),
+            "campaign_cfg": dict(campaign_cfg),
+            "strategy": strategy,
+            "ring_timeout": ring_timeout,
+            "max_wait_time": max_wait_time,
+            "bridge_id": bridge_id,
+            "pstn_channel_id": pstn_channel_id,
+            "uniqueid": uniqueid,
+            "id_customer": id_customer,
+            "tel_customer": tel_customer,
+            "call_type_val": call_type_val,
+            "callid_meta": callid_meta,
+            "entry_reason": entry_reason,
+        }
+
+        welcome_sound = campaign_cfg.get("welcome_sound")
+        if welcome_sound:
+            self._stop_bridge_moh(bridge_id)
+
+        if start_welcome_or_continue(
+            self.ari,
+            self.state_store,
+            call_id,
+            pstn_channel_id,
+            welcome_sound,
+            RESUME_REDISTRIBUTE,
+        ):
+            with self._welcome_deferred_lock:
+                self._welcome_deferred[call_id] = deferred
+            self.logger.info(
+                "TransferManager: WELCOMEPLAY pendiente redistrib call_id=%s "
+                "camp=%s sound=%s",
+                call_id,
+                target_camp_id,
+                welcome_sound,
+            )
+            return
+
+        self._begin_redistribution_queue_hold_and_distribute(call_id, deferred)
+
+    def _begin_redistribution_queue_hold_and_distribute(
+        self, call_id: str, deferred: Dict[str, Any]
+    ) -> None:
+        """MOH destino + on_enter_queue + distribución (tras welcome o sin audio)."""
+        target_camp_id = deferred["target_camp_id"]
+        campaign_cfg = deferred.get("campaign_cfg") or {}
+        strategy = deferred["strategy"]
+        ring_timeout = deferred["ring_timeout"]
+        max_wait_time = deferred["max_wait_time"]
+        bridge_id = deferred["bridge_id"]
+        pstn_channel_id = deferred["pstn_channel_id"]
+        uniqueid = deferred["uniqueid"]
+        id_customer = deferred.get("id_customer")
+        tel_customer = deferred.get("tel_customer")
+        call_type_val = deferred.get("call_type_val")
+        callid_meta = deferred.get("callid_meta")
+        entry_reason = deferred.get("entry_reason")
+
+        with self.state_store.lock(call_id):
+            ctx = self.state_store.get(call_id)
+            if ctx:
+                clear_welcome_flags(ctx)
+                self.state_store.register_unsafe(call_id, ctx)
+
+        moh_class = campaign_cfg.get("moh_sound")
+        try:
+            if moh_class:
+                self.ari.post(
+                    f"bridges/{bridge_id}/moh",
+                    params={"mohClass": moh_class},
+                )
+            else:
+                self._start_moh(bridge_id)
+        except Exception:
+            self.logger.exception(
+                "_begin_redistribution: error MOH bridge=%s call_id=%s",
+                bridge_id,
+                call_id,
+            )
 
         if self.queue_event_manager:
             try:
@@ -1249,6 +1350,9 @@ class TransferManager:
             mark_fn = self.inbound_handler._mark_pstn_hangup_by_app
             on_queue_timeout_callback = lambda cid, ch: mark_fn(ch)
 
+        if not self.distribution_service:
+            return
+
         if campaign_cfg.get("voicebot") and campaign_cfg.get("external_ag_host"):
             self.distribution_service.start_voicebot_distribution(
                 call_id=call_id,
@@ -1277,6 +1381,23 @@ class TransferManager:
                 distribution_metadata=distribution_metadata,
                 on_queue_timeout_callback=on_queue_timeout_callback,
             )
+
+    def on_welcome_finished(self, call_id: str) -> None:
+        """PlaybackFinished de WELCOMEPLAY en overflow/blind redistrib."""
+        with self._welcome_deferred_lock:
+            deferred = self._welcome_deferred.pop(call_id, None)
+        if not deferred:
+            self.logger.warning(
+                "TransferManager.on_welcome_finished: sin deferred call_id=%s",
+                call_id,
+            )
+            with self.state_store.lock(call_id):
+                ctx = self.state_store.get(call_id)
+                if ctx:
+                    clear_welcome_flags(ctx)
+                    self.state_store.register_unsafe(call_id, ctx)
+            return
+        self._begin_redistribution_queue_hold_and_distribute(call_id, deferred)
 
     # -------------------------------------------------------------------------
     # 2a) Overflow por timeout de cola -> Campaña (sin agente)
@@ -1369,37 +1490,11 @@ class TransferManager:
             ctx.agent_connected_channel = None
             ctx.agent_answered_ts = None
 
-            bridge_id = ctx.bridge_id
-            pstn_channel_id = ctx.pstn_channel
             id_customer = ctx.id_customer
             call_type = ctx.call_type
             self.state_store.register_unsafe(call_id, ctx)
 
-        # MOH de campaña destino
-        moh_class = None
-        if self.get_campaign_config:
-            try:
-                camp_cfg = self.get_campaign_config(str(target_id)) or {}
-                moh_class = camp_cfg.get("moh_sound")
-            except Exception:
-                self.logger.exception(
-                    "overflow_to_campaign: error leyendo cfg campaña %s",
-                    target_id,
-                )
-        try:
-            if moh_class:
-                self.ari.post(
-                    f"bridges/{bridge_id}/moh",
-                    params={"mohClass": moh_class},
-                )
-            else:
-                self._start_moh(bridge_id)
-        except Exception:
-            self.logger.exception(
-                "overflow_to_campaign: error MOH bridge=%s call_id=%s",
-                bridge_id,
-                call_id,
-            )
+        # MOH destino (o WELCOMEPLAY) lo arranca _start_redistribution_after_blind_to_campaign
 
         self._log_transfer_result(
             ctx=None,
@@ -1489,7 +1584,7 @@ class TransferManager:
             is_voicebot_source = bool(getattr(ctx, "is_voicebot", False))
         
         # 2. Ejecución física fuera del lock (no modifica estado compartido)
-        self._start_moh(bridge_id)
+        # MOH / WELCOMEPLAY destino: _start_redistribution_after_blind_to_campaign
         
         if old_agent_ch:
             # hangup_channel ya tiene retry logic, si retorna False significa que falló después de reintentos

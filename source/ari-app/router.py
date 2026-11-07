@@ -430,10 +430,10 @@ class AcDRouter:
 
     def _handle_playback_finished(self, event: PlaybackFinishedEvent) -> None:
         """
-        Delega PlaybackFinished a ManualCallHandler para loop de ringback click2call.
-        Otros tipos de llamada se ignoran.
+        Completa WELCOMEPLAY (inbound/dialer/redistrib) o ringback MANUAL click2call.
         """
         playback = event.playback or {}
+        playback_id = playback.get("id")
         target_uri = playback.get("target_uri") or ""
         channel_id = None
         if isinstance(target_uri, str) and target_uri.startswith("channel:"):
@@ -443,6 +443,41 @@ class AcDRouter:
 
         ctx = self.state_store.get_by_channel(channel_id)
         if not ctx:
+            return
+
+        from services.queue_welcome import (
+            RESUME_DIALER,
+            RESUME_INBOUND,
+            RESUME_REDISTRIBUTE,
+            is_our_welcome_playback,
+        )
+
+        if is_our_welcome_playback(ctx, playback_id):
+            call_id = ctx.call_id
+            action = getattr(ctx, "welcome_resume_action", None)
+            if action == RESUME_INBOUND:
+                inbound_handler = self.handlers.get(CallType.INBOUND.value)
+                if inbound_handler and hasattr(inbound_handler, "on_welcome_finished"):
+                    inbound_handler.on_welcome_finished(call_id)
+                return
+            if action == RESUME_DIALER:
+                progressive_handler = self.handlers.get(CallType.PROGRESSIVE.value)
+                if progressive_handler and hasattr(
+                    progressive_handler, "on_welcome_finished"
+                ):
+                    progressive_handler.on_welcome_finished(call_id)
+                return
+            if action == RESUME_REDISTRIBUTE:
+                if self.transfer_manager and hasattr(
+                    self.transfer_manager, "on_welcome_finished"
+                ):
+                    self.transfer_manager.on_welcome_finished(call_id)
+                return
+            self.logger.warning(
+                "PlaybackFinished welcome: action desconocida %r call_id=%s",
+                action,
+                call_id,
+            )
             return
 
         call_type = getattr(ctx.type, "value", ctx.type)

@@ -32,6 +32,7 @@ DEFAULT_CAMPAIGN_CFG = {
     "failover": False,
     "failover_dst_tipo": None,
     "failover_dst_id": None,
+    "welcome_sound": None,
 }
 
 
@@ -187,6 +188,12 @@ def fetch_campaign_cfg_from_redis(
                 failover_dst_tipo = None
                 failover_dst_id = None
 
+    welcome_raw = normalized.get("welcomeplay") or normalized.get("welcome_sound")
+    if welcome_raw is not None and isinstance(welcome_raw, bytes):
+        welcome_raw = welcome_raw.decode("utf-8")
+    welcome_sound = str(welcome_raw).strip() if welcome_raw is not None else ""
+    welcome_sound = welcome_sound or None
+
     return {
         "moh_sound": moh_sound,
         "max_wait_time": max_wait_time,
@@ -204,6 +211,7 @@ def fetch_campaign_cfg_from_redis(
         "failover": failover,
         "failover_dst_tipo": failover_dst_tipo,
         "failover_dst_id": failover_dst_id,
+        "welcome_sound": welcome_sound,
     }
 
 

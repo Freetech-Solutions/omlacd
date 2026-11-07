@@ -134,6 +134,11 @@ class CallContext(BaseModel):
 
     # Playback ARI de ringback local (click2call) mientras espera answer PSTN
     ringback_playback_id: Optional[str] = None
+    # Anuncio WELCOMEPLAY al entrar en cola (antes de MOH/distribución)
+    welcome_playback_id: Optional[str] = None
+    welcome_pending: bool = False
+    # "inbound" | "dialer" | "redistribute" — qué reanudar en PlaybackFinished
+    welcome_resume_action: Optional[str] = None
 
     # Campos para tracking de timestamps de respuesta (para determinar si fue contestada)
     bridge_created_ts: Optional[str] = None  # Timestamp ISO de creación del bridge

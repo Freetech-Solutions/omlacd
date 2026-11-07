@@ -17,6 +17,12 @@ from services.call_manager import CallActionService
 from services.campaign_config import fetch_campaign_cfg_from_redis
 from services.distribution_service import DistributionService
 from services.queue_strategy import QueueStrategyEngine
+from services.queue_welcome import (
+    RESUME_INBOUND,
+    clear_welcome_flags,
+    start_welcome_or_continue,
+    stop_welcome_if_playing,
+)
 from state import CallContext, CallRegistry
 from state_helpers import (
     active_agent_channel,
@@ -76,6 +82,9 @@ class InboundCallHandler(BaseHandler):
         # pstn_channel_id mantiene el identificador del canal PSTN asociado a la llamada
         # inbound actual manejada por esta instancia del handler.
         self.pstn_channel_id: Optional[str] = None
+        # Params diferidos tras WELCOMEPLAY (call_id -> dict)
+        self._welcome_deferred: Dict[str, Dict[str, Any]] = {}
+        self._welcome_deferred_lock = threading.Lock()
 
         # Canal(es) PSTN cuyo colgado fue iniciado por la app (timeout de cola). Usado para
         # distinguir EXIT_TIMEOUT vs EXIT_ABANDON al procesar StasisEnd.
@@ -412,6 +421,10 @@ class InboundCallHandler(BaseHandler):
         call_id = context.call_id
         if not call_id:
             return False
+
+        with self._welcome_deferred_lock:
+            self._welcome_deferred.pop(call_id, None)
+        stop_welcome_if_playing(self.ari_client, context)
 
         self._pstn_safety_net_cleanup(context, call_id)
 
@@ -850,21 +863,7 @@ class InboundCallHandler(BaseHandler):
                     bridge_id,
                 )
 
-            # Iniciar MOH
-            try:
-                if moh_sound:
-                    # Intentar usar clase de MOH específica
-                    self.ari_client.post(
-                        f"bridges/{bridge_id}/moh",
-                        params={"mohClass": moh_sound},
-                    )
-                else:
-                    # Fallback a MOH por defecto
-                    self.call_service.start_moh_on_bridge(bridge_id)
-            except Exception:
-                logger.exception("Error iniciando MOH en bridge %s", bridge_id)
-
-            # Crear y registrar contexto de llamada
+            # Crear y registrar contexto de llamada (antes del welcome: flags en ctx)
             ctx = self._create_and_register_context(
                 call_id=call_id,
                 channel_id=channel_id,
@@ -881,97 +880,175 @@ class InboundCallHandler(BaseHandler):
                 )
                 return
 
-            # Reportar entrada a cola
-            try:
-                if self.reporter:
-                    contacto_id = inbound_data.get("id_customer")
-                    if contacto_id and str(contacto_id) == "-1":
-                        contacto_id = None
-
-                    channel_leg_start_ts = datetime.now().isoformat()
-
-                    self.reporter.log_queue(
-                        call_id=call_id,
-                        numero=inbound_data.get("tel_dialed") or inbound_data.get("tel_customer") or "",
-                        campana_id=str(id_camp),
-                        contacto_id=contacto_id,
-                        agente_id=None,
-                        tipo_campana=0,
-                        tipo_llamada=CallType.INBOUND_ID,
-                        uniqueid=uniqueid,
-                        channel_leg_id=uniqueid,
-                        channel_leg_name=channel_name or channel_id,
-                        channel_leg_start_ts=channel_leg_start_ts,
-                        custom_data=None,
-                    )
-            except Exception:
-                logger.exception("Error reportando evento de cola para llamada inbound %s", call_id)
-
-            # Notificar a QueueEventManager
-            if self.queue_event_manager:
-                try:
-                    self.queue_event_manager.on_enter_queue(
-                        callid=call_id,
-                        uniqueid=uniqueid,
-                        campana_id=str(id_camp),
-                    )
-                except Exception:
-                    logger.exception(
-                        "Error notificando on_enter_queue a QueueEventManager para llamada %s",
-                        call_id,
-                    )
-
-            # Iniciar distribución (loop + timer de cola) vía DistributionService
-            if not self.distribution_service:
-                logger.error(
-                    "InboundCallHandler.on_start: distribution_service no inyectado, no se puede iniciar distribución para %s",
-                    call_id,
-                )
-                return
-            distribution_metadata = {
-                "id_customer": inbound_data.get("id_customer"),
-                "id_camp": inbound_data.get("id_camp"),
-                "tel_customer": inbound_data.get("tel_customer"),
-                "callid": inbound_data.get("callid") or call_id,
-                "call_type": inbound_data.get("call_type", CallType.INBOUND_ID),
+            deferred = {
+                "bridge_id": bridge_id,
+                "channel_id": channel_id,
+                "channel_name": channel_name,
+                "uniqueid": uniqueid,
+                "id_camp": id_camp,
+                "inbound_data": inbound_data,
+                "campaign_cfg": campaign_cfg,
+                "moh_sound": moh_sound,
+                "max_wait_time": max_wait_time,
+                "strategy": strategy,
+                "ring_timeout": ring_timeout,
             }
-            try:
-                # VOICEBOT=True basta para el VoicebotLoop. EXTERNAL_AG_HOST solo es
-                # fallback SIP (PJSIP/{sip}@{host}); AudioSocket usa AUDIOSOCKET_ADDR
-                # y SIP suele traer VOICEBOT_ADDR en OML:AGENT.
-                if campaign_cfg.get("voicebot"):
-                    self.distribution_service.start_voicebot_distribution(
-                        call_id=call_id,
-                        campaign_id=str(id_camp),
-                        bridge_id=bridge_id,
-                        strategy=campaign_cfg.get("voicebot_strategy", "random"),
-                        ring_timeout=ring_timeout,
-                        queue_timeout_sec=max_wait_time,
-                        pstn_channel_id=channel_id,
-                        uniqueid=uniqueid,
-                        distribution_metadata=distribution_metadata,
-                        external_host=campaign_cfg.get("external_ag_host") or "",
-                        max_qcalls=campaign_cfg.get("maxqcall", 10),
-                        on_queue_timeout_callback=lambda cid, ch: self._mark_pstn_hangup_by_app(ch),
-                    )
-                else:
-                    self.distribution_service.start_distribution(
-                        call_id=call_id,
-                        campaign_id=str(id_camp),
-                        bridge_id=bridge_id,
-                        strategy=strategy,
-                        ring_timeout=ring_timeout,
-                        queue_timeout_sec=max_wait_time,
-                        pstn_channel_id=channel_id,
-                        uniqueid=uniqueid,
-                        distribution_metadata=distribution_metadata,
-                        on_queue_timeout_callback=lambda cid, ch: self._mark_pstn_hangup_by_app(ch),
-                    )
-            except Exception:
-                logger.exception("Error iniciando distribución para llamada %s", call_id)
+            welcome_sound = campaign_cfg.get("welcome_sound")
+            if start_welcome_or_continue(
+                self.ari_client,
+                self.state_store,
+                call_id,
+                channel_id,
+                welcome_sound,
+                RESUME_INBOUND,
+            ):
+                with self._welcome_deferred_lock:
+                    self._welcome_deferred[call_id] = deferred
+                return
+
+            self._begin_inbound_queue_hold_and_distribute(call_id, deferred)
 
         except Exception as e:
             logger.error("InboundCallHandler.on_start: Error inesperado: %s", e, exc_info=True)
+
+    def _begin_inbound_queue_hold_and_distribute(
+        self, call_id: str, deferred: Dict[str, Any]
+    ) -> None:
+        """MOH + log_queue + on_enter_queue + distribución (tras welcome o sin audio)."""
+        bridge_id = deferred["bridge_id"]
+        channel_id = deferred["channel_id"]
+        channel_name = deferred.get("channel_name")
+        uniqueid = deferred["uniqueid"]
+        id_camp = deferred["id_camp"]
+        inbound_data = deferred["inbound_data"]
+        campaign_cfg = deferred["campaign_cfg"]
+        moh_sound = deferred.get("moh_sound")
+        max_wait_time = deferred["max_wait_time"]
+        strategy = deferred["strategy"]
+        ring_timeout = deferred["ring_timeout"]
+
+        with self.state_store.lock(call_id):
+            ctx = self.state_store.get(call_id)
+            if ctx:
+                clear_welcome_flags(ctx)
+                self.state_store.register_unsafe(call_id, ctx)
+
+        try:
+            if moh_sound:
+                self.ari_client.post(
+                    f"bridges/{bridge_id}/moh",
+                    params={"mohClass": moh_sound},
+                )
+            else:
+                self.call_service.start_moh_on_bridge(bridge_id)
+        except Exception:
+            logger.exception("Error iniciando MOH en bridge %s", bridge_id)
+
+        try:
+            if self.reporter:
+                contacto_id = inbound_data.get("id_customer")
+                if contacto_id and str(contacto_id) == "-1":
+                    contacto_id = None
+                self.reporter.log_queue(
+                    call_id=call_id,
+                    numero=inbound_data.get("tel_dialed")
+                    or inbound_data.get("tel_customer")
+                    or "",
+                    campana_id=str(id_camp),
+                    contacto_id=contacto_id,
+                    agente_id=None,
+                    tipo_campana=0,
+                    tipo_llamada=CallType.INBOUND_ID,
+                    uniqueid=uniqueid,
+                    channel_leg_id=uniqueid,
+                    channel_leg_name=channel_name or channel_id,
+                    channel_leg_start_ts=datetime.now().isoformat(),
+                    custom_data=None,
+                )
+        except Exception:
+            logger.exception(
+                "Error reportando evento de cola para llamada inbound %s", call_id
+            )
+
+        if self.queue_event_manager:
+            try:
+                self.queue_event_manager.on_enter_queue(
+                    callid=call_id,
+                    uniqueid=uniqueid,
+                    campana_id=str(id_camp),
+                )
+            except Exception:
+                logger.exception(
+                    "Error notificando on_enter_queue a QueueEventManager para llamada %s",
+                    call_id,
+                )
+
+        if not self.distribution_service:
+            logger.error(
+                "InboundCallHandler: distribution_service no inyectado, no se puede "
+                "iniciar distribución para %s",
+                call_id,
+            )
+            return
+        distribution_metadata = {
+            "id_customer": inbound_data.get("id_customer"),
+            "id_camp": inbound_data.get("id_camp"),
+            "tel_customer": inbound_data.get("tel_customer"),
+            "callid": inbound_data.get("callid") or call_id,
+            "call_type": inbound_data.get("call_type", CallType.INBOUND_ID),
+        }
+        try:
+            if campaign_cfg.get("voicebot"):
+                self.distribution_service.start_voicebot_distribution(
+                    call_id=call_id,
+                    campaign_id=str(id_camp),
+                    bridge_id=bridge_id,
+                    strategy=campaign_cfg.get("voicebot_strategy", "random"),
+                    ring_timeout=ring_timeout,
+                    queue_timeout_sec=max_wait_time,
+                    pstn_channel_id=channel_id,
+                    uniqueid=uniqueid,
+                    distribution_metadata=distribution_metadata,
+                    external_host=campaign_cfg.get("external_ag_host") or "",
+                    max_qcalls=campaign_cfg.get("maxqcall", 10),
+                    on_queue_timeout_callback=lambda cid, ch: self._mark_pstn_hangup_by_app(
+                        ch
+                    ),
+                )
+            else:
+                self.distribution_service.start_distribution(
+                    call_id=call_id,
+                    campaign_id=str(id_camp),
+                    bridge_id=bridge_id,
+                    strategy=strategy,
+                    ring_timeout=ring_timeout,
+                    queue_timeout_sec=max_wait_time,
+                    pstn_channel_id=channel_id,
+                    uniqueid=uniqueid,
+                    distribution_metadata=distribution_metadata,
+                    on_queue_timeout_callback=lambda cid, ch: self._mark_pstn_hangup_by_app(
+                        ch
+                    ),
+                )
+        except Exception:
+            logger.exception("Error iniciando distribución para llamada %s", call_id)
+
+    def on_welcome_finished(self, call_id: str) -> None:
+        """PlaybackFinished de WELCOMEPLAY: arranca MOH + cola + distribución."""
+        with self._welcome_deferred_lock:
+            deferred = self._welcome_deferred.pop(call_id, None)
+        if not deferred:
+            logger.warning(
+                "InboundCallHandler.on_welcome_finished: sin deferred call_id=%s",
+                call_id,
+            )
+            with self.state_store.lock(call_id):
+                ctx = self.state_store.get(call_id)
+                if ctx:
+                    clear_welcome_flags(ctx)
+                    self.state_store.register_unsafe(call_id, ctx)
+            return
+        self._begin_inbound_queue_hold_and_distribute(call_id, deferred)
 
     def on_up(self, event: BaseARIEvent) -> None:
         """
