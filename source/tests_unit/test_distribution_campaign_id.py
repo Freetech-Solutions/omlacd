@@ -59,7 +59,7 @@ def test_start_distribution_sets_distribution_campaign_id():
 
     with patch("services.distribution_service.settings") as st:
         st.ACD_QUEUE_WEIGHT_ENABLED = True
-        st.ACD_WAITING_ALIVE_TTL_SEC = 90
+        st.ACD_WAITING_ALIVE_TTL_SEC = 15
         with patch("threading.Thread"):
             with patch("threading.Timer") as timer_cls:
                 timer_cls.return_value = MagicMock()

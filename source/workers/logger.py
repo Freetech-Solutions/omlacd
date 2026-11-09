@@ -570,6 +570,7 @@ def insert_llamada_resumen(message):
         custom_data = message.get("custom_data")
         if not isinstance(custom_data, dict):
             custom_data = {}
+        # Overflow FAILOVER va en channel_data (JSONB); no implica is_transferred
 
         agent_segments = message.get("agent_segments")
         if agent_segments:
@@ -843,9 +844,21 @@ def update_redis_call_stats(message):
         # CORRECCIÓN 1: No registrar DIAL para llamadas inbound
         # DIAL solo debe registrarse para llamadas outbound (dialer, preview, manual)
         # Para inbound, solo se registran eventos de finalización (EXIT_TIMEOUT, EXIT_ABANDON, etc.)
+        custom_data_stats = message.get("custom_data")
+        if not isinstance(custom_data_stats, dict):
+            custom_data_stats = {}
+        overflow_pending = bool(custom_data_stats.get("overflow_pending"))
+        is_overflow_reentry = bool(
+            custom_data_stats.get("is_overflow")
+            or custom_data_stats.get("entry_reason") == "overflow"
+        )
+
         if event_name == 'DIAL':
             if is_inbound:
                 # Para inbound, no registrar DIAL (solo se registra cuando realmente se atiende o finaliza)
+                return True
+            # Re-entrada por FAILOVER/overflow: no nueva oferta DIAL_OUT
+            if is_overflow_reentry:
                 return True
         
         # EXIT_SHORTCALL: categoría propia; solo CALL_TYPE:x:EXIT_SHORTCALL (nunca EXIT_ANSWERED_HUMAN/BOT)
@@ -1040,8 +1053,26 @@ def update_redis_call_stats(message):
                 call_type=str(t_llamada),
                 message=message,
             )
+        # Supervisión Inbound: flow-out FAILOVER (no es expired)
+        if (
+            event_name == HangupCause.EXIT_OVERFLOW.value
+            and t_campana == CallType.INBOUND_ID
+            and campana_id is not None
+        ):
+            _publish_camp_event(
+                redis_client,
+                campana_id,
+                HangupCause.EXIT_OVERFLOW.value,
+                call_type=str(t_llamada),
+                message=message,
+            )
         # Supervisión salientes: no contactación / no diálogo (manual, preview, dialer)
-        if is_outbound and event_name in CAMP_DIALER_NO_CONTACT_EVENTS:
+        # overflow_pending = EXIT_OVERFLOW hop A→B: PSTN sigue vivo, no acusar fin dialer
+        if (
+            is_outbound
+            and event_name in CAMP_DIALER_NO_CONTACT_EVENTS
+            and not overflow_pending
+        ):
             _publish_camp_event(
                 redis_client, campana_id, event_name, message=message)
         

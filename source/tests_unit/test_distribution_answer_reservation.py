@@ -631,6 +631,39 @@ class TestChannelUpRecover:
             assert svc._recover_answer_if_channel_up("call-1", "agent-ch-1") is False
             answer_mock.assert_not_called()
 
+    def test_recover_false_when_call_ended(self):
+        """Abandono PSTN mid-originate: no recuperar answer sobre llamada muerta."""
+        ctx = _ctx(agent_attempt_channel="agent-ch-1", call_ended=True)
+        state_store = MagicMock()
+        self._lock_store(state_store, ctx)
+        ari = MagicMock()
+        ari.get_channel_details.return_value = {"state": "Up"}
+        svc = self._make_service(state_store, ari)
+
+        with patch.object(svc, "handle_agent_answer") as answer_mock:
+            assert svc._recover_answer_if_channel_up("call-1", "agent-ch-1") is False
+            answer_mock.assert_not_called()
+
+    def test_recover_or_drop_hangs_up_and_releases_reservation(self):
+        ctx = _ctx(agent_attempt_channel="orphan-ch", agent_id=55, call_ended=True)
+        state_store = MagicMock()
+        self._lock_store(state_store, ctx)
+        ari = MagicMock()
+        ari.get_channel_details.return_value = {"state": "Up"}
+        svc = self._make_service(state_store, ari)
+        svc._active_attempts["call-1"] = "orphan-ch"
+        svc._active_attempt_agents["call-1"] = 55
+
+        with patch.object(svc, "_release_agent_reservation") as release_mock:
+            ok = svc.recover_or_drop_late_agent_leg("call-1", "orphan-ch")
+
+        assert ok is False
+        ari.hangup_channel.assert_called_once_with("orphan-ch")
+        release_mock.assert_called_once()
+        assert release_mock.call_args[0][0] == 55
+        assert release_mock.call_args.kwargs.get("failure_cooldown") is True
+        assert "call-1" not in svc._active_attempts
+
     def test_queue_timeout_skips_when_attempt_channel_up(self):
         ctx = _ctx(agent_attempt_channel="attempt-1")
         state_store = MagicMock()
@@ -657,6 +690,78 @@ class TestChannelUpRecover:
         state_store.mark_call_ended_atomic.assert_not_called()
         ari.hangup_channel.assert_not_called()
         assert ctx.distribution_answer_accepted is True
+
+    def test_queue_timeout_recovers_when_slot_empty_but_attempt_channel_up(self):
+        """Carrera clásica: bucle vació _active_attempts; agente ya Up en contexto."""
+        ctx = _ctx(agent_attempt_channel="attempt-up")
+        state_store = MagicMock()
+        self._lock_store(state_store, ctx)
+        ari = MagicMock()
+        ari.get_channel_details.return_value = {"state": "Up"}
+        svc = self._make_service(state_store, ari)
+        # Slot vacío (como tras _clear_attempt_if_loop sin hangup)
+        assert "call-1" not in svc._active_attempts
+
+        cb = MagicMock()
+        with svc._on_queue_timeout_callbacks_lock:
+            svc._on_queue_timeout_callbacks["call-1"] = cb
+
+        with patch.object(
+            svc, "_recover_answer_if_channel_up", return_value=True
+        ) as recover:
+            svc._on_queue_timeout(
+                call_id="call-1",
+                pstn_channel_id="pstn-1",
+                bridge_id="bridge-1",
+                id_camp="10",
+                uniqueid="uid-1",
+            )
+
+        recover.assert_called_once_with("call-1", "attempt-up")
+        cb.assert_not_called()
+        state_store.mark_call_ended_atomic.assert_not_called()
+        ari.hangup_channel.assert_not_called()
+
+    def test_queue_timeout_claims_before_signaling_loop_stop(self):
+        """Con canal Ringing: claim toma el slot antes de stop_event (timeout gana)."""
+        ctx = _ctx(agent_attempt_channel="attempt-1")
+        state_store = MagicMock()
+        self._lock_store(state_store, ctx)
+        state_store.mark_call_ended_atomic.return_value = True
+        ari = MagicMock()
+        ari.get_channel_details.return_value = {"state": "Ringing"}
+        svc = self._make_service(state_store, ari)
+        svc._active_attempts["call-1"] = "attempt-1"
+        svc._active_attempt_agents["call-1"] = 7
+        svc._active_attempt_loop_gens["call-1"] = 1
+
+        order = []
+        real_claim = svc._claim_attempt_for_timeout
+
+        def _claim(cid):
+            order.append("claim")
+            return real_claim(cid)
+
+        def _signal(cid):
+            order.append("signal")
+            # Tras claim el slot debe estar vacío
+            assert "call-1" not in svc._active_attempts
+
+        with patch.object(svc, "_claim_attempt_for_timeout", side_effect=_claim):
+            with patch.object(
+                svc, "_signal_distribution_loop_stop", side_effect=_signal
+            ):
+                with patch.object(svc, "_release_agent_reservation"):
+                    with patch.object(svc, "_dequeue_waiting"):
+                        svc._on_queue_timeout(
+                            call_id="call-1",
+                            pstn_channel_id="pstn-1",
+                            bridge_id="bridge-1",
+                            id_camp="10",
+                            uniqueid="uid-1",
+                        )
+
+        assert order == ["claim", "signal"]
 
     def test_is_answer_already_accepted_for_channel(self):
         ctx = _ctx(
@@ -692,7 +797,7 @@ class TestLateStasisStartAfterRecover:
 
         dist = MagicMock()
         dist.handle_agent_answer.return_value = False
-        dist.is_answer_already_accepted_for_channel.return_value = True
+        dist.recover_or_drop_late_agent_leg.return_value = True
         agent_status = MagicMock()
         agent_status.try_confirm_distribution_oncall.return_value = True
 

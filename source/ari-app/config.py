@@ -92,6 +92,11 @@ class Settings(BaseSettings):
         ge=1,
         description="Umbral en segundos: con agente, talk menor al umbral se reporta como EXIT_SHORTCALL",
     )
+    MAX_OVERFLOW_HOPS: int = Field(
+        default=5,
+        ge=1,
+        description="Tope de desbordes encadenados por timeout de cola (FAILOVER)",
+    )
     TRANSFER_TIMEOUT: int = Field(default=30, ge=1, description="Timeout para transferencias ciegas")
     CONSULT_TIMEOUT: int = Field(default=45, ge=1, description="Timeout para transferencias consultivas")
 
@@ -228,12 +233,13 @@ class Settings(BaseSettings):
         ),
     )
     ACD_WAITING_ALIVE_TTL_SEC: int = Field(
-        default=90,
+        default=15,
         ge=15,
         le=600,
         description=(
             "TTL del heartbeat acd:queue:waiting:alive:{call_id}. El loop lo refresca; "
-            "tras crash de acd-app, heads huérfanos dejan de bloquear en ≤ este TTL."
+            "tras crash de acd-app, heads huérfanos dejan de bloquear en ≤ este TTL "
+            "(default 15s; el bucle también dequea al detectar PSTN muerto)."
         ),
     )
     ACD_CALL_PRIORITY_TAU_SEC: float = Field(

@@ -196,11 +196,15 @@ return 1
 # Estado UI del softphone (Django api_make_ringing); no está en AgentStatus del ACD.
 _AGENT_STATUS_RINGING = "RINGING"
 
-# ONCALL→POSTCALL atómico + limpieza de campos de llamada.
-# ARGV[1]=ONCALL ARGV[2]=POSTCALL ARGV[3]=timestamp ARGV[4]=expected_call_id ("" = no filtrar)
-# Retorna 1 si hubo cambio (STATUS o limpieza de campos), 0 si no tocó nada.
+# ONCALL→POSTCALL atómico + limpieza + wrapup cooldown (misma eval).
+# KEYS[1]=agent KEYS[2]=cooldown (puede ser "" si ttl=0)
+# ARGV[1]=ONCALL ARGV[2]=POSTCALL ARGV[3]=timestamp ARGV[4]=expected_call_id
+# ARGV[5]=ttl_sec (0 = no SET cooldown) ARGV[6]=cooldown_value ("wrapup")
+# Retorna 1 si hubo cambio (STATUS o limpieza), 0 si no tocó campos.
 # No pisa STATUS si ya no es ONCALL (p. ej. consola ya puso PAUSE-ACW/READY).
 # No toca voicebots (VOICEBOT=1). Preserva CAMPAIGN para métricas ACW de Django.
+# Cooldown: se setea en la misma eval si ttl>0 y no hay otra CALLID activa
+# (cierra la ventana READY→reserve entre HSET y SET cooldown).
 _SET_POSTCALL_AND_CLEAR_FIELDS_SCRIPT = """
 local voicebot = redis.call('HGET', KEYS[1], 'VOICEBOT')
 if voicebot == '1' then
@@ -232,6 +236,11 @@ if should_clear then
         'AGENT_CHANNEL_ID', 'PSTN_CHANNEL_ID'
     )
     changed = 1
+end
+-- Wrapup cooldown atómico con la transición (también si STATUS ya era ACW/READY).
+local ttl = tonumber(ARGV[5])
+if ttl and ttl > 0 and KEYS[2] ~= nil and KEYS[2] ~= '' then
+    redis.call('SET', KEYS[2], ARGV[6], 'EX', ttl)
 end
 return changed
 """
@@ -1052,28 +1061,26 @@ class AgentStatusService:
                 e,
             )
     
-    def apply_wrapup_cooldown(
+    def resolve_wrapup_cooldown_ttl(
         self,
         agent_id: Any,
         campaign_id: Optional[Any] = None,
-    ) -> bool:
+    ) -> int:
         """
-        Bloquea nuevas ofertas (acd:cooldown:agent) tras colgado humano.
+        TTL de cooldown wrapup en segundos (0 = no aplicar).
 
-        TTL = max(WRAPUPTIME, AUTO_UNPAUSE) + AGENT_WRAPUP_POST_READY_GRACE_SEC
-        desde OML:CAMP. No aplica a voicebots. Se setea aunque STATUS ya sea
-        PAUSE-ACW/READY (consola más rápida que POSTCALL).
+        TTL = max(WRAPUPTIME, AUTO_UNPAUSE) + AGENT_WRAPUP_POST_READY_GRACE_SEC.
+        Voicebots → 0. Sin redis/agente → 0.
         """
         if not agent_id or not self.redis_client:
-            return False
-
+            return 0
         try:
             agent_key = self._get_agent_key(agent_id)
             voicebot = self.redis_client.hget(agent_key, "VOICEBOT")
             if voicebot is not None and isinstance(voicebot, bytes):
                 voicebot = voicebot.decode("utf-8")
             if str(voicebot or "") == "1":
-                return False
+                return 0
 
             camp_id = campaign_id
             if camp_id is None or str(camp_id).strip() == "":
@@ -1096,21 +1103,42 @@ class AgentStatusService:
             grace = int(
                 getattr(settings, "AGENT_WRAPUP_POST_READY_GRACE_SEC", 5) or 0
             )
-            ttl = max(wrapuptime, auto_unpause, 0) + max(grace, 0)
+            return max(wrapuptime, auto_unpause, 0) + max(grace, 0)
+        except Exception as e:
+            self.logger.warning(
+                "resolve_wrapup_cooldown_ttl: error agente %s: %s",
+                agent_id,
+                e,
+                exc_info=True,
+            )
+            return 0
+
+    def apply_wrapup_cooldown(
+        self,
+        agent_id: Any,
+        campaign_id: Optional[Any] = None,
+    ) -> bool:
+        """
+        Bloquea nuevas ofertas (acd:cooldown:agent) tras colgado humano.
+
+        Preferir set_postcall_and_clear_fields (cooldown en la misma eval).
+        Este método queda para reintentos / paths que solo necesitan cooldown.
+        """
+        if not agent_id or not self.redis_client:
+            return False
+
+        try:
+            ttl = self.resolve_wrapup_cooldown_ttl(agent_id, campaign_id=campaign_id)
             if ttl <= 0:
                 return False
 
             cooldown_key = RedisKeys.agent_offer_cooldown(str(agent_id))
             self.redis_client.set(cooldown_key, "wrapup", ex=ttl)
             self.logger.info(
-                "apply_wrapup_cooldown: agente %s campaign=%s ttl=%ss "
-                "(wrapup=%s auto_unpause=%s grace=%s)",
+                "apply_wrapup_cooldown: agente %s campaign=%s ttl=%ss",
                 agent_id,
-                camp_id,
+                campaign_id,
                 ttl,
-                wrapuptime,
-                auto_unpause,
-                grace,
             )
             return True
         except Exception as e:
@@ -1129,13 +1157,13 @@ class AgentStatusService:
         campaign_id: Optional[Any] = None,
     ) -> bool:
         """
-        Transición atómica ONCALL→POSTCALL y limpieza de campos de llamada.
+        Transición atómica ONCALL→POSTCALL, limpieza de campos y wrapup cooldown.
 
         Solo cambia STATUS a POSTCALL si el valor actual es ONCALL.
         Si el agente ya está en PAUSE-ACW/READY (consola más rápida), no pisa
         STATUS pero limpia CALLID/NODE_ID/BRIDGE_ID cuando coinciden con call_id.
         No toca voicebots (VOICEBOT=1). Preserva CAMPAIGN para métricas ACW.
-        Tras el intento aplica wrapup cooldown (bloquea oferta aunque READY).
+        El cooldown wrapup se setea en la misma eval Redis (sin ventana vs READY).
 
         Args:
             agent_id: ID del agente
@@ -1163,28 +1191,32 @@ class AgentStatusService:
             agent_key = self._get_agent_key(agent_id)
             current_timestamp = str(int(datetime.now().timestamp()))
             expected_call_id = str(call_id).strip() if call_id else ""
+            ttl = self.resolve_wrapup_cooldown_ttl(
+                agent_id, campaign_id=campaign_id
+            )
+            cooldown_key = (
+                RedisKeys.agent_offer_cooldown(str(agent_id)) if ttl > 0 else ""
+            )
             result = self.redis_client.eval(
                 _SET_POSTCALL_AND_CLEAR_FIELDS_SCRIPT,
-                1,
+                2,
                 agent_key,
+                cooldown_key,
                 AgentStatus.ONCALL.value,
                 AgentStatus.POSTCALL.value,
                 current_timestamp,
                 expected_call_id,
+                str(int(ttl)),
+                "wrapup",
             )
-            # Wrapup tras colgado humano (también si consola ya puso ACW/READY).
-            # No aplicar si el hash ya apunta a otra CALLID (llamada nueva).
-            callid_now = self.redis_client.hget(agent_key, "CALLID")
-            if callid_now is not None and isinstance(callid_now, bytes):
-                callid_now = callid_now.decode("utf-8")
-            callid_now = (callid_now or "").strip()
-            other_active_call = bool(
-                expected_call_id
-                and callid_now
-                and callid_now != expected_call_id
-            )
-            if not other_active_call:
-                self.apply_wrapup_cooldown(agent_id, campaign_id=campaign_id)
+            if ttl > 0:
+                self.logger.info(
+                    "set_postcall_and_clear_fields: wrapup cooldown agente %s "
+                    "ttl=%ss campaign=%s (atómico con postcall)",
+                    agent_id,
+                    ttl,
+                    campaign_id,
+                )
             if result:
                 self.logger.info(
                     "set_postcall_and_clear_fields: agente %s → POSTCALL "

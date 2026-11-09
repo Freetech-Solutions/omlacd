@@ -30,6 +30,7 @@ from state_helpers import (
     active_agent_channel,
     call_has_prior_agent_handling,
     effective_queue_campaign_id,
+    overflow_custom_data_from_context,
     queue_timeout_should_suppress_cleanup,
 )
 from utils import compute_bot_agent_durations
@@ -69,6 +70,8 @@ class DistributionService:
         self.queue_event_manager = queue_event_manager
         self.route_validator = route_validator
         self.agent_status_service = agent_status_service
+        # Inyectado desde TransferManager (evita ciclo DI): (call_id, target_camp_id) -> bool
+        self._overflow_to_campaign: Optional[Callable[[str, str], bool]] = None
 
         self._call_events: Dict[str, Tuple[threading.Event, threading.Event]] = {}
         self._call_events_lock = threading.Lock()
@@ -97,19 +100,53 @@ class DistributionService:
         self._waiting_inventory = WaitingInventory(redis_client) if redis_client else None
         self._offer_coordinator = OfferCoordinator(redis_client) if redis_client else None
 
+    def set_overflow_to_campaign(
+        self, fn: Optional[Callable[[str, str], bool]]
+    ) -> None:
+        self._overflow_to_campaign = fn
+
     def _queue_weight_enabled(self) -> bool:
         return bool(getattr(settings, "ACD_QUEUE_WEIGHT_ENABLED", True))
 
     def _waiting_alive_ttl_sec(self) -> int:
         try:
-            return int(getattr(settings, "ACD_WAITING_ALIVE_TTL_SEC", 90) or 90)
+            return int(getattr(settings, "ACD_WAITING_ALIVE_TTL_SEC", 15) or 15)
         except (TypeError, ValueError):
-            return 90
+            return 15
 
     def _touch_waiting_alive(self, call_id: str) -> None:
         if not self._waiting_inventory:
             return
         self._waiting_inventory.touch_alive(call_id, self._waiting_alive_ttl_sec())
+
+    def _abandon_waiting_queue(
+        self,
+        call_id: str,
+        campaign_id: Optional[Any],
+        *,
+        reason: str,
+    ) -> None:
+        """
+        Saca la llamada del ZSET waiting + limpia heartbeat.
+        Usar al detectar PSTN muerto / call_ended / ctx gone para no dejar HOL zombie
+        hasta que expire ACD_WAITING_ALIVE_TTL_SEC.
+        """
+        camp = str(campaign_id).strip() if campaign_id is not None else ""
+        if not camp:
+            try:
+                ctx = self.state_store.get(call_id)
+                if ctx is not None:
+                    q = effective_queue_campaign_id(ctx)
+                    camp = str(q) if q is not None else ""
+            except Exception:
+                camp = ""
+        self._dequeue_waiting(camp or None, call_id)
+        logger.info(
+            "DistributionService._abandon_waiting_queue: call_id=%s campaign=%s reason=%s",
+            call_id,
+            camp or "(none)",
+            reason,
+        )
 
     def _enqueue_waiting(self, campaign_id: str, call_id: str) -> None:
         if not self._queue_weight_enabled() or not self._waiting_inventory:
@@ -607,8 +644,29 @@ class DistributionService:
         Si el canal de agente ya está Up (StasisStart atrasado en el event worker),
         acepta la contestación sin colgar: handle_agent_answer + stop_distribution.
         Retorna True si se recuperó la respuesta.
+
+        No recupera si la llamada ya terminó (p.ej. abandono PSTN mid-originate):
+        en ese caso el caller debe colgar la pierna huérfana.
         """
         if not agent_channel_id or not self._is_channel_up(agent_channel_id):
+            return False
+        try:
+            with self.state_store.lock(call_id):
+                ctx = self.state_store.get(call_id)
+                if not ctx or getattr(ctx, "call_ended", False):
+                    logger.info(
+                        "DistributionService._recover_answer_if_channel_up: omitiendo "
+                        "recover call_id=%s channel=%s (ended/sin ctx)",
+                        call_id,
+                        agent_channel_id,
+                    )
+                    return False
+        except Exception:
+            logger.exception(
+                "DistributionService._recover_answer_if_channel_up: error leyendo ctx "
+                "call_id=%s",
+                call_id,
+            )
             return False
         logger.warning(
             "DistributionService: ring/queue wait venció pero canal %s está Up "
@@ -1082,8 +1140,14 @@ class DistributionService:
                     try:
                         context = self.state_store.get(call_id)
                         if not context:
+                            self._abandon_waiting_queue(
+                                call_id, id_camp, reason="voicebot_no_context"
+                            )
                             return
                         if getattr(context, "call_ended", False):
+                            self._abandon_waiting_queue(
+                                call_id, id_camp, reason="voicebot_call_ended"
+                            )
                             return
                         if active_agent_channel(context):
                             return
@@ -1151,6 +1215,9 @@ class DistributionService:
                                     "(call_id=%s, caller_channel_id=%s)",
                                     call_id,
                                     caller_channel_id,
+                                )
+                                self._abandon_waiting_queue(
+                                    call_id, id_camp, reason="voicebot_pstn_dead"
                                 )
                                 return
                             attempt_finished.clear()
@@ -1519,6 +1586,61 @@ class DistributionService:
                     e,
                 )
 
+    def recover_or_drop_late_agent_leg(self, call_id: str, channel_id: str) -> bool:
+        """
+        StasisStart tardío cuando handle_agent_answer ya no puede tomar el slot.
+
+        Returns:
+            True si la contestación queda aceptada (consolidar bridge).
+            False si el canal se colgó o no aplica (handler debe salir).
+        """
+        if self.is_answer_already_accepted_for_channel(call_id, channel_id):
+            return True
+        if self._recover_answer_if_channel_up(call_id, channel_id):
+            return True
+        if self.is_answer_already_accepted_for_channel(call_id, channel_id):
+            return True
+        # Huérfano: abandono PSTN / timeout; colgar pierna y liberar reserva (evitar DIALING).
+        drop_agent_id: Optional[int] = None
+        with self._dialing_lock:
+            if self._active_attempts.get(call_id) == channel_id:
+                self._active_attempts.pop(call_id, None)
+                drop_agent_id = self._active_attempt_agents.pop(call_id, None)
+                self._active_attempt_loop_gens.pop(call_id, None)
+        if drop_agent_id is None:
+            try:
+                with self.state_store.lock(call_id):
+                    ctx = self.state_store.get(call_id)
+                    if ctx and getattr(ctx, "agent_id", None) is not None:
+                        drop_agent_id = int(ctx.agent_id)
+            except Exception:
+                logger.exception(
+                    "recover_or_drop_late_agent_leg: error leyendo agent_id call_id=%s",
+                    call_id,
+                )
+        try:
+            self.ari_client.hangup_channel(channel_id)
+            logger.warning(
+                "recover_or_drop_late_agent_leg: colgando pierna huérfana %s call_id=%s",
+                channel_id,
+                call_id,
+            )
+        except Exception:
+            logger.exception(
+                "recover_or_drop_late_agent_leg: error hangup %s call_id=%s",
+                channel_id,
+                call_id,
+            )
+        if drop_agent_id is not None:
+            self._release_agent_reservation(
+                int(drop_agent_id),
+                call_id,
+                RedisKeys.agent_lock(str(drop_agent_id)),
+                failure_cooldown=True,
+                use_status_reservation=True,
+            )
+        return False
+
     def handle_agent_answer(self, call_id: str, channel_id: str) -> bool:
         """
         Señaliza que el agente contestó para este intento. Retorna True si channel_id
@@ -1697,6 +1819,9 @@ class DistributionService:
                 call_id,
                 pstn,
             )
+            self._abandon_waiting_queue(
+                call_id, campaign_id, reason="redistribute_pstn_dead"
+            )
             return False
 
         # El timer residual lo cancela start_distribution vía _replace_queue_timer.
@@ -1873,11 +1998,17 @@ class DistributionService:
                                 "DistributionLoop: contexto inexistente para call_id=%s, saliendo del loop",
                                 call_id,
                             )
+                            self._abandon_waiting_queue(
+                                call_id, id_camp, reason="no_context"
+                            )
                             return
                         if getattr(context, "call_ended", False):
                             logger.info(
                                 "DistributionLoop: llamada %s ya marcada como finalizada, saliendo del loop",
                                 call_id,
+                            )
+                            self._abandon_waiting_queue(
+                                call_id, id_camp, reason="call_ended"
                             )
                             return
                         if active_agent_channel(context):
@@ -1974,6 +2105,9 @@ class DistributionService:
                                     "(call_id=%s, caller_channel_id=%s)",
                                     call_id,
                                     caller_channel_id,
+                                )
+                                self._abandon_waiting_queue(
+                                    call_id, id_camp, reason="pstn_dead"
                                 )
                                 return
 
@@ -2094,17 +2228,43 @@ class DistributionService:
                             if stop_event.is_set() or not self._is_current_loop(
                                 call_id, loop_gen
                             ):
-                                # Si handle_agent_answer ya consumió el slot, la reserva
-                                # queda hasta try_confirm_distribution_oncall (no liberar aquí).
+                                # Canal ya Up y llamada viva: recuperar answer (lag eventos).
+                                if self._recover_answer_if_channel_up(
+                                    call_id, agent_channel_id
+                                ):
+                                    return
+                                # Answer ya aceptada por handle_agent_answer: no colgar.
+                                if self.is_answer_already_accepted_for_channel(
+                                    call_id, agent_channel_id
+                                ):
+                                    return
+                                # Abandono PSTN / stop sin answer: colgar pierna + liberar.
+                                try:
+                                    self.ari_client.hangup_channel(agent_channel_id)
+                                except Exception:
+                                    logger.debug(
+                                        "DistributionLoop: error colgando agente %s "
+                                        "tras stop_event call_id=%s",
+                                        agent_channel_id,
+                                        call_id,
+                                        exc_info=True,
+                                    )
                                 owned = self._clear_attempt_if_loop(call_id, loop_gen)
                                 if owned:
-                                    self._release_agent_reservation(
-                                        candidate.agent_id,
-                                        call_id,
-                                        lock_key,
-                                        failure_cooldown=True,
-                                        use_status_reservation=True,
-                                    )
+                                    with self.state_store.lock(call_id):
+                                        ctx = self.state_store.get(call_id)
+                                        if ctx and getattr(
+                                            ctx, "agent_attempt_channel", None
+                                        ) == agent_channel_id:
+                                            ctx.agent_attempt_channel = None
+                                            self.state_store.register_unsafe(call_id, ctx)
+                                self._release_agent_reservation(
+                                    candidate.agent_id,
+                                    call_id,
+                                    lock_key,
+                                    failure_cooldown=True,
+                                    use_status_reservation=True,
+                                )
                                 return
 
                             if not answered_or_failed:
@@ -2227,6 +2387,186 @@ class DistributionService:
                     loop_gen,
                 )
 
+    def _attempt_queue_overflow(
+        self,
+        call_id: str,
+        id_camp: str,
+        uniqueid: Optional[str],
+        pstn_channel_id: Optional[str],
+        bridge_id: Optional[str],
+        context_for_report: Optional[CallContext],
+    ) -> bool:
+        """
+        Si FAILOVER apunta a otra campaña y hay handler, reporta EXIT_OVERFLOW
+        (flow-out en A) y desborda sin hangup PSTN. True = overflow OK (caller return).
+        """
+        overflow_fn = self._overflow_to_campaign
+        if overflow_fn is None:
+            return False
+
+        try:
+            cfg = get_campaign_config_with_defaults(self.redis_client, str(id_camp))
+        except Exception:
+            logger.exception(
+                "_attempt_queue_overflow: error leyendo config campaña %s call_id=%s",
+                id_camp,
+                call_id,
+            )
+            return False
+
+        if not cfg or not cfg.get("failover"):
+            return False
+
+        dst_tipo = cfg.get("failover_dst_tipo")
+        dst_id = cfg.get("failover_dst_id")
+        if dst_tipo != 1 or not dst_id:
+            logger.info(
+                "_attempt_queue_overflow: FAILOVER no es campaña (tipo=%s dst=%s) "
+                "call_id=%s → hangup",
+                dst_tipo,
+                dst_id,
+                call_id,
+            )
+            return False
+
+        target_camp_id = str(dst_id)
+        if target_camp_id == str(id_camp):
+            logger.info(
+                "_attempt_queue_overflow: destino igual a origen camp=%s call_id=%s → hangup",
+                id_camp,
+                call_id,
+            )
+            return False
+
+        ctx = context_for_report or self.state_store.get(call_id)
+        if not ctx or getattr(ctx, "call_ended", False):
+            return False
+
+        max_hops = int(getattr(settings, "MAX_OVERFLOW_HOPS", 5) or 5)
+        if int(getattr(ctx, "overflow_count", 0) or 0) >= max_hops:
+            logger.info(
+                "_attempt_queue_overflow: hops agotados (%s/%s) call_id=%s → hangup",
+                getattr(ctx, "overflow_count", 0),
+                max_hops,
+                call_id,
+            )
+            return False
+
+        if self.queue_event_manager:
+            try:
+                self.queue_event_manager.on_timeout(
+                    callid=call_id,
+                    uniqueid=uniqueid or call_id,
+                    campana_id=str(id_camp),
+                )
+            except Exception:
+                logger.exception(
+                    "_attempt_queue_overflow: error on_timeout call_id=%s", call_id
+                )
+
+        if self.reporter and uniqueid:
+            try:
+                camp_id_int = int(id_camp) if str(id_camp).isdigit() else 0
+                target_int = (
+                    int(target_camp_id) if str(target_camp_id).isdigit() else target_camp_id
+                )
+                custom_data = {
+                    "is_overflow": True,
+                    "overflow_pending": True,
+                    "overflow_to_campaign_id": target_int,
+                    "overflow_count": int(getattr(ctx, "overflow_count", 0) or 0),
+                    "overflow_origin_campaign_id": getattr(
+                        ctx, "overflow_origin_campaign_id", None
+                    )
+                    or camp_id_int,
+                    "overflow_path": list(getattr(ctx, "overflow_path", None) or []),
+                }
+                end_iso = datetime.now().isoformat()
+                bridge_wait_time = 0.0
+                duracion_llamada = 0.0
+                if getattr(ctx, "bridge_created_ts", None):
+                    try:
+                        start_dt = datetime.fromisoformat(ctx.bridge_created_ts)
+                        end_dt = datetime.fromisoformat(end_iso)
+                        duracion_llamada = max(0.0, (end_dt - start_dt).total_seconds())
+                        bridge_wait_time = duracion_llamada
+                    except Exception:
+                        pass
+                call_data = {
+                    "callid": call_id,
+                    "id_camp": camp_id_int or getattr(ctx, "id_camp", None),
+                    "id_customer": getattr(ctx, "id_customer", None),
+                    "phone_number": getattr(ctx, "phone_number", None),
+                    "tel_dialed": getattr(ctx, "tel_dialed", None),
+                    "call_type": getattr(ctx, "call_type", None) or 0,
+                    "is_voicebot": bool(getattr(ctx, "is_voicebot", False)),
+                    "is_voicebot_transfer": bool(
+                        getattr(ctx, "is_voicebot_transfer", False)
+                    ),
+                    "transfer_count": int(getattr(ctx, "transfer_count", 0) or 0),
+                    "agent_segments": list(getattr(ctx, "agent_segments", None) or []),
+                    "ts_start_iso": getattr(ctx, "bridge_created_ts", None),
+                    "ts_answer_iso": getattr(ctx, "pstn_answered_ts", None)
+                    or getattr(ctx, "agent_answered_ts", None),
+                }
+                self.reporter.log_segment_end(
+                    call_data=call_data,
+                    event_final=HangupCause.EXIT_OVERFLOW.value,
+                    is_transfer=False,
+                    quien_corto=0,
+                    uniqueid=uniqueid,
+                    callid=call_id,
+                    end_iso=end_iso,
+                    bridge_wait_time=bridge_wait_time,
+                    duracion_llamada=duracion_llamada,
+                    channel_leg="PSTN",
+                    channel_leg_id=getattr(ctx, "uniqueid_pstn", None) or pstn_channel_id,
+                    channel_leg_name=getattr(ctx, "pstn_channel", None) or pstn_channel_id,
+                    channel_leg_start_ts=getattr(ctx, "bridge_created_ts", None),
+                    channel_leg_answer_ts=getattr(ctx, "pstn_answered_ts", None),
+                    channel_leg_end_ts=end_iso,
+                    custom_data=custom_data,
+                )
+            except Exception:
+                logger.exception(
+                    "_attempt_queue_overflow: error reportando EXIT_OVERFLOW call_id=%s",
+                    call_id,
+                )
+
+        try:
+            ok = bool(overflow_fn(call_id, target_camp_id))
+        except Exception:
+            logger.exception(
+                "_attempt_queue_overflow: overflow_to_campaign falló call_id=%s A=%s B=%s",
+                call_id,
+                id_camp,
+                target_camp_id,
+            )
+            return False
+
+        if ok:
+            logger.info(
+                "_attempt_queue_overflow: desborde OK call_id=%s %s→%s",
+                call_id,
+                id_camp,
+                target_camp_id,
+            )
+            return True
+
+        logger.warning(
+            "_attempt_queue_overflow: overflow rechazado call_id=%s %s→%s → hangup",
+            call_id,
+            id_camp,
+            target_camp_id,
+        )
+        return False
+
+    def _signal_distribution_loop_stop(self, call_id: str) -> None:
+        """Despierta al bucle de distribución (stop + attempt_finished)."""
+        stop_event, attempt_finished = self._get_or_create_call_events(call_id)
+        stop_event.set()
+        attempt_finished.set()
+
     def _on_queue_timeout(
         self,
         call_id: str,
@@ -2236,11 +2576,15 @@ class DistributionService:
         uniqueid: str,
     ) -> None:
         """
-        Maneja timeout de cola en dos fases: claim del intento y luego commit
-        destructivo (dequeue, callback, mark, report, hangups).
+        Maneja timeout de cola: claim del intento; si FAILOVER aplica, desborda
+        sin hangup PSTN; si no, commit destructivo (callback, mark, report, hangups).
 
         Si la contestación ya fue aceptada o el canal de intento está Up, aborta
         antes de mark/report (un solo closer: answer o timeout completo).
+
+        Orden crítico: peek Up + claim ANTES de stop_event, para que el bucle no
+        vacíe `_active_attempts` sin hangup mientras el agente ya contestó
+        (EventLoop atrasado).
         """
         logger.info(
             "DistributionService._on_queue_timeout: Timeout de cola para call_id=%s, campaña=%s",
@@ -2248,20 +2592,22 @@ class DistributionService:
             id_camp,
         )
 
-        # Capturar el callback ANTES de stop_event: el finally del distribution
-        # loop hace pop al salir y, si corre primero, CALLDATA se reporta sin
-        # acusar EXIT_TIMEOUT al dialer (has_cb=false).
+        # Capturar el callback ANTES de despertar al bucle: el finally del
+        # distribution loop hace pop al salir y, si corre primero, CALLDATA se
+        # reporta sin acusar EXIT_TIMEOUT al dialer (has_cb=false).
         with self._on_queue_timeout_callbacks_lock:
             cb = self._on_queue_timeout_callbacks.pop(call_id, None)
-
-        stop_event, attempt_finished = self._get_or_create_call_events(call_id)
-        stop_event.set()
-        attempt_finished.set()
 
         with self._call_events_lock:
             self._queue_timers.pop(call_id, None)
 
-        # --- Early abort (antes de claim) ---
+        def _abort_timeout_keep_call(reason: str) -> None:
+            """Answer/recover gana: despertar bucle sin cleanup destructivo."""
+            logger.info("_on_queue_timeout: abort call_id=%s (%s)", call_id, reason)
+            self._signal_distribution_loop_stop(call_id)
+            self._discard_queue_timeout_callback(call_id)
+
+        # --- Early abort (antes de claim / stop_event) ---
         with self.state_store.lock(call_id):
             context = self.state_store.get(call_id)
             if not context:
@@ -2269,6 +2615,7 @@ class DistributionService:
                     "_on_queue_timeout: contexto inexistente para call_id=%s, nada que hacer",
                     call_id,
                 )
+                self._signal_distribution_loop_stop(call_id)
                 self._discard_queue_timeout_callback(call_id)
                 return
             if queue_timeout_should_suppress_cleanup(context):
@@ -2279,8 +2626,9 @@ class DistributionService:
                     context.agent_connected_channel,
                     getattr(context, "distribution_answer_accepted", False),
                 )
-                self._discard_queue_timeout_callback(call_id)
+                _abort_timeout_keep_call("suppress")
                 return
+            ctx_attempt_channel = getattr(context, "agent_attempt_channel", None)
 
         with self._dialing_lock:
             peek_agent_channel = self._active_attempts.get(call_id)
@@ -2296,10 +2644,10 @@ class DistributionService:
             return
 
         if self._queue_timeout_should_abort(call_id):
-            self._discard_queue_timeout_callback(call_id)
+            _abort_timeout_keep_call("suppress-pre-claim")
             return
 
-        # --- Fase claim ---
+        # --- Fase claim (mientras el bucle aún no recibió stop_event) ---
         claimed = self._claim_attempt_for_timeout(call_id)
         current_agent_channel: Optional[str] = None
         timeout_agent_id: Optional[int] = None
@@ -2330,17 +2678,38 @@ class DistributionService:
                 self._restore_attempt_slot(
                     call_id, current_agent_channel, timeout_agent_id, timeout_loop_gen
                 )
-                self._discard_queue_timeout_callback(call_id)
+                _abort_timeout_keep_call("suppress-post-claim")
                 return
         else:
-            # Slot vacío: answer pudo ganar; no destruir si suppress.
+            # Slot vacío: answer pudo ganar; o bucle vació el slot en carrera vieja.
             if self._queue_timeout_should_abort(call_id):
                 logger.info(
                     "_on_queue_timeout: sin intento activo y answer aceptada call_id=%s; abort",
                     call_id,
                 )
+                _abort_timeout_keep_call("suppress-empty-slot")
+                return
+            fallback_ch = ctx_attempt_channel
+            if not fallback_ch:
+                with self.state_store.lock(call_id):
+                    ctx_fb = self.state_store.get(call_id)
+                    if ctx_fb:
+                        fallback_ch = getattr(ctx_fb, "agent_attempt_channel", None)
+            if fallback_ch and self._is_channel_up(fallback_ch):
+                logger.warning(
+                    "_on_queue_timeout: slot vacío pero agent_attempt_channel %s Up "
+                    "call_id=%s; recuperando answer (carrera bucle/timeout)",
+                    fallback_ch,
+                    call_id,
+                )
+                self._recover_answer_if_channel_up(call_id, fallback_ch)
                 self._discard_queue_timeout_callback(call_id)
                 return
+
+        # Timeout gana: recién ahora despertar al bucle (slot ya reclamado o vacío
+        # legítimo). Evita que el bucle haga _clear_attempt_if_loop sin hangup
+        # antes de que veamos canal Up.
+        self._signal_distribution_loop_stop(call_id)
 
         # --- Fase commit (timeout gana) ---
         context_for_report: Optional[CallContext] = None
@@ -2368,6 +2737,28 @@ class DistributionService:
                 failure_cooldown=True,
                 use_status_reservation=True,
             )
+
+        if current_agent_channel:
+            try:
+                self.ari_client.hangup_channel(current_agent_channel)
+            except Exception:
+                logger.exception(
+                    "_on_queue_timeout: error colgando canal intento %s (pre-overflow) call_id=%s",
+                    current_agent_channel,
+                    call_id,
+                )
+            current_agent_channel = None
+
+        # Desborde FAILOVER → campaña (antes de mark_call_ended / hangup PSTN)
+        if self._attempt_queue_overflow(
+            call_id=call_id,
+            id_camp=str(id_camp),
+            uniqueid=uniqueid,
+            pstn_channel_id=pstn_channel_id,
+            bridge_id=bridge_id,
+            context_for_report=context_for_report,
+        ):
+            return
 
         try:
             mark_result = self.state_store.mark_call_ended_atomic(call_id)
@@ -2486,6 +2877,8 @@ class DistributionService:
                     channel_leg_start_ts=context_for_report.bridge_created_ts,
                     channel_leg_answer_ts=context_for_report.pstn_answered_ts,
                     channel_leg_end_ts=end_iso,
+                    custom_data=overflow_custom_data_from_context(context_for_report)
+                    or None,
                 )
             except Exception:
                 logger.exception(

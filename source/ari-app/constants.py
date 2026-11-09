@@ -61,6 +61,8 @@ class HangupCause(Enum):
     CHANUNAVAIL = 'CHANUNAVAIL'
     EXIT_ABANDON = 'EXIT_ABANDON'
     EXIT_TIMEOUT = 'EXIT_TIMEOUT'
+    # Desborde FAILOVER a otra campaña (flow-out); distinto de EXIT_TIMEOUT (cola muere)
+    EXIT_OVERFLOW = 'EXIT_OVERFLOW'
     # Tras handoff desde voicebot: espera a agente humano (colgó el cliente vs timeout de cola)
     EXIT_HANDOFF_ABANDON = 'EXIT_HANDOFF_ABANDON'
     EXIT_HANDOFF_TIMEOUT = 'EXIT_HANDOFF_TIMEOUT'
