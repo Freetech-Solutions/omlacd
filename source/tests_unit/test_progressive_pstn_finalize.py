@@ -423,7 +423,7 @@ class TestFinalizeProgressivePstnEnd(unittest.TestCase):
             "EXIT_TIMEOUT",
         )
         legacy_forwarder.submit_dial_exit_timeout.assert_called_once_with(
-            16, 21, "123456766", callid="prog-1",
+            16, 21, "123456766", callid="prog-1", channel_id="pstn-ch-1",
         )
         legacy_forwarder.cleanup_pending_dial.assert_called_once_with("pstn-ch-1")
         legacy_forwarder.submit_dial_exit_abandon.assert_not_called()
@@ -481,7 +481,7 @@ class TestQueueTimeoutDialerCallback(unittest.TestCase):
             self.assertIn("pstn-ch-1", handler._pstn_hangup_initiated_by_app)
         pstn_reported_store.add.assert_called_once_with("pstn-ch-1")
         legacy_forwarder.submit_dial_exit_timeout.assert_called_once_with(
-            16, 21, "123456766", callid="prog-1",
+            16, 21, "123456766", callid="prog-1", channel_id="pstn-ch-1",
         )
         legacy_forwarder.cleanup_pending_dial.assert_called_once_with("pstn-ch-1")
         legacy_forwarder.submit_dial_exit_shortcall.assert_not_called()

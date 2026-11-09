@@ -24,6 +24,7 @@ try:
     import redis  # noqa: F401
 except ImportError:
     sys.modules['redis'] = MagicMock()
+sys.modules.setdefault('gearman', MagicMock())
 sys.modules['config'] = MagicMock()
 sys.modules['config'].settings = MagicMock()
 sys.modules['config'].settings.NODE_ID = "test-node"
@@ -656,12 +657,14 @@ class TestConcurrentRecordings(unittest.TestCase):
         bridge_id = "bridge-recording"
         channel_id = "channel-recording"
         
-        # Crear contexto inicial
+        # pstn_answered_ts: manual no graba early-media (183) hasta answer PSTN
         context = CallContext(
             call_id=call_id,
             type=CallType.MANUAL,
             bridge_id=bridge_id,
-            recording_started=False
+            pstn_channel=channel_id,
+            pstn_answered_ts="2026-01-01T12:00:00+00:00",
+            recording_started=False,
         )
         self.state_store.register(call_id, context)
         
