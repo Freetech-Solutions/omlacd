@@ -113,6 +113,7 @@ class AcDRouter:
         self.pstn_reported_store = pstn_reported_store
         self.pstn_ring_timer = pstn_ring_timer
         self.redis_client = redis_client
+        self.distribution_service = distribution_service
         self.logger = logging.getLogger(__name__)
         # Canales para los que ya se reportó BUSY/CONGESTION/CHANUNAVAIL en evento Dial;
         # no enviar CANCEL en ChannelDestroyed para evitar duplicado.
