@@ -109,6 +109,8 @@ class AcDRouter:
         self.call_service = call_service
         self.queue_event_manager = queue_event_manager
         self.sip_refer_handlers = sip_refer_handlers
+        self.distribution_service = distribution_service
+        self.get_campaign_config = get_campaign_config
         self.route_validator = route_validator
         self.pstn_reported_store = pstn_reported_store
         self.pstn_ring_timer = pstn_ring_timer
@@ -1292,6 +1294,22 @@ class AcDRouter:
         channel_id = event.channel.id
         if self.pstn_ring_timer and channel_id:
             self.pstn_ring_timer.cancel(channel_id)
+        # I3: handoff FAILOVER→dialplan — cerrar ticket Redis (EXIT_TIMEOUT) si aplica.
+        if channel_id and self.distribution_service:
+            try:
+                if self.distribution_service.try_finalize_failover_handoff(channel_id):
+                    logger.info(
+                        "ChannelDestroyed: handoff FAILOVER dialplan finalizado "
+                        "(channel_id=%s); cleanup ACD omitido",
+                        channel_id,
+                    )
+                    return
+            except Exception as e:
+                logger.warning(
+                    "ChannelDestroyed: try_finalize_failover_handoff falló: %s",
+                    e,
+                    exc_info=True,
+                )
         is_cancel_path = False
         early_fail_event = None  # CANCEL / 603_DECLINED / 404_NOT_FOUND / …
         event_final_for_dialer = None

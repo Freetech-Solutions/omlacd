@@ -24,7 +24,7 @@ from services.queue_welcome import (
     start_welcome_or_continue,
     stop_welcome_if_playing,
 )
-from state import CallContext, CallRegistry
+from state import TRANSFER_PHASE_NONE, CallContext, CallRegistry
 from state_helpers import (
     active_agent_channel,
     call_has_prior_agent_handling,
@@ -34,6 +34,9 @@ from state_helpers import (
     is_agent_leg_channel,
     is_consult_initiator_channel,
     overflow_custom_data_from_context,
+    pending_blind_transfer_abort_legs,
+    pending_consult_abort_bridges,
+    pending_consult_abort_legs,
 )
 from utils import compute_bot_agent_durations, parse_ari_args
 
@@ -146,9 +149,57 @@ class InboundCallHandler(BaseHandler):
         """
         Purga recursos ARI cuando el PSTN se va (bridge, piernas de agente, distribución).
         Idempotente: puede invocarse desde ChannelDestroyed y StasisEnd.
+
+        Incluye:
+        - ``blind_transfer_leg_id`` si la blind aún no consolidó (destino en RING fuera del bridge).
+        - pierna/bridge de consulta activa (``consultation.consult_leg_ch`` / ``consult_bridge``).
         """
-        bridge_id = getattr(context, "bridge_id", None)
-        if bridge_id and str(bridge_id).strip():
+        fresh_ctx = context
+        extra_legs: List[str] = []
+        extra_bridges: List[str] = []
+        try:
+            with self.state_store.lock(call_id):
+                locked = self.state_store.get(call_id)
+                # Solo refrescar con CallContext real (MagicMock de get() sin stub no sirve).
+                if isinstance(locked, CallContext):
+                    fresh_ctx = locked
+                # Capturar recursos de abort ANTES de marcar consultation inactive.
+                extra_legs = (
+                    list(pending_blind_transfer_abort_legs(fresh_ctx))
+                    + list(pending_consult_abort_legs(fresh_ctx))
+                )
+                extra_bridges = list(pending_consult_abort_bridges(fresh_ctx))
+                dirty = False
+                if extra_legs and getattr(fresh_ctx, "transfer_in_progress", False) is True:
+                    fresh_ctx.transfer_in_progress = False
+                    dirty = True
+                cons = getattr(fresh_ctx, "consultation", None)
+                if cons is not None and getattr(cons, "active", False) is True:
+                    cons.active = False
+                    dirty = True
+                    fresh_ctx.transfer_phase = TRANSFER_PHASE_NONE
+                if dirty:
+                    self.state_store.register_unsafe(call_id, fresh_ctx)
+        except Exception:
+            logger.exception(
+                "InboundCallHandler: PSTN Hangup - error leyendo contexto para abort "
+                "blind/consult (call_id=%s)",
+                call_id,
+            )
+            extra_legs = (
+                list(pending_blind_transfer_abort_legs(fresh_ctx))
+                + list(pending_consult_abort_legs(fresh_ctx))
+            )
+            extra_bridges = list(pending_consult_abort_bridges(fresh_ctx))
+
+        bridges: List[str] = []
+        bridge_seen: Set[str] = set()
+        for bid in [getattr(fresh_ctx, "bridge_id", None)] + extra_bridges:
+            if isinstance(bid, str) and bid.strip() and bid not in bridge_seen:
+                bridge_seen.add(bid)
+                bridges.append(bid)
+
+        for bridge_id in bridges:
             logger.warning(
                 "InboundCallHandler: PSTN Hangup - Destruyendo bridge remanente %s (call_id=%s)",
                 bridge_id,
@@ -159,9 +210,17 @@ class InboundCallHandler(BaseHandler):
             except Exception:
                 pass
 
-        for agent_leg in distinct_agent_leg_ids(context):
+        legs: List[str] = []
+        seen: Set[str] = set()
+        for agent_leg in list(distinct_agent_leg_ids(fresh_ctx)) + extra_legs:
+            if not isinstance(agent_leg, str) or not agent_leg or agent_leg in seen:
+                continue
+            seen.add(agent_leg)
+            legs.append(agent_leg)
+
+        for agent_leg in legs:
             logger.warning(
-                "InboundCallHandler: PSTN Hangup - Colgando agente remanente %s (call_id=%s)",
+                "InboundCallHandler: PSTN Hangup - Colgando pierna remanente %s (call_id=%s)",
                 agent_leg,
                 call_id,
             )
@@ -743,6 +802,89 @@ class InboundCallHandler(BaseHandler):
             self.state_store.register_unsafe(call_id, context)
             return context
 
+    def _apply_failover_reentry_hydration(
+        self,
+        call_id: str,
+        target_camp_id: Any,
+        ticket: Dict[str, Any],
+    ) -> None:
+        """
+        I5: tras dialplan→campaña, restaura overflow_* desde ticket Redis.
+        No emite log_transfer (el hop cola→dialplan ya reportó OVERFLOW).
+        """
+        now_iso = datetime.now().astimezone().isoformat()
+        try:
+            target_id = int(target_camp_id) if target_camp_id is not None else None
+        except (TypeError, ValueError):
+            target_id = None
+
+        with self.state_store.lock(call_id):
+            ctx = self.state_store.get(call_id)
+            if not ctx or getattr(ctx, "call_ended", False):
+                return
+
+            origin = ticket.get("overflow_origin_campaign_id") or ticket.get("id_camp")
+            try:
+                origin_int = int(origin) if origin is not None else None
+            except (TypeError, ValueError):
+                origin_int = None
+
+            path = list(ticket.get("overflow_path") or getattr(ctx, "overflow_path", None) or [])
+            path.append(
+                {
+                    "from_destination_type": ticket.get("destination_type"),
+                    "from_destination_id": ticket.get("failover_dst_id"),
+                    "to_campaign_id": target_id,
+                    "reason": "DIALPLAN_REENTRY",
+                    "at": now_iso,
+                }
+            )
+            ctx.is_overflow = True
+            ctx.handoff_to_dialplan = False
+            ctx.entry_reason = "overflow"
+            ctx.overflow_path = path
+            ctx.overflow_count = int(
+                ticket.get("overflow_count")
+                or getattr(ctx, "overflow_count", 0)
+                or 0
+            )
+            if origin_int is not None:
+                ctx.overflow_origin_campaign_id = origin_int
+                ctx.overflow_from_campaign_id = origin_int
+            if target_id is not None:
+                ctx.id_camp = target_id
+                ctx.distribution_campaign_id = target_id
+
+            if ticket.get("bridge_created_ts"):
+                ctx.bridge_created_ts = ticket["bridge_created_ts"]
+            if ticket.get("pstn_answered_ts"):
+                ctx.pstn_answered_ts = ticket["pstn_answered_ts"]
+            if ticket.get("uniqueid_pstn"):
+                ctx.uniqueid_pstn = ticket["uniqueid_pstn"]
+            if ticket.get("phone_number") and not getattr(ctx, "phone_number", None):
+                ctx.phone_number = ticket["phone_number"]
+            if ticket.get("tel_dialed") and not getattr(ctx, "tel_dialed", None):
+                ctx.tel_dialed = ticket["tel_dialed"]
+            if ticket.get("id_customer") is not None and getattr(ctx, "id_customer", None) in (
+                None,
+                -1,
+            ):
+                try:
+                    ctx.id_customer = int(ticket["id_customer"])
+                except (TypeError, ValueError):
+                    pass
+
+            self.state_store.register_unsafe(call_id, ctx)
+
+        logger.info(
+            "InboundCallHandler: reentrada FAILOVER dialplan→camp call_id=%s "
+            "camp=%s origin=%s hops=%s",
+            call_id,
+            target_id,
+            origin_int,
+            ticket.get("overflow_count"),
+        )
+
     # -------------------------------------------------------------------------
     # API BaseHandler
     # -------------------------------------------------------------------------
@@ -796,6 +938,49 @@ class InboundCallHandler(BaseHandler):
             # Determinar call_id y uniqueid
             call_id = inbound_data.get("callid") or channel_id
             uniqueid = inbound_data.get("uniqueid") or channel_id
+
+            # I5: ticket handoff (misma PSTN tras IVR/TC/Survey → campaña)
+            handoff_ticket: Optional[Dict[str, Any]] = None
+            if self.distribution_service and hasattr(
+                self.distribution_service, "peek_failover_handoff"
+            ):
+                try:
+                    peeked = self.distribution_service.peek_failover_handoff(
+                        channel_id
+                    )
+                    # Solo dict real: MagicMock es truthy y rompería call_id en unit tests.
+                    if isinstance(peeked, dict):
+                        handoff_ticket = peeked
+                except Exception:
+                    logger.exception(
+                        "InboundCallHandler.on_start: peek_failover_handoff falló "
+                        "channel=%s",
+                        channel_id,
+                    )
+                    handoff_ticket = None
+            if handoff_ticket:
+                ticket_call_id = str(handoff_ticket.get("call_id") or "")
+                if ticket_call_id:
+                    call_id = ticket_call_id
+                ticket_uid = handoff_ticket.get("uniqueid") or handoff_ticket.get(
+                    "uniqueid_pstn"
+                )
+                if ticket_uid:
+                    uniqueid = str(ticket_uid)
+                # Completar args débiles desde ticket (survey/IVR puede no setear CID)
+                if not inbound_data.get("tel_customer") and handoff_ticket.get(
+                    "phone_number"
+                ):
+                    inbound_data["tel_customer"] = handoff_ticket["phone_number"]
+                if (
+                    not inbound_data.get("id_customer")
+                    or str(inbound_data.get("id_customer")) in ("", "-1", "null")
+                ) and handoff_ticket.get("id_customer") is not None:
+                    inbound_data["id_customer"] = handoff_ticket["id_customer"]
+                if not inbound_data.get("tel_dialed") and handoff_ticket.get(
+                    "tel_dialed"
+                ):
+                    inbound_data["tel_dialed"] = handoff_ticket["tel_dialed"]
 
             # Fail-closed: ya hay contexto para este call_id → no crear otro bridge.
             try:
@@ -876,7 +1061,9 @@ class InboundCallHandler(BaseHandler):
                 uniqueid=uniqueid,
                 inbound_data=inbound_data,
                 queue_timeout_seconds=max_wait_time,
-                pstn_answered_ts=pstn_answered_ts,
+                pstn_answered_ts=(
+                    (handoff_ticket or {}).get("pstn_answered_ts") or pstn_answered_ts
+                ),
             )
             # Carrera: otro thread ganó el register con otro bridge_id.
             if getattr(ctx, "bridge_id", None) and str(ctx.bridge_id) != str(bridge_id):
@@ -884,6 +1071,34 @@ class InboundCallHandler(BaseHandler):
                     call_id, channel_id, bridge_id, ctx
                 )
                 return
+
+            if handoff_ticket:
+                self._apply_failover_reentry_hydration(
+                    call_id, id_camp, handoff_ticket
+                )
+                if self.distribution_service and hasattr(
+                    self.distribution_service, "consume_failover_handoff"
+                ):
+                    try:
+                        self.distribution_service.consume_failover_handoff(
+                            channel_id, call_id
+                        )
+                    except Exception:
+                        logger.exception(
+                            "InboundCallHandler.on_start: consume_failover_handoff "
+                            "falló call_id=%s",
+                            call_id,
+                        )
+                # Canal ya no está en handoff dialplan
+                try:
+                    self.ari_client.set_channel_variable(
+                        channel_id, "__OMLFAILOVER", ""
+                    )
+                except Exception:
+                    logger.debug(
+                        "InboundCallHandler.on_start: clear OMLFAILOVER falló",
+                        exc_info=True,
+                    )
 
             deferred = {
                 "bridge_id": bridge_id,
@@ -973,7 +1188,7 @@ class InboundCallHandler(BaseHandler):
                     channel_leg_id=uniqueid,
                     channel_leg_name=channel_name or channel_id,
                     channel_leg_start_ts=datetime.now().isoformat(),
-                    custom_data=None,
+                    custom_data=overflow_custom_data_from_context(ctx) or None,
                 )
         except Exception:
             logger.exception(
@@ -1007,6 +1222,15 @@ class InboundCallHandler(BaseHandler):
             "callid": inbound_data.get("callid") or call_id,
             "call_type": inbound_data.get("call_type", CallType.INBOUND_ID),
         }
+        if ctx and getattr(ctx, "is_overflow", False):
+            distribution_metadata["entry_reason"] = getattr(ctx, "entry_reason", None) or "overflow"
+            distribution_metadata["is_overflow"] = True
+            distribution_metadata["overflow_count"] = int(
+                getattr(ctx, "overflow_count", 0) or 0
+            )
+            distribution_metadata["overflow_origin_campaign_id"] = getattr(
+                ctx, "overflow_origin_campaign_id", None
+            )
         try:
             if campaign_cfg.get("voicebot"):
                 self.distribution_service.start_voicebot_distribution(
@@ -1804,6 +2028,16 @@ class InboundCallHandler(BaseHandler):
                     pstn_channel,
                     uniqueid_pstn,
                     self.pstn_channel_id,
+                )
+                return
+
+            # Comparar con `is True` evita que mocks truthy activen el skip.
+            if getattr(context, "handoff_to_dialplan", False) is True:
+                logger.info(
+                    "InboundCallHandler.on_pstn_stasis_end: handoff FAILOVER→dialplan "
+                    "(call_id=%s, channel_id=%s); no finalize abandon",
+                    context.call_id,
+                    channel_id,
                 )
                 return
 

@@ -89,14 +89,17 @@ TIPO_CAMPANA_MAPPING = {
 INITIATION_AGENT = 'AGENT'
 INITIATION_DIALER = 'DIALER'
 INITIATION_BOT = 'BOT'
+INITIATION_EXTERNAL = 'EXTERNAL'
 
 
 def _initiation_method_from_message(t_llamada, t_campana, agent_duration, atendida_por_voicebot):
     """
-    Deriva initiation_method (AGENT, DIALER, BOT) para interactions_summary.
+    Deriva initiation_method (AGENT, DIALER, BOT, EXTERNAL) para interactions_summary.
+    Quién inició la interacción (no quién contestó):
+    - EXTERNAL: inbound (leg PSTN/cliente).
     - DIALER: campaña dialer o progressive (tipo 2 o 5).
-    - AGENT: manual, preview, o inbound atendida por agente.
-    - BOT: inbound atendida solo por voicebot (sin tiempo de agente).
+    - AGENT: manual o preview.
+    - BOT: solo si el bot origina (no se deduce de inbound atendido por voicebot).
     """
     tipo = t_llamada if (t_llamada not in (None, 0)) else t_campana
     if tipo in (CallType.DIALER_ID, CallType.PROGRESSIVE_ID):
@@ -104,9 +107,7 @@ def _initiation_method_from_message(t_llamada, t_campana, agent_duration, atendi
     if tipo in (CallType.MANUAL_ID, CallType.PREVIEW_ID):
         return INITIATION_AGENT
     if tipo == CallType.INBOUND_ID:
-        if atendida_por_voicebot and (agent_duration or 0) <= 0:
-            return INITIATION_BOT
-        return INITIATION_AGENT
+        return INITIATION_EXTERNAL
     return None
 
 
@@ -356,13 +357,33 @@ def log_transfer_to_postgres(message):
         if target_agent_id is None and target_campaign_id is None and numero_extra:
             destination_external_endpoint = numero_extra[:128]
 
-        # destination_type: AGENT, CAMPAIGN, EXTERNAL
-        if target_agent_id is not None:
+        # destination_type: preferir el del mensaje (OVERFLOW→IVR/HANGUP/SURVEY/…).
+        # Fallback legacy: AGENT / CAMPAIGN / EXTERNAL según target_* / numero_extra.
+        _DIALPLAN_OVERFLOW_TYPES = frozenset(
+            {"IVR", "HANGUP", "SURVEY", "TIME_CONDITION"}
+        )
+        explicit_dest_type = (message.get("destination_type") or "").strip().upper()
+
+        if explicit_dest_type in _DIALPLAN_OVERFLOW_TYPES:
+            destination_type = explicit_dest_type
+            # numero_extra FAILOVERDST "tipo,id" → destination_id = id objeto
+            dst_obj_id = None
+            if numero_extra and "," in numero_extra:
+                dst_obj_id = numero_extra.split(",", 1)[1].strip()
+            destination_id = (dst_obj_id or numero_extra or explicit_dest_type)[:128]
+            destination_external_endpoint = (
+                numero_extra[:128] if numero_extra else None
+            )
+            target_agent_id = None
+            target_campaign_id = None
+        elif target_agent_id is not None:
             destination_type = "AGENT"
             destination_id = str(target_agent_id)[:128]
-        elif target_campaign_id is not None:
+        elif target_campaign_id is not None or explicit_dest_type == "CAMPAIGN":
             destination_type = "CAMPAIGN"
-            destination_id = str(target_campaign_id)[:128]
+            destination_id = str(target_campaign_id)[:128] if target_campaign_id is not None else (
+                (numero_extra or "unknown")[:128]
+            )
         elif destination_external_endpoint:
             destination_type = "EXTERNAL"
             destination_id = destination_external_endpoint
@@ -531,9 +552,11 @@ def insert_llamada_resumen(message):
             agent_duration = clean_float(msg_agent) or 0.0
         else:
             agent_duration = max(0.0, total_duration - bridge_wait_time)
-        # Usar initiation_method del payload si es válido; si no, derivar de tipo y voicebot
+        # Usar initiation_method del payload si es válido; si no, derivar de tipo
         _from_msg = message.get("initiation_method")
-        if _from_msg in (INITIATION_AGENT, INITIATION_DIALER, INITIATION_BOT):
+        if _from_msg in (
+            INITIATION_AGENT, INITIATION_DIALER, INITIATION_BOT, INITIATION_EXTERNAL,
+        ):
             initiation_method = _from_msg
         else:
             initiation_method = _initiation_method_from_message(
@@ -1066,6 +1089,22 @@ def update_redis_call_stats(message):
                 call_type=str(t_llamada),
                 message=message,
             )
+            # I6 aditivo: breakdown dialplan (UI vieja solo lee EXIT_OVERFLOW)
+            custom = message.get("custom_data") or {}
+            if not isinstance(custom, dict):
+                custom = {}
+            dest_label = str(custom.get("destination_type") or "").strip().upper()
+            if dest_label and dest_label not in ("CAMPAIGN", "AGENT", ""):
+                redis_client.hincrby(
+                    redis_key,
+                    f"CALL_TYPE:{t_llamada}:EXIT_OVERFLOW:{dest_label}",
+                    1,
+                )
+                redis_client.hincrby(
+                    redis_key,
+                    f"CALL_TYPE:{t_llamada}:FAILOVER_DIALPLAN",
+                    1,
+                )
         # Supervisión salientes: no contactación / no diálogo (manual, preview, dialer)
         # overflow_pending = EXIT_OVERFLOW hop A→B: PSTN sigue vivo, no acusar fin dialer
         if (

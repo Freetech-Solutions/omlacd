@@ -645,6 +645,21 @@ class ARI:
             logger.error(f"Error al obtener la variable del canal: {e}")
             return None
 
+    def set_channel_variable(self, channel_id: str, variable_name: str, value: str) -> bool:
+        """POST /channels/{id}/variable — setea variable de canal Asterisk."""
+        try:
+            route = f"channels/{channel_id}/variable"
+            params = {"variable": variable_name, "value": str(value)}
+            return self.post(route, params=params).get("ok", False)
+        except Exception as e:
+            logger.error(
+                "Error al setear variable %s en canal %s: %s",
+                variable_name,
+                channel_id,
+                e,
+            )
+            return False
+
     # --- Métodos de Bridges (Puentes) ---
 
     def create_bridge(self, bridge_type='mixing'):

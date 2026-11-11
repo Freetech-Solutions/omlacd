@@ -77,6 +77,14 @@ def _memory_store():
     return store
 
 
+def _mock_dist():
+    dist = MagicMock()
+    # Sin ticket: peek MagicMock truthy rompía call_id en on_start (I5).
+    dist.peek_failover_handoff.return_value = None
+    dist.consume_failover_handoff.return_value = None
+    return dist
+
+
 def _inbound_handler(ari=None, state_store=None, dist=None, call_service=None, reporter=None, qem=None):
     store = state_store or MagicMock()
     _lock_cm(store)
@@ -87,7 +95,7 @@ def _inbound_handler(ari=None, state_store=None, dist=None, call_service=None, r
         call_service=call_service or MagicMock(),
         queue_strategy_engine=MagicMock(),
         redis_client=MagicMock(),
-        distribution_service=dist or MagicMock(),
+        distribution_service=dist or _mock_dist(),
         queue_event_manager=qem,
         agent_status_service=MagicMock(),
     )
@@ -103,7 +111,7 @@ def _progressive_handler(
         state_store=store,
         reporter=reporter if reporter is not None else MagicMock(),
         call_service=call_service or MagicMock(),
-        distribution_service=dist or MagicMock(),
+        distribution_service=dist or _mock_dist(),
         queue_event_manager=qem or MagicMock(),
         redis_client=MagicMock(),
         agent_status_service=MagicMock(),

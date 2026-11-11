@@ -73,7 +73,7 @@ class ARIWithCircuitBreaker:
             'get_channel_details', 'start_moh', 'stop_moh',
             'answer', 'continue_call', 'create_channel',
             'redirect_to_dialplan', 'originate_channel', 'hangup_channel',
-            'get_channel_variable', 'create_bridge',
+            'get_channel_variable', 'set_channel_variable', 'create_bridge',
             'add_channel_to_bridge', 'get_channels_in_bridge',
             'destroy_bridge', 'start_recording',
             'external_media', 'execute_asterisk_command',
