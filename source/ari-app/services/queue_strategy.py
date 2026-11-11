@@ -172,9 +172,13 @@ class QueueStrategyEngine:
         if status is not AgentStatus.READY:
             return None
 
-        # PENALTY
-        penalty_raw = normalized.get("penalty") or normalized.get("PENALTY")
-        penalty = self._parse_int(penalty_raw, default=0) or 0
+        # Cooldown post-fallo puede dejar READY sin lock/lease; no re-ofrecer aún
+        if self._has_active_reservation(agent_id):
+            return None
+
+        # Penalty de distribución viene de OML:CAMP:{id}:MEMBER-PENALTY (membresía).
+        # No usar penalty del hash OML:AGENT (nadie lo escribe para colas).
+        penalty = 0
 
         # CALLS_ANSWERED
         calls_raw = normalized.get("calls_answered") or normalized.get("CALLS_ANSWERED")
@@ -215,15 +219,46 @@ class QueueStrategyEngine:
 
         return profile
 
+    def _load_member_penalties(self, campaign_id: str) -> Dict[int, int]:
+        """Lee OML:CAMP:{id}:MEMBER-PENALTY. Vacío si falta la clave o hay error."""
+        if not campaign_id:
+            return {}
+        try:
+            raw = self.redis.hgetall(RedisKeys.campaign_member_penalty(str(campaign_id))) or {}
+        except RedisError as exc:
+            self.logger.error(
+                "QueueStrategyEngine: error leyendo MEMBER-PENALTY campaña %s: %s",
+                campaign_id,
+                exc,
+                exc_info=True,
+            )
+            return {}
+        penalties: Dict[int, int] = {}
+        for field, value in raw.items():
+            agent_key = self._to_str(field)
+            if agent_key is None:
+                continue
+            try:
+                agent_id = int(agent_key)
+            except (TypeError, ValueError):
+                continue
+            penalties[agent_id] = self._parse_int(value, default=0) or 0
+        return penalties
+
     def _has_active_reservation(self, agent_id: int) -> bool:
-        """True si el agente tiene lock o lease de reserva activos."""
+        """True si el agente tiene lock, lease o cooldown de offer activos."""
         if self.agent_status_service:
             return self.agent_status_service.has_active_distribution_reservation(agent_id)
         try:
             agent_id_str = str(agent_id)
             lock_key = RedisKeys.agent_lock(agent_id_str)
             lease_key = RedisKeys.agent_reservation_lease(agent_id_str)
-            return bool(self.redis.exists(lock_key) or self.redis.exists(lease_key))
+            cooldown_key = RedisKeys.agent_offer_cooldown(agent_id_str)
+            return bool(
+                self.redis.exists(lock_key)
+                or self.redis.exists(lease_key)
+                or self.redis.exists(cooldown_key)
+            )
         except RedisError:
             return True
 
@@ -330,16 +365,19 @@ class QueueStrategyEngine:
         queue_name: str,
         member_ids: List[int],
         strategy: str,
+        campaign_id: Optional[str] = None,
     ) -> List[AgentProfile]:
         """
         Obtiene los candidatos ordenados según la estrategia indicada.
         
         - Filtra solo agentes en estado READY.
-        - Agrupa por penalidad (priorizando penalidades más bajas).
+        - Agrupa por penalidad de membresía (OML:CAMP:{id}:MEMBER-PENALTY).
         - Aplica la estrategia dentro de cada grupo.
         """
         if not member_ids:
             return []
+
+        membership_penalties = self._load_member_penalties(campaign_id or "")
 
         # Paso 1: Fetch masivo usando pipeline
         try:
@@ -356,7 +394,7 @@ class QueueStrategyEngine:
             )
             return []
 
-        # Paso 2: Mapear resultados y agrupar por penalidad
+        # Paso 2: Mapear resultados y agrupar por penalidad de membresía
         groups: Dict[int, List[AgentProfile]] = {}
 
         for raw_id, raw_data in zip(member_ids, results):
@@ -369,6 +407,7 @@ class QueueStrategyEngine:
             if not profile:
                 continue
 
+            profile.penalty = membership_penalties.get(agent_id_int, 0)
             groups.setdefault(profile.penalty, []).append(profile)
 
         if not groups:

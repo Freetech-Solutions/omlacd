@@ -20,6 +20,7 @@ _requests.adapters = types.ModuleType("requests.adapters")
 _requests.adapters.HTTPAdapter = MagicMock()
 _requests.Session = MagicMock()
 _requests.exceptions.RequestException = Exception
+_requests.Response = type("Response", (), {})
 sys.modules["requests"] = _requests
 sys.modules["requests.exceptions"] = _requests.exceptions
 sys.modules["requests.adapters"] = _requests.adapters
@@ -422,7 +423,7 @@ class TestFinalizeProgressivePstnEnd(unittest.TestCase):
             "EXIT_TIMEOUT",
         )
         legacy_forwarder.submit_dial_exit_timeout.assert_called_once_with(
-            16, 21, "123456766", callid="prog-1",
+            16, 21, "123456766", callid="prog-1", channel_id="pstn-ch-1",
         )
         legacy_forwarder.cleanup_pending_dial.assert_called_once_with("pstn-ch-1")
         legacy_forwarder.submit_dial_exit_abandon.assert_not_called()
@@ -480,7 +481,7 @@ class TestQueueTimeoutDialerCallback(unittest.TestCase):
             self.assertIn("pstn-ch-1", handler._pstn_hangup_initiated_by_app)
         pstn_reported_store.add.assert_called_once_with("pstn-ch-1")
         legacy_forwarder.submit_dial_exit_timeout.assert_called_once_with(
-            16, 21, "123456766", callid="prog-1",
+            16, 21, "123456766", callid="prog-1", channel_id="pstn-ch-1",
         )
         legacy_forwarder.cleanup_pending_dial.assert_called_once_with("pstn-ch-1")
         legacy_forwarder.submit_dial_exit_shortcall.assert_not_called()
@@ -502,6 +503,105 @@ class TestQueueTimeoutDialerCallback(unittest.TestCase):
         pstn_reported_store.add.assert_called_once_with("pstn-ch-1")
         legacy_forwarder.submit_dial_exit_timeout.assert_not_called()
         legacy_forwarder.cleanup_pending_dial.assert_not_called()
+
+    def test_on_queue_timeout_after_voicebot_handoff_submits_exit_answered(self):
+        state_store = MagicMock()
+        legacy_forwarder = MagicMock()
+        pstn_reported_store = MagicMock()
+        context = _progressive_context(agent_answered=False)
+        context.is_voicebot_transfer = True
+        context.voicebot_leg_start_ts = "2026-03-19T13:34:10+00:00"
+        context.voicebot_leg_end_ts = "2026-03-19T13:34:25+00:00"
+        state_store.get.return_value = context
+
+        handler = _make_handler(
+            state_store=state_store,
+            legacy_forwarder=legacy_forwarder,
+            pstn_reported_store=pstn_reported_store,
+        )
+        handler._on_queue_timeout_for_dialer("prog-1", "pstn-ch-1")
+
+        legacy_forwarder.submit_dial_exit_timeout.assert_not_called()
+        legacy_forwarder.submit_dial_exit_answered.assert_called_once()
+        args, kwargs = legacy_forwarder.submit_dial_exit_answered.call_args
+        self.assertEqual(args[:3], (16, 21, "123456766"))
+        self.assertAlmostEqual(args[3], 15.0, places=1)
+        self.assertEqual(kwargs.get("callid"), "prog-1")
+        legacy_forwarder.cleanup_pending_dial.assert_called_once_with("pstn-ch-1")
+
+    def test_on_queue_timeout_after_human_blind_to_campaign_submits_exit_answered(self):
+        state_store = MagicMock()
+        legacy_forwarder = MagicMock()
+        pstn_reported_store = MagicMock()
+        context = _progressive_context(agent_answered=False)
+        context.distribution_campaign_id = 22
+        context.agent_segments = [
+            {
+                "agent_id": 7,
+                "campaign_id": "16",
+                "answered_ts": "2026-03-19T13:34:10+00:00",
+                "end_ts": "2026-03-19T13:34:30+00:00",
+                "duration_sec": 20.0,
+            }
+        ]
+        state_store.get.return_value = context
+
+        handler = _make_handler(
+            state_store=state_store,
+            legacy_forwarder=legacy_forwarder,
+            pstn_reported_store=pstn_reported_store,
+        )
+        handler._on_queue_timeout_for_dialer("prog-1", "pstn-ch-1")
+
+        legacy_forwarder.submit_dial_exit_timeout.assert_not_called()
+        legacy_forwarder.submit_dial_exit_answered.assert_called_once()
+        args, kwargs = legacy_forwarder.submit_dial_exit_answered.call_args
+        self.assertEqual(args[:3], (16, 21, "123456766"))
+        self.assertAlmostEqual(args[3], 20.0, places=1)
+        self.assertEqual(kwargs.get("callid"), "prog-1")
+
+    def test_failed_blind_to_agent_reports_completeagent_and_exit_answered(self):
+        state_store = MagicMock()
+        reporter = MagicMock()
+        legacy_forwarder = MagicMock()
+        context = _progressive_context(agent_answered=False)
+        context.inbound_agent_hung_up_first = True
+        context.blind_transfer_attempted = True
+        context.agent_segments = [
+            {
+                "agent_id": 7,
+                "campaign_id": "16",
+                "answered_ts": "2026-03-19T13:34:10+00:00",
+                "end_ts": "2026-03-19T13:34:28+00:00",
+                "duration_sec": 18.0,
+            }
+        ]
+        state_store.get_by_channel.return_value = context
+        state_store.mark_call_ended_atomic.return_value = True
+        state_store.get.return_value = context
+        state_store.lock.return_value.__enter__ = MagicMock(return_value=None)
+        state_store.lock.return_value.__exit__ = MagicMock(return_value=False)
+
+        handler = _make_handler(
+            state_store=state_store,
+            reporter=reporter,
+            legacy_forwarder=legacy_forwarder,
+        )
+        handler.on_pstn_stasis_end("pstn-ch-1")
+
+        self.assertEqual(
+            reporter.log_segment_end.call_args.kwargs.get("event_final"),
+            HangupCause.EXIT_ANSWERED.value,
+        )
+        legacy_forwarder.submit_dial_exit_answered.assert_called_once()
+        legacy_forwarder.submit_dial_exit_abandon.assert_not_called()
+
+    def test_is_pstn_leg_channel_ignores_stale_self_pstn_channel_id(self):
+        context = _progressive_context(agent_answered=True)
+        handler = _make_handler()
+        handler.pstn_channel_id = "other-call-pstn-ch"
+        self.assertTrue(handler._is_pstn_leg_channel("pstn-ch-1", context))
+        self.assertFalse(handler._is_pstn_leg_channel("other-call-pstn-ch", context))
 
 
 if __name__ == "__main__":

@@ -222,6 +222,10 @@ class TestRedisUpdates(unittest.TestCase):
             campaign_id=id_camp,
             contact_number=phone_number,
         )
+        mock_agent_status.set_postcall_and_clear_fields.assert_called_once_with(
+            1001,
+            call_id=call_id,
+        )
 
     def test_consult_complete_rejects_when_consult_leg_not_up(self):
         """
@@ -507,5 +511,115 @@ class TestRedisUpdates(unittest.TestCase):
             "El contexto NO debe ser eliminado cuando se ignora el hangup del agente iniciador"
         )
 
+    def test_blind_to_campaign_sets_postcall_for_source_agent(self):
+        """blind_to_campaign must release human source agent ONCALL→POSTCALL."""
+        self.mock_state_store.lock.return_value.__enter__.return_value = None
+        mock_agent_status = MagicMock()
+        mock_dist = MagicMock()
+        manager = TransferManager(
+            state_store=self.mock_state_store,
+            ari_client=self.mock_ari_client,
+            reporter=self.mock_reporter,
+            agent_status_service=mock_agent_status,
+            distribution_service=mock_dist,
+            get_campaign_config=lambda _cid: {
+                "strategy": "fewestcalls",
+                "ring_timeout": 30,
+                "max_wait_time": 60,
+            },
+        )
+
+        call_id = "call-camp-1"
+        mock_ctx = MagicMock()
+        mock_ctx.call_id = call_id
+        mock_ctx.bridge_id = "bridge-1"
+        mock_ctx.agent_id = 55
+        mock_ctx.is_voicebot = False
+        mock_ctx.transfer_in_progress = False
+        mock_ctx.pstn_channel = "pstn-1"
+        mock_ctx.uniqueid_pstn = "uid-pstn"
+        mock_ctx.id_customer = "c1"
+        mock_ctx.id_camp = 10
+        mock_ctx.call_type = 3
+        mock_ctx.phone_number = "123"
+        mock_ctx.agent_segments = []
+        mock_ctx.transfer_count = 0
+        mock_ctx.agent_connected_channel = "agent-ch-55"
+        mock_ctx.agent_attempt_channel = None
+
+        def _active_ch(ctx):
+            return getattr(ctx, "agent_connected_channel", None)
+
+        self.mock_state_store.get.return_value = mock_ctx
+        with patch("transfer.active_agent_channel", side_effect=_active_ch), patch(
+            "transfer.finalize_current_agent_segment", return_value=0.0
+        ):
+            # _verify_state_integrity needs a real-ish check; stub it
+            with patch.object(manager, "_verify_state_integrity", return_value=True):
+                with patch.object(manager, "_start_redistribution_after_blind_to_campaign"):
+                    result = manager.blind_to_campaign(call_id, target_camp_id=99)
+
+        self.assertTrue(result)
+        mock_agent_status.set_postcall_and_clear_fields.assert_called_with(
+            55,
+            call_id=call_id,
+        )
+
+    def test_blind_to_endpoint_sets_postcall_for_source_agent(self):
+        """blind_to_endpoint must release human source agent when hanging up."""
+        self.mock_state_store.lock.return_value.__enter__.return_value = None
+        mock_agent_status = MagicMock()
+        manager = TransferManager(
+            state_store=self.mock_state_store,
+            ari_client=self.mock_ari_client,
+            reporter=self.mock_reporter,
+            agent_status_service=mock_agent_status,
+        )
+        call_id = "call-blind-1"
+        mock_ctx = MagicMock()
+        mock_ctx.call_id = call_id
+        mock_ctx.bridge_id = "bridge-1"
+        mock_ctx.agent_id = 77
+        mock_ctx.is_voicebot = False
+        mock_ctx.transfer_in_progress = False
+        mock_ctx.id_customer = "c1"
+        mock_ctx.id_camp = 10
+        mock_ctx.call_type = 1
+        mock_ctx.phone_number = "555"
+        mock_ctx.uniqueid_pstn = "uid"
+        mock_ctx.agent_connected_channel = "agent-ch-77"
+        mock_ctx.agent_attempt_channel = None
+
+        def _active_ch(ctx):
+            return getattr(ctx, "agent_connected_channel", None)
+
+        self.mock_state_store.get.return_value = mock_ctx
+        self.mock_ari_client.hangup_channel.return_value = True
+        self.mock_ari_client.originate_channel_op.return_value = {
+            "ok": True,
+            "data": {"id": "leg-new"},
+        }
+
+        with patch("transfer.active_agent_channel", side_effect=_active_ch), patch.object(
+            manager, "_originate_transfer_leg", return_value="leg-new"
+        ), patch.object(manager, "_start_moh"), patch.object(
+            manager, "_log_transfer_result"
+        ), patch.object(manager, "_verify_state_integrity", return_value=True):
+            # First lock starts with transfer_in_progress=False; code sets it True
+            # so the second lock verification sees transfer_in_progress=True.
+            result = manager.blind_to_endpoint(
+                unique_id=call_id,
+                endpoint="PJSIP/100@trunk",
+                agente_id=77,
+            )
+
+        self.assertTrue(result)
+        mock_agent_status.set_postcall_and_clear_fields.assert_called_with(
+            77,
+            call_id=call_id,
+        )
+
+
 if __name__ == '__main__':
     unittest.main()
+

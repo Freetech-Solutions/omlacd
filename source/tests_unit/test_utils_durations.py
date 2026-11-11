@@ -111,7 +111,6 @@ class TestComputeBotAgentDurations(unittest.TestCase):
     def test_mixed_naive_end_iso_and_aware_agent_ts_no_typeerror(self):
         """end_iso naive (como datetime.now().isoformat()) y agent con offset: no TypeError."""
         art = timezone(timedelta(hours=-3))
-        fixed_local = datetime(2026, 2, 3, 17, 0, 0, tzinfo=art)
         context = MagicMock()
         context.is_voicebot = False
         context.is_voicebot_transfer = False
@@ -120,7 +119,12 @@ class TestComputeBotAgentDurations(unittest.TestCase):
 
         real_datetime = datetime
         with patch.object(utils_mod, "datetime") as mock_dt:
-            mock_dt.now.return_value = fixed_local
+            # _ensure_offset_aware usa datetime.now().astimezone().tzinfo (TZ local).
+            # No devolver un datetime real ART: .astimezone() lo convertiría a la TZ
+            # del proceso (p.ej. UTC en CI) y rompería el diff con el agent aware.
+            mock_local = MagicMock()
+            mock_local.tzinfo = art
+            mock_dt.now.return_value.astimezone.return_value = mock_local
             mock_dt.fromisoformat = real_datetime.fromisoformat
             bot_duration, agent_duration = compute_bot_agent_durations(
                 context, end_iso, 43.0

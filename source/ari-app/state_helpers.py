@@ -1,7 +1,7 @@
 import logging
 from contextlib import contextmanager
 from datetime import datetime
-from typing import Any, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from state import CallRegistry, CallContext
 
@@ -18,14 +18,20 @@ def queue_timeout_should_suppress_cleanup(ctx: CallContext) -> bool:
     """
     True si _on_queue_timeout no debe ejecutar cleanup destructivo (hangup PSTN/agente, bridge, etc.).
 
-    No basta con ``active_agent_channel`` (``agent_connected_channel``): Redis migrado desde el
-    modelo legacy o estados inconsistentes pueden tener un id en ``agent_connected_channel``
-    sin que la llamada esté realmente atendida en este runtime. En flujos inbound/progressive/voicebot
-    habituales, ``agent_answered_ts`` se persiste en el mismo ``register`` que la consolidación
-    tras ``add_channel_to_bridge`` OK.
+    También inhibe si ``distribution_answer_accepted`` está seteado: el agente ya contestó
+    (handle_agent_answer) pero aún puede no haber consolidado el bridge ni escrito
+    ``agent_answered_ts``. En ese intervalo el timeout no debe cortar la llamada.
 
-    Se exigen ambas señales: pierna consolidada en el modelo y timestamp de contestación del agente.
+    Sin ese flag, no basta con ``active_agent_channel`` (``agent_connected_channel``): Redis
+    migrado desde el modelo legacy o estados inconsistentes pueden tener un id en
+    ``agent_connected_channel`` sin que la llamada esté realmente atendida. En flujos
+    inbound/progressive/voicebot habituales, ``agent_answered_ts`` se persiste en el mismo
+    ``register`` que la consolidación tras ``add_channel_to_bridge`` OK.
+
+    Se exigen ambas señales (pierna consolidada + timestamp) o la contestación ya aceptada.
     """
+    if getattr(ctx, "distribution_answer_accepted", False):
+        return True
     if not active_agent_channel(ctx):
         return False
     return bool(getattr(ctx, "agent_answered_ts", None))
@@ -69,15 +75,96 @@ def distinct_agent_leg_ids(context: CallContext) -> List[str]:
     return out
 
 
+def pending_blind_transfer_abort_legs(context: CallContext) -> List[str]:
+    """
+    Pierna B originada por blind_to_endpoint aún no consolidada.
+
+    ``blind_transfer_leg_id`` se setea al originate (destino puede seguir en AppDial2
+    RINGING sin StasisStart). En ese intervalo no está en agent_attempt/connected,
+    así que distinct_agent_leg_ids no la cuelga.
+
+    No afecta distribución de cola ni handoff voicebot (no setean este campo).
+    Tras consolidar (is_transferred / reset tracking) el campo queda None → [].
+    """
+    if getattr(context, "is_transferred", False) is True:
+        return []
+    btl = getattr(context, "blind_transfer_leg_id", None)
+    # Exigir str real: MagicMock es truthy y rompe assert_called_once en safety-net.
+    if isinstance(btl, str) and btl.strip():
+        return [btl.strip()]
+    return []
+
+
+def _consultation_active(context: CallContext) -> bool:
+    """True solo si consultation.active es bool True (no MagicMock truthy)."""
+    cons = getattr(context, "consultation", None)
+    if cons is None:
+        return False
+    return getattr(cons, "active", False) is True
+
+
+def pending_consult_abort_legs(context: CallContext) -> List[str]:
+    """
+    Pierna B de consulta activa (``consultation.consult_leg_ch``).
+
+    Vive en el bridge de consulta, no en agent_attempt/connected del bridge principal;
+    el safety-net del PSTN debe colgarla explícitamente.
+    """
+    if not _consultation_active(context):
+        return []
+    cons = getattr(context, "consultation", None)
+    leg = getattr(cons, "consult_leg_ch", None)
+    if isinstance(leg, str) and leg.strip():
+        return [leg.strip()]
+    return []
+
+
+def pending_consult_abort_bridges(context: CallContext) -> List[str]:
+    """
+    Bridge de consulta activo, distinto del bridge principal de la llamada.
+    """
+    if not _consultation_active(context):
+        return []
+    cons = getattr(context, "consultation", None)
+    consult_bridge = getattr(cons, "consult_bridge", None)
+    if not isinstance(consult_bridge, str) or not consult_bridge.strip():
+        return []
+    main_bridge = getattr(context, "bridge_id", None)
+    if isinstance(main_bridge, str) and consult_bridge.strip() == main_bridge.strip():
+        return []
+    return [consult_bridge.strip()]
+
+
 def effective_queue_campaign_id(ctx: CallContext) -> Optional[int]:
     """
     Campaña de cola operativa (eventos en vivo, stats ACD, voicebot-calls).
     Tras blind_to_campaign difiere de id_camp (atribución CDR).
     """
     dist = getattr(ctx, "distribution_campaign_id", None)
-    if dist is not None:
+    if dist is not None and isinstance(dist, (int, str)):
         return dist
     return ctx.id_camp
+
+
+def overflow_custom_data_from_context(ctx: Any) -> Dict[str, Any]:
+    """
+    Campos JSONB channel_data / custom_data para desborde FAILOVER.
+    Vacío si la llamada no es overflow.
+    """
+    if not ctx or not getattr(ctx, "is_overflow", False):
+        return {}
+    data: Dict[str, Any] = {
+        "is_overflow": True,
+        "overflow_count": int(getattr(ctx, "overflow_count", 0) or 0),
+        "overflow_path": list(getattr(ctx, "overflow_path", None) or []),
+    }
+    origin = getattr(ctx, "overflow_origin_campaign_id", None)
+    if origin is not None:
+        data["overflow_origin_campaign_id"] = origin
+    from_camp = getattr(ctx, "overflow_from_campaign_id", None)
+    if from_camp is not None:
+        data["overflow_from_campaign_id"] = from_camp
+    return data
 
 
 def call_transfer_routing_active(ctx: Any) -> bool:
@@ -85,9 +172,9 @@ def call_transfer_routing_active(ctx: Any) -> bool:
     True mientras hay transferencia en curso o blind con pierna pendiente de cierre de reporting,
     o ya hubo una transferencia finalizada (is_transferred). Usar en router en lugar de is_transferred solo.
     """
-    if getattr(ctx, "is_transferred", False):
+    if getattr(ctx, "is_transferred", False) is True:
         return True
-    if getattr(ctx, "transfer_in_progress", False):
+    if getattr(ctx, "transfer_in_progress", False) is True:
         return True
     if getattr(ctx, "blind_transfer_report_state", None) == "requested":
         return True
@@ -101,17 +188,19 @@ def call_has_prior_agent_handling(ctx: Any) -> bool:
     Tras blind_to_campaign el agente se desvincula (agent_connected_channel=None) mientras el cliente
     espera en la cola destino; no usar la ausencia de pierna de agente como proxy de «nunca atendida».
     """
-    if getattr(ctx, "transfer_in_progress", False):
+    if getattr(ctx, "transfer_in_progress", False) is True:
         return True
-    if getattr(ctx, "is_transferred", False):
+    if getattr(ctx, "is_transferred", False) is True:
         return True
-    try:
-        if int(getattr(ctx, "transfer_count", 0) or 0) > 0:
-            return True
-    except (TypeError, ValueError):
-        pass
-    segs = getattr(ctx, "agent_segments", None) or []
-    return bool(segs)
+    tc = getattr(ctx, "transfer_count", 0)
+    if isinstance(tc, (int, float, str)) and not isinstance(tc, bool):
+        try:
+            if int(tc or 0) > 0:
+                return True
+        except (TypeError, ValueError):
+            pass
+    segs = getattr(ctx, "agent_segments", None)
+    return isinstance(segs, (list, tuple)) and len(segs) > 0
 
 
 def finalize_current_agent_segment(ctx: CallContext) -> float:

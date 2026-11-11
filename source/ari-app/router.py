@@ -24,6 +24,7 @@ from models import (
     ChannelLeftBridgeEvent,
     StasisEndEvent,
     RecordingFinishedEvent,
+    PlaybackFinishedEvent,
     ChannelTransferEvent,
 )
 from reporter import ACDReporter
@@ -108,10 +109,13 @@ class AcDRouter:
         self.call_service = call_service
         self.queue_event_manager = queue_event_manager
         self.sip_refer_handlers = sip_refer_handlers
+        self.distribution_service = distribution_service
+        self.get_campaign_config = get_campaign_config
         self.route_validator = route_validator
         self.pstn_reported_store = pstn_reported_store
         self.pstn_ring_timer = pstn_ring_timer
         self.redis_client = redis_client
+        self.distribution_service = distribution_service
         self.logger = logging.getLogger(__name__)
         # Canales para los que ya se reportó BUSY/CONGESTION/CHANUNAVAIL en evento Dial;
         # no enviar CANCEL en ChannelDestroyed para evitar duplicado.
@@ -153,6 +157,11 @@ class AcDRouter:
         event_type = event.type
         if not event_type:
             return
+
+        # Call-ID SIP del INVITE hacia voicebot (peer.protocol_id); independiente del forward legacy
+        if event_type == 'Dial':
+            self._maybe_capture_agentic_sip_call_id(event_dict)
+            self._maybe_handle_manual_pstn_dial(event_dict)
         
         # Legacy dial handling: DIAL call_type=2 (DIALER) con channel_type to_pstn o to_agent
         if event_type == 'Dial' and self.legacy_forwarder and self.legacy_forwarder.should_forward_dial(event_dict):
@@ -217,6 +226,8 @@ class AcDRouter:
                                     channel_leg_end_ts=now_iso,
                                 )
                                 self._channel_ids_dial_failure_reported.add(peer_id)
+                                if self.pstn_ring_timer:
+                                    self.pstn_ring_timer.cancel(str(peer_id))
                             except Exception as e:
                                 self.logger.warning(
                                     "Error reportando fallo DIALER a acd-log-processor: %s", e,
@@ -269,6 +280,30 @@ class AcDRouter:
                             self._cleanup_old_pstn_answer_ts()
                     if peer_id and self.pstn_ring_timer:
                         self.pstn_ring_timer.cancel(str(peer_id))
+            elif dialstatus in ("NOANSWER", "BUSY", "CANCEL", "CONGESTION", "CHANUNAVAIL"):
+                # Backup: cool+unlock del intento de distribución sin depender del channel_id ARI
+                # (ChannelDestroyed a veces no matchea pre-generated UUID vs id real).
+                args = self.legacy_forwarder._get_dial_event_args(event_dict)
+                if args and args.get("channel_type") in (
+                    ChannelType.TO_AGENT.value,
+                    "to_agent",
+                ):
+                    call_id = (
+                        args.get("related_call_id")
+                        or args.get("callid")
+                        or args.get("uniqueid")
+                    )
+                    if call_id and self.distribution_service:
+                        try:
+                            self.distribution_service.handle_agent_leg_dial_failure(
+                                str(call_id)
+                            )
+                        except Exception as e:
+                            self.logger.debug(
+                                "handle_agent_leg_dial_failure call_id=%s: %s",
+                                call_id,
+                                e,
+                            )
             self.legacy_forwarder.handle_dial_event(event_dict)
         
         try:
@@ -299,6 +334,9 @@ class AcDRouter:
             elif event_type == 'RecordingFinished':
                 if isinstance(event, RecordingFinishedEvent):
                     self._handle_recording_finished(event)
+            elif event_type == 'PlaybackFinished':
+                if isinstance(event, PlaybackFinishedEvent):
+                    self._handle_playback_finished(event)
             elif event_type == 'ChannelHold':
                 if isinstance(event, ChannelHoldEvent):
                     self._handle_channel_hold(event)
@@ -310,6 +348,148 @@ class AcDRouter:
             # Add other handlers as needed
         except Exception as e:
             self.logger.error(f"Error procesando evento {event_type}: {e}", exc_info=True)
+
+    def _maybe_handle_manual_pstn_dial(self, event_dict: Dict[str, Any]) -> None:
+        """183 de una llamada manual: early media al bridge, sin marcar answer."""
+        dialstatus = str(event_dict.get("dialstatus") or "").strip().upper()
+        if dialstatus not in ("PROGRESS", "PROCEEDING", "ANSWER"):
+            return
+        peer_id = self._dial_peer_id(event_dict)
+        if not peer_id:
+            return
+        ctx = self._manual_context_for_dial(event_dict, peer_id)
+        if not ctx or not ctx.call_id:
+            return
+        manual_handler = self.handlers.get(CallType.MANUAL.value)
+        if not manual_handler:
+            return
+        self.logger.info(
+            "Manual PSTN Dial %s channel=%s call_id=%s",
+            dialstatus,
+            peer_id,
+            ctx.call_id,
+        )
+        if dialstatus == "ANSWER" and hasattr(manual_handler, "on_pstn_answered"):
+            manual_handler.on_pstn_answered(peer_id, call_id=ctx.call_id)
+            self._maybe_start_recording_on_pstn_answer(ctx.call_id, peer_id)
+            return
+        if hasattr(manual_handler, "on_pstn_progress"):
+            manual_handler.on_pstn_progress(peer_id, call_id=ctx.call_id)
+
+    def _dial_peer_id(self, event_dict: Dict[str, Any]) -> Optional[str]:
+        peer = event_dict.get("peer") if isinstance(event_dict.get("peer"), dict) else {}
+        channel = event_dict.get("channel") if isinstance(event_dict.get("channel"), dict) else {}
+        peer_id = peer.get("id") or channel.get("id")
+        return str(peer_id) if peer_id else None
+
+    def _manual_context_for_dial(self, event_dict: Dict[str, Any], peer_id: str):
+        ctx = None
+        if hasattr(self.state_store, "get_by_channel"):
+            ctx = self.state_store.get_by_channel(peer_id)
+        if ctx is None:
+            ctx = self._context_from_dial_app_args(event_dict)
+        if not ctx:
+            return None
+        call_type = getattr(ctx.type, "value", ctx.type)
+        numeric = str(getattr(ctx, "call_type", ""))
+        if call_type != CallType.MANUAL.value and numeric != "1":
+            return None
+        if ctx.pstn_channel and ctx.pstn_channel != peer_id:
+            return None
+        return ctx
+
+    def _context_from_dial_app_args(self, event_dict: Dict[str, Any]):
+        peer = event_dict.get("peer") if isinstance(event_dict.get("peer"), dict) else {}
+        dialplan = peer.get("dialplan") if isinstance(peer.get("dialplan"), dict) else {}
+        app_data = dialplan.get("app_data") or ""
+        if not app_data:
+            return None
+        args = parse_ari_args(
+            [part.strip() for part in str(app_data).split(",") if part.strip()]
+        )
+        if args.get("channel_type") not in (ChannelType.TO_PSTN.value, "to_pstn"):
+            return None
+        if str(args.get("call_type") or "") != "1":
+            return None
+        bridge_id = args.get("bridge_id")
+        if bridge_id and hasattr(self.state_store, "get_by_bridge_id"):
+            found = self.state_store.get_by_bridge_id(bridge_id)
+            if found:
+                return found
+        related = args.get("related_call_id") or args.get("callid")
+        if related:
+            return self.state_store.get(related)
+        return None
+
+    def _maybe_start_recording_on_pstn_answer(self, call_id: str, channel_id: str) -> None:
+        if not self.recording_handler or not hasattr(self.recording_handler, "try_start"):
+            return
+        ctx = self.state_store.get(call_id)
+        if not ctx or ctx.pstn_channel != channel_id or not ctx.bridge_id:
+            return
+        if not ctx.pstn_answered_ts or getattr(ctx, "recording_started", False):
+            return
+        self.recording_handler.try_start(ctx.bridge_id, channel_id)
+
+    def _handle_playback_finished(self, event: PlaybackFinishedEvent) -> None:
+        """
+        Completa WELCOMEPLAY (inbound/dialer/redistrib) o ringback MANUAL click2call.
+        """
+        playback = event.playback or {}
+        playback_id = playback.get("id")
+        target_uri = playback.get("target_uri") or ""
+        channel_id = None
+        if isinstance(target_uri, str) and target_uri.startswith("channel:"):
+            channel_id = target_uri.split(":", 1)[1]
+        if not channel_id:
+            return
+
+        ctx = self.state_store.get_by_channel(channel_id)
+        if not ctx:
+            return
+
+        from services.queue_welcome import (
+            RESUME_DIALER,
+            RESUME_INBOUND,
+            RESUME_REDISTRIBUTE,
+            is_our_welcome_playback,
+        )
+
+        if is_our_welcome_playback(ctx, playback_id):
+            call_id = ctx.call_id
+            action = getattr(ctx, "welcome_resume_action", None)
+            if action == RESUME_INBOUND:
+                inbound_handler = self.handlers.get(CallType.INBOUND.value)
+                if inbound_handler and hasattr(inbound_handler, "on_welcome_finished"):
+                    inbound_handler.on_welcome_finished(call_id)
+                return
+            if action == RESUME_DIALER:
+                progressive_handler = self.handlers.get(CallType.PROGRESSIVE.value)
+                if progressive_handler and hasattr(
+                    progressive_handler, "on_welcome_finished"
+                ):
+                    progressive_handler.on_welcome_finished(call_id)
+                return
+            if action == RESUME_REDISTRIBUTE:
+                if self.transfer_manager and hasattr(
+                    self.transfer_manager, "on_welcome_finished"
+                ):
+                    self.transfer_manager.on_welcome_finished(call_id)
+                return
+            self.logger.warning(
+                "PlaybackFinished welcome: action desconocida %r call_id=%s",
+                action,
+                call_id,
+            )
+            return
+
+        call_type = getattr(ctx.type, "value", ctx.type)
+        if call_type != CallType.MANUAL.value:
+            return
+
+        manual_handler = self.handlers.get(CallType.MANUAL.value)
+        if manual_handler and hasattr(manual_handler, "on_playback_finished"):
+            manual_handler.on_playback_finished(event)
 
     def _handle_stasis_start(self, event: StasisStartEvent, event_dict: Optional[Dict[str, Any]] = None) -> None:
         channel_id = event.channel.id
@@ -438,6 +618,39 @@ class AcDRouter:
                 self.logger.warning("No handler for amd_done")
             return
 
+        # externalMedia (AudioSocket) no envía appArgs: completar desde pending_dial_store
+        if not args_dict.get("channel_type"):
+            store = None
+            if self.legacy_forwarder and getattr(self.legacy_forwarder, "pending_dial_store", None):
+                store = self.legacy_forwarder.pending_dial_store
+            elif self.call_service and getattr(self.call_service, "pending_dial_store", None):
+                store = self.call_service.pending_dial_store
+            if store:
+                pending_meta = store.get(channel_id) or {}
+                if pending_meta.get("channel_type"):
+                    for key in (
+                        "channel_type",
+                        "related_call_id",
+                        "callid",
+                        "call_type",
+                        "id_camp",
+                        "id_customer",
+                        "tel_customer",
+                        "agentic_leg",
+                        "voicebot_transport",
+                        "audiosocket_uuid",
+                    ):
+                        if key in pending_meta and key not in args_dict:
+                            args_dict[key] = pending_meta[key]
+                    _log_callid = args_dict.get("callid") or args_dict.get("related_call_id")
+                    if _log_callid:
+                        set_log_call_id(str(_log_callid))
+                    self.logger.debug(
+                        "StasisStart: args desde pending_dial_store channel_id=%s channel_type=%s",
+                        channel_id,
+                        args_dict.get("channel_type"),
+                    )
+
         channel_type = args_dict.get('channel_type')
         is_manual = self._is_valid_manual_call(args_dict) # Verifica si tiene id_agent y id_camp
 
@@ -467,6 +680,8 @@ class AcDRouter:
         call_type_raw = args_dict.get('call_type')
         progressive_marker = args_dict.get('progressive') in (1, '1', True, 'true')
         if call_type_raw in (2, '2', CallType.DIALER_ID) and progressive_marker:
+            if self.pstn_ring_timer and channel_id:
+                self.pstn_ring_timer.cancel(str(channel_id))
             progressive_handler = self.handlers.get(CallType.PROGRESSIVE.value)
             if progressive_handler:
                 progressive_handler.on_start(event, args_dict=args_dict)
@@ -781,11 +996,13 @@ class AcDRouter:
             except Exception as e:
                 self.logger.error(f"Error updating agent status on blind transfer: {e}")
 
-        # Llamar al handler fuera del lock (operación no crítica que no modifica estado)
+        # El handler de manual marca pstn_answered_ts si este Up es la pierna PSTN
         if call_type:
             handler = self.handlers.get(call_type)
             if handler:
                 handler.on_up(event)
+        if call_id and channel_id:
+            self._maybe_start_recording_on_pstn_answer(call_id, channel_id)
 
         # Blind transfer: OK final si el destino pasó a Up después de un bridge exitoso
         if self.transfer_manager and call_id and channel_id:
@@ -827,8 +1044,11 @@ class AcDRouter:
         channel_id: str,
         pending_amd: Dict[str, Any],
         meta: Optional[Dict[str, Any]],
-    ) -> None:
-        """Hangup durante [amd]: CDR EXIT_AMD + Dial AMD al dialer (callid de negocio)."""
+    ) -> bool:
+        """Hangup durante [amd]: CDR EXIT_AMD + Dial AMD al dialer (callid de negocio).
+
+        Returns True si se envió Dial AMD (cupo liberado en dialer; no reenviar Destroy).
+        """
         meta = meta or {}
         id_camp = pending_amd.get("id_camp") or meta.get("id_camp") or meta.get("campaign_id") or ""
         id_customer = (
@@ -906,13 +1126,22 @@ class AcDRouter:
                     e,
                     exc_info=True,
                 )
+        dial_amd_submitted = False
         if self.legacy_forwarder and id_camp:
+            # Hangup durante/tras AMD no-HUMAN: un solo job Dial AMD + latencia embebida (P0).
+            # No reenviar ChannelDestroyed: el dialer libera cupo en Dial AMD.
+            amd_duration = self.legacy_forwarder.compute_amd_duration_sec(
+                pending_amd.get("amd_start_ts"), end_iso,
+            )
             self.legacy_forwarder.submit_dial_amd(
                 id_camp,
                 id_customer or "",
                 tel_customer or "",
                 callid=call_id or "",
+                amd_duration=amd_duration,
             )
+            self.legacy_forwarder.cleanup_pending_dial(channel_id)
+            dial_amd_submitted = True
         try:
             if self.redis_client:
                 node_id = getattr(self.state_store, "node_id", None) or "default"
@@ -920,7 +1149,10 @@ class AcDRouter:
         except Exception:
             pass
         if self.pstn_reported_store and channel_id:
-            self.pstn_reported_store.add(channel_id)
+            self.pstn_reported_store.add(
+                channel_id, credit_via_dial_amd=dial_amd_submitted,
+            )
+        return dial_amd_submitted
 
     def _cleanup_old_pstn_answer_ts(self) -> None:
         """Elimina entradas con timestamp mayor a _pstn_answer_ts_max_age_sec para evitar crecimiento indefinido."""
@@ -950,6 +1182,82 @@ class AcDRouter:
                 if val not in (None, ""):
                     return str(val)
         return str(channel_id)
+
+    def _maybe_capture_agentic_sip_call_id(self, event_dict: Dict[str, Any]) -> None:
+        """
+        Persiste peer.protocol_id (Call-ID SIP del INVITE voicebot) en CallContext.
+        Solo si la metadata del canal marca agentic_leg=1; no sobrescribe un valor ya set.
+        """
+        peer = event_dict.get("peer") or {}
+        if not isinstance(peer, dict):
+            peer = {}
+        protocol_id = peer.get("protocol_id")
+        peer_id = peer.get("id")
+        if not protocol_id or not peer_id:
+            return
+
+        call_id = None
+        ctx = self.state_store.get_by_channel(str(peer_id))
+        if ctx:
+            call_id = ctx.call_id
+        else:
+            store = None
+            if self.legacy_forwarder and getattr(self.legacy_forwarder, "pending_dial_store", None):
+                store = self.legacy_forwarder.pending_dial_store
+            elif self.call_service and getattr(self.call_service, "pending_dial_store", None):
+                store = self.call_service.pending_dial_store
+            if store:
+                meta = store.get(str(peer_id)) or {}
+                if str(meta.get("agentic_leg") or "") == "1":
+                    related = meta.get("related_call_id") or meta.get("callid")
+                    if related:
+                        call_id = str(related)
+
+        if not call_id:
+            return
+
+        try:
+            with self.state_store.lock(call_id):
+                fresh = self.state_store.get(call_id)
+                if not fresh:
+                    return
+                if getattr(fresh, "sip_agentic_leg_call_id", None):
+                    return
+                # Confirmar pierna agentic: metadata o canal ya marcado como voicebot attempt
+                is_agentic = False
+                store = None
+                if self.legacy_forwarder and getattr(self.legacy_forwarder, "pending_dial_store", None):
+                    store = self.legacy_forwarder.pending_dial_store
+                elif self.call_service and getattr(self.call_service, "pending_dial_store", None):
+                    store = self.call_service.pending_dial_store
+                if store:
+                    meta = store.get(str(peer_id)) or {}
+                    is_agentic = str(meta.get("agentic_leg") or "") == "1"
+                if not is_agentic:
+                    attempt = getattr(fresh, "agent_attempt_channel", None)
+                    connected = getattr(fresh, "agent_connected_channel", None)
+                    if getattr(fresh, "is_voicebot", False) and str(peer_id) in (
+                        str(attempt or ""),
+                        str(connected or ""),
+                    ):
+                        is_agentic = True
+                if not is_agentic:
+                    return
+                fresh.sip_agentic_leg_call_id = str(protocol_id)
+                self.state_store.register_unsafe(call_id, fresh)
+                self.logger.debug(
+                    "Capturado sip_agentic_leg_call_id=%s call_id=%s peer_id=%s",
+                    protocol_id,
+                    call_id,
+                    peer_id,
+                )
+        except Exception as e:
+            self.logger.warning(
+                "Error capturando sip_agentic_leg_call_id peer_id=%s: %s",
+                peer_id,
+                e,
+                exc_info=True,
+            )
 
     def _maybe_log_dial_for_pstn_channel(
         self,
@@ -986,12 +1294,38 @@ class AcDRouter:
         channel_id = event.channel.id
         if self.pstn_ring_timer and channel_id:
             self.pstn_ring_timer.cancel(channel_id)
+        # I3: handoff FAILOVER→dialplan — cerrar ticket Redis (EXIT_TIMEOUT) si aplica.
+        if channel_id and self.distribution_service:
+            try:
+                if self.distribution_service.try_finalize_failover_handoff(channel_id):
+                    logger.info(
+                        "ChannelDestroyed: handoff FAILOVER dialplan finalizado "
+                        "(channel_id=%s); cleanup ACD omitido",
+                        channel_id,
+                    )
+                    return
+            except Exception as e:
+                logger.warning(
+                    "ChannelDestroyed: try_finalize_failover_handoff falló: %s",
+                    e,
+                    exc_info=True,
+                )
         is_cancel_path = False
         early_fail_event = None  # CANCEL / 603_DECLINED / 404_NOT_FOUND / …
         event_final_for_dialer = None
         pstn_cleaned_by_app = False
+        # Dial AMD ya liberó OML:CALLS en el dialer → no encolar ChannelDestroyed.
+        # Comparar con `is True` evita que mocks truthy activen el skip.
+        skip_channel_destroyed_for_dialer = False
+        if self.pstn_reported_store and channel_id:
+            try:
+                if self.pstn_reported_store.is_dial_amd_credit_released(channel_id) is True:
+                    skip_channel_destroyed_for_dialer = True
+            except Exception:
+                pass
         id_camp = id_customer = tel_customer = ""
         early_fail_quien_corto = 2
+        meta = None
         # Simetría con MANUAL: reportar fallo a acd-log-processor cuando se destruye
         # la pierna PSTN DIALER antes de contestar (canal no estaba Up). Clasificar por
         # cause/tech_cause (603→603_DECLINED, 403→403_FORBIDDEN, 404→404_NOT_FOUND,
@@ -1109,9 +1443,18 @@ class AcDRouter:
                     # Canal en [amd]: StasisEnd al redirigir deja sin contexto. Si cuelga
                     # ahí, no inventar EXIT_ANSWERED. Reportar EXIT_AMD + Dial AMD para
                     # que el primer originate deje CDR y saque el contacto de SELECTED.
-                    self._report_exit_amd_on_channel_destroyed(
+                    if self._report_exit_amd_on_channel_destroyed(
                         channel_id, pending_amd, meta,
-                    )
+                    ):
+                        skip_channel_destroyed_for_dialer = True
+                    pstn_cleaned_by_app = True
+                elif not pstn_cleaned_by_app and (meta or {}).get("amd") in (True, "True", "true", 1, "1"):
+                    # Dial ANSWER fue diferido por AMD (meta.amd=True) y nunca se envió
+                    # submit_dial_answered_pstn (corte antes de escribir pending_amd o tras expirar TTL).
+                    if self._report_exit_amd_on_channel_destroyed(
+                        channel_id, meta, meta,
+                    ):
+                        skip_channel_destroyed_for_dialer = True
                     pstn_cleaned_by_app = True
                 if not pstn_cleaned_by_app:
                     meta_callid = (meta or {}).get("callid") or (meta or {}).get("related_call_id")
@@ -1209,35 +1552,62 @@ class AcDRouter:
         # Early-fail (CANCEL/603_DECLINED/404_NOT_FOUND/403_FORBIDDEN/405_NOT_ALLOWED/
         # 406_NO_ACCEPTABLE/408_REQUEST_TIMEOUT/480_TEMPORARILY_UNAVAILABLE/
         # 487_REQUEST_TERMINATED/488_NOT_ACCEPTABLE_HERE/608_REJECTED/
-        # CHANUNAVAIL/ERROR): Dial status a process-event y limpiar metadata.
+        # CONGESTION/BUSY/CHANUNAVAIL/ERROR): Dial status a process-event y limpiar metadata.
         #   404_NOT_FOUND → 404_NOT_FOUND (dialstatus propio; sin incidence rules)
         #   480_TEMPORARILY_UNAVAILABLE → dialstatus propio (con incidence rules)
         #   487_REQUEST_TERMINATED → NOANSWER (con incidence rules)
+        #   CONGESTION (SIP 500/502/503, Q.850 34/38/41/42) → CONGESTION
+        #   BUSY (Q.850 17) → BUSY
         #   603_DECLINED + 403/405/406/408/488/608 + CHANUNAVAIL + ERROR → CHANUNAVAIL
         #     (fail sin reglas; libera OML:CALLS)
         #   CANCEL (y residuales p. ej. HangupCause.NOANSWER Q.850) → CANCEL.
         # EXIT_SHORTCALL: enviar Dial EXIT_SHORTCALL a process-event y limpiar (no ChannelDestroyed).
-        # PSTN limpiado por app: enviar ChannelDestroyed a process-event para que el dialer
-        # decremente OML:CALLS:{id_camp}:DIALER (el segment_end ya fue reportado, no duplicar).
+        # Dial AMD (MACHINE / hangup en [amd]): un solo job Dial AMD libera cupo en el dialer;
+        # no reenviar ChannelDestroyed (evita fan-out + send-reports duplicado).
+        # Otros PSTN limpiados por app (p. ej. EXIT_TIMEOUT): ChannelDestroyed sigue
+        # liberando OML:CALLS si aún hay metadata pendiente.
         # Resto: enviar ChannelDestroyed to_pstn a process-event y limpiar metadata.
         if self.legacy_forwarder:
-            if pstn_cleaned_by_app:
+            if skip_channel_destroyed_for_dialer:
+                self.logger.debug(
+                    "Skip ChannelDestroyed→process-event: Dial AMD ya liberó cupo "
+                    "channel_id=%s",
+                    channel_id,
+                )
+            elif pstn_cleaned_by_app:
                 # Segmento ya reportado a acd-log-processor; igual enviamos ChannelDestroyed
                 # a process-event para que el dialer decremente el contador de llamadas.
                 self.legacy_forwarder.handle_channel_destroyed(channel_id)
             elif is_cancel_path:
                 callid = meta.get("callid") or meta.get("uniqueid") or "" if meta else ""
+                # M0: eco attempt_id desde pending (meta) + channel_id para fallback.
+                early_attempt_id = (
+                    meta.get("attempt_id") if isinstance(meta, dict) else None
+                )
+                early_kwargs = {
+                    "callid": callid,
+                    "channel_id": channel_id,
+                    "attempt_id": early_attempt_id,
+                }
                 if early_fail_event == HangupCause.NOT_FOUND.value:
                     self.legacy_forwarder.submit_dial_not_found(
-                        id_camp, id_customer, tel_customer, callid=callid
+                        id_camp, id_customer, tel_customer, **early_kwargs
                     )
                 elif early_fail_event == HangupCause.TEMPORARILY_UNAVAILABLE.value:
                     self.legacy_forwarder.submit_dial_temporarily_unavailable(
-                        id_camp, id_customer, tel_customer, callid=callid
+                        id_camp, id_customer, tel_customer, **early_kwargs
                     )
                 elif early_fail_event == HangupCause.REQUEST_TERMINATED.value:
                     self.legacy_forwarder.submit_dial_noanswer(
-                        id_camp, id_customer, tel_customer, callid=callid
+                        id_camp, id_customer, tel_customer, **early_kwargs
+                    )
+                elif early_fail_event == HangupCause.CONGESTION.value:
+                    self.legacy_forwarder.submit_dial_congestion(
+                        id_camp, id_customer, tel_customer, **early_kwargs
+                    )
+                elif early_fail_event == HangupCause.BUSY.value:
+                    self.legacy_forwarder.submit_dial_busy(
+                        id_camp, id_customer, tel_customer, **early_kwargs
                     )
                 elif early_fail_event in (
                     HangupCause.DECLINED.value,
@@ -1251,17 +1621,27 @@ class AcDRouter:
                     HangupCause.ERROR.value,
                 ):
                     self.legacy_forwarder.submit_dial_chanunavail(
-                        id_camp, id_customer, tel_customer, callid=callid
+                        id_camp, id_customer, tel_customer, **early_kwargs
                     )
                 else:
                     # CANCEL y residuales early-fail → CANCEL (sin incidence rules)
                     self.legacy_forwarder.submit_dial_cancel(
-                        id_camp, id_customer, tel_customer, callid=callid
+                        id_camp, id_customer, tel_customer, **early_kwargs
                     )
                 self.legacy_forwarder.cleanup_pending_dial(channel_id)
             elif event_final_for_dialer == HangupCause.EXIT_SHORTCALL.value:
                 callid = meta.get("callid") or meta.get("uniqueid") or "" if meta else ""
-                self.legacy_forwarder.submit_dial_exit_shortcall(id_camp, id_customer, tel_customer, callid=callid)
+                early_attempt_id = (
+                    meta.get("attempt_id") if isinstance(meta, dict) else None
+                )
+                self.legacy_forwarder.submit_dial_exit_shortcall(
+                    id_camp,
+                    id_customer,
+                    tel_customer,
+                    callid=callid,
+                    channel_id=channel_id,
+                    attempt_id=early_attempt_id,
+                )
                 self.legacy_forwarder.cleanup_pending_dial(channel_id)
             else:
                 self.legacy_forwarder.handle_channel_destroyed(channel_id)

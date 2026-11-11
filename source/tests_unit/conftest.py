@@ -6,6 +6,23 @@ import sys
 import os
 from unittest.mock import Mock, MagicMock, patch
 
+# Cargar los paquetes reales antes del módulo de test. Varios archivos hacen
+# sys.modules.setdefault("redis"|"requests", MagicMock()); si el mock entra
+# primero, `from redis.exceptions import RedisError` y `requests.Response`
+# fallan porque un MagicMock no es un paquete.
+try:
+    import redis  # noqa: F401
+    import redis.exceptions  # noqa: F401
+except ImportError:
+    pass
+
+try:
+    import requests  # noqa: F401
+    import requests.exceptions  # noqa: F401
+    import requests.adapters  # noqa: F401
+except ImportError:
+    pass
+
 # Agregar el directorio source/ari-app al path para importar módulos
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'ari-app'))
 

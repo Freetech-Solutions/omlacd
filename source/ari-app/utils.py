@@ -93,8 +93,9 @@ def build_oml_sip_headers(
         origin: Origen de la llamada. Si es None, se deriva del call_type:
                 - "1" (MANUAL_ID) -> "MANUAL"
                 - "2" (DIALER_ID) -> "DIALER"
-                - "3" (INBOUND_ID) -> "INBOUND"
-                - "4" (PREVIEW_ID) -> "PREVIEW"
+                - "3" (INBOUND_ID) -> "IN" (softphone is_inbound)
+                - "4" (PREVIEW_ID) -> "MANUAL"
+                - "5" (PROGRESSIVE_ID) -> "DIALER"
                 Si call_type no está disponible, usa "UNKNOWN" como fallback.
         asterisk_id: ID único de Asterisk (para X-OML-BranchID si include_branch_id=True)
         include_legacy_vars: Si True, incluye variables legacy (OMLUNIQUEID, OMLCAMPID, etc.)
@@ -108,15 +109,17 @@ def build_oml_sip_headers(
         - Variables legacy si include_legacy_vars=True
         - Headers adicionales si se proporcionan
     """
-    # Derivar origin del call_type si no se especifica explícitamente
+    # Derivar origin del call_type si no se especifica explícitamente.
+    # El softphone del agente usa X-Oml-Origin: inbound debe ser "IN" (no "INBOUND")
+    # para is_inbound / ringing; "MANUAL" fuerza auto-attend (click2call).
     if origin is None:
         if call_type:
-            # Mapeo de call_type (string numérico) a origin
             call_type_to_origin = {
                 str(CallType.MANUAL_ID): "MANUAL",
                 str(CallType.DIALER_ID): "DIALER",
-                str(CallType.INBOUND_ID): "INBOUND",
-                str(CallType.PREVIEW_ID): "PREVIEW",
+                str(CallType.INBOUND_ID): "IN",
+                str(CallType.PREVIEW_ID): "MANUAL",
+                str(CallType.PROGRESSIVE_ID): "DIALER",
             }
             origin = call_type_to_origin.get(str(call_type), "UNKNOWN")
         else:

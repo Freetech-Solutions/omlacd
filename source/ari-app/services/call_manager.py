@@ -9,8 +9,10 @@ Incluye la lógica de decisión de tipos de llamada (dial to agent vs dial to PS
 validación de idempotencia y validación de rutas para el comando 'dial'.
 """
 
+import json
 import logging
 import time
+import uuid
 from datetime import datetime
 from typing import Optional, Dict, Any, TYPE_CHECKING
 
@@ -18,7 +20,7 @@ from ari_manager import ARI
 from config import settings
 from log_config import set_log_call_id, reset_log_call_id
 from state import CallRegistry
-from constants import ChannelType, ProtocolPrefix, CallType
+from constants import ChannelType, ProtocolPrefix, CallType, RedisKeys
 from utils import build_oml_sip_headers, build_dynamic_sip_headers_from_env
 from metadata_utils import build_app_args
 from idempotency import (
@@ -413,7 +415,8 @@ class CallActionService:
         related_call_id: str,
         metadata: Dict[str, Any],
         external_sip_trunk: Optional[str] = None,
-        timeout: Optional[int] = None
+        timeout: Optional[int] = None,
+        early_media: bool = False,
     ) -> Optional[str]:
         """
         Origina una llamada hacia PSTN.
@@ -437,6 +440,9 @@ class CallActionService:
                 Si no se proporciona, se usa config.SIP_TRUNK como fallback.
             timeout: Timeout en segundos para el intento de llamada (opcional).
                 Si no se proporciona, se usa 30 como valor por defecto.
+            early_media: Si es True, crea el canal en Stasis y después marca.
+                El 183 se puede unir al bridge antes del answer. Solo la
+                llamada manual lo activa; el dialer sigue con originate.
         
         Returns:
             ID del canal PSTN creado, o None si falla
@@ -468,27 +474,64 @@ class CallActionService:
             caller_id = None
         if caller_id is None or caller_id == '':
             caller_id = tel_customer or number or ''
-        
+
+        call_type_raw = metadata.get("call_type") or metadata.get("id_calltype") or ""
+        id_camp_meta = metadata.get("id_camp") or metadata.get("campaign_id") or ""
+        amd_enabled = False
+        if self.redis_client and id_camp_meta and str(id_camp_meta) != "0":
+            try:
+                raw_amd = self.redis_client.hget(f"OML:CAMP:{id_camp_meta}", "AMD")
+                if isinstance(raw_amd, bytes):
+                    raw_amd = raw_amd.decode("utf-8", errors="ignore")
+                amd_enabled = str(raw_amd or "").strip().lower() in ("true", "1", "yes")
+            except Exception:
+                amd_enabled = False
+        metadata_with_amd = {**metadata, "amd": "1" if amd_enabled else "0"}
+
         # Construir appArgs de forma centralizada
         app_args = build_app_args(
-            metadata,
+            metadata_with_amd,
             related_call_id=related_call_id,
             default_channel_type=ChannelType.TO_PSTN.value,
         )
-        
+
         # Variables de canal OML para el leg PSTN en llamadas DIALER (tipo 2)
-        call_type_raw = metadata.get("call_type") or metadata.get("id_calltype")
         if call_type_raw in (2, "2", CallType.DIALER_ID):
             _id_camp = metadata.get("id_camp") or metadata.get("campaign_id") or "0"
             _id_customer = metadata.get("id_customer") or metadata.get("contact_id") or "0"
             variables = {"OMLCAMPID": str(_id_camp), "OMLCODCLI": str(_id_customer)}
         else:
             variables = None
-        
+
         # Timeout de negocio (timer acd-app) vs timeout ARI (margen de seguridad).
         business_timeout = timeout if timeout is not None else settings.DEFAULT_ORIGINATE_TIMEOUT
         safety_margin = int(getattr(settings, "ORIGINATE_SAFETY_MARGIN_SEC", 2))
         ari_timeout = business_timeout + safety_margin
+
+        pre_channel_id = str(uuid.uuid4())
+        stored_meta = {
+            "call_type": call_type_raw,
+            "channel_type": ChannelType.TO_PSTN.value,
+            "id_camp": id_camp_meta,
+            "campaign_id": id_camp_meta,
+            "id_customer": metadata.get("id_customer", metadata.get("contact_id", "")),
+            "tel_customer": metadata.get("tel_customer", metadata.get("phone_number", number)),
+            "originate_ts": datetime.now().astimezone().isoformat(),
+            "originate_timeout": business_timeout,
+            "local_cancel": False,
+            "amd": amd_enabled,
+        }
+        # M0: preserve dialer attempt_id for process-event echo.
+        attempt_id = metadata.get("attempt_id")
+        if attempt_id not in (None, ""):
+            stored_meta["attempt_id"] = str(attempt_id)
+        if related_call_id:
+            stored_meta["related_call_id"] = related_call_id
+        callid = metadata.get("callid") or metadata.get("uniqueid") or related_call_id
+        if callid:
+            stored_meta["callid"] = str(callid)
+        if self.pending_dial_store:
+            self.pending_dial_store.register(pre_channel_id, stored_meta)
 
         self.logger.info(
             f"🚀 Originando llamada hacia PSTN: {endpoint} "
@@ -496,20 +539,32 @@ class CallActionService:
             f"related_call_id={related_call_id})"
         )
 
-        result = self.ari_client.originate_channel_op(
-            endpoint=endpoint,
-            app=self.config['ARI_APP'],
-            callerId=caller_id,
-            appArgs=app_args,
-            variables=variables,
-            timeout=ari_timeout,
-        )
+        if early_media:
+            result = self._create_and_dial_pstn(
+                endpoint=endpoint,
+                caller_id=caller_id,
+                app_args=app_args,
+                timeout=ari_timeout,
+                channel_id=pre_channel_id,
+            )
+        else:
+            result = self.ari_client.originate_channel_op(
+                endpoint=endpoint,
+                app=self.config['ARI_APP'],
+                callerId=caller_id,
+                appArgs=app_args,
+                variables=variables,
+                timeout=ari_timeout,
+                channelId=pre_channel_id,
+            )
 
         if not result.get("ok"):
             self.logger.error(
                 "❌ Error crítico al originar hacia PSTN después de reintentos: %s",
                 result.get("error"),
             )
+            if self.pending_dial_store:
+                self.pending_dial_store.pop(pre_channel_id)
             return None
 
         data = result.get("data") or {}
@@ -519,28 +574,12 @@ class CallActionService:
                 "❌ Respuesta inválida de ARI al originar hacia PSTN, falta 'id': %s",
                 data,
             )
+            if self.pending_dial_store:
+                self.pending_dial_store.pop(pre_channel_id)
             return None
 
-        # Registrar metadata para LegacyEventForwarder / clasificación CANCEL vs 480.
-        if self.pending_dial_store:
-            call_type_raw = metadata.get("call_type") or metadata.get("id_calltype") or ""
-            id_camp = metadata.get("id_camp") or metadata.get("campaign_id") or ""
-            stored_meta = {
-                "call_type": call_type_raw,
-                "channel_type": ChannelType.TO_PSTN.value,
-                "id_camp": id_camp,
-                "campaign_id": id_camp,
-                "id_customer": metadata.get("id_customer", metadata.get("contact_id", "")),
-                "tel_customer": metadata.get("tel_customer", metadata.get("phone_number", number)),
-                "originate_ts": datetime.now().astimezone().isoformat(),
-                "originate_timeout": business_timeout,
-                "local_cancel": False,
-            }
-            if related_call_id:
-                stored_meta["related_call_id"] = related_call_id
-            callid = metadata.get("callid") or metadata.get("uniqueid") or related_call_id
-            if callid:
-                stored_meta["callid"] = str(callid)
+        if self.pending_dial_store and pstn_channel_id != pre_channel_id:
+            self.pending_dial_store.pop(pre_channel_id)
             self.pending_dial_store.register(pstn_channel_id, stored_meta)
 
         if self.pstn_ring_timer:
@@ -548,7 +587,52 @@ class CallActionService:
 
         self.logger.info(f"✅ Canal PSTN creado: {pstn_channel_id}")
         return pstn_channel_id
-    
+
+    def _create_and_dial_pstn(
+        self,
+        endpoint: str,
+        caller_id: Optional[str],
+        app_args: Optional[str],
+        timeout: int,
+        channel_id: str,
+    ) -> Dict[str, Any]:
+        """
+        Create en Stasis y luego dial. Si el dial falla, cuelga el canal creado.
+        """
+        created = self.ari_client.create_stasis_channel_op(
+            endpoint=endpoint,
+            app=self.config["ARI_APP"],
+            app_args=app_args,
+            channel_id=channel_id,
+        )
+        if not created.get("ok"):
+            return created
+
+        data = created.get("data") or {}
+        created_id = data.get("id") or channel_id
+        dialed = self.ari_client.dial_channel_op(
+            created_id,
+            caller=caller_id,
+            timeout=timeout,
+        )
+        if dialed.get("ok"):
+            return created
+
+        self.logger.error(
+            "Dial de early media falló para %s: %s",
+            created_id,
+            dialed.get("error"),
+        )
+        try:
+            self.ari_client.hangup_channel_op(created_id)
+        except Exception as exc:
+            self.logger.warning(
+                "No se pudo colgar %s tras fallo de dial: %s",
+                created_id,
+                exc,
+            )
+        return dialed
+
     def dial_agent(
         self,
         agent_id: str,
@@ -689,6 +773,9 @@ class CallActionService:
         
         call_type = str(metadata.get('call_type', CallType.MANUAL_ID))  # Default: "1" para manual
         agent_id = str(metadata.get('agent_id', metadata.get('id_agent', '')))
+        # Origin SIP para el softphone: inbound → "IN" (ringing); no forzar MANUAL
+        # (MANUAL implica click2call → auto-attend siempre).
+        origin = metadata.get("origin")
         
         # CallerId pierna agente: phone_number o tel_customer (ANI en SIP INVITE)
         caller_id = phone_number or ''
@@ -701,7 +788,7 @@ class CallActionService:
             phone_number=phone_number,
             call_type=call_type,
             agent_id=agent_id,
-            origin="MANUAL"
+            origin=origin,
         )
         
         # Construir appArgs reutilizando helper común. Excluimos claves que ya están
@@ -721,7 +808,27 @@ class CallActionService:
             f"(timeout={timeout_value}s, related_call_id={related_call_id}, "
             f"callid={callid}, agent_id={agent_id})"
         )
-        
+
+        # Pre-registrar metadata en pending_dial_store cuando viene channel_id
+        # (p. ej. DistributionService genera UUID antes del originate): el evento
+        # ARI Dial (RINGING/ANSWER con auto-answer) puede llegar mientras
+        # originate_channel_op sigue bloqueado esperando el response HTTP.
+        call_type_raw = metadata.get("call_type") or metadata.get("id_calltype")
+        is_dialer_agent_leg = call_type_raw in (2, "2", CallType.DIALER_ID)
+        stored_meta = None
+        if self.pending_dial_store and is_dialer_agent_leg:
+            stored_meta = {
+                "call_type": call_type_raw,
+                "channel_type": ChannelType.TO_AGENT.value,
+                "id_camp": id_campaign,
+                "id_customer": id_customer,
+                "tel_customer": phone_number,
+                "callid": callid,
+                "uniqueid": uniqueid_tecnico or callid,
+            }
+            if channel_id:
+                self.pending_dial_store.register(channel_id, stored_meta)
+
         result = self.ari_client.originate_channel_op(
             endpoint=endpoint,
             app=self.config['ARI_APP'],
@@ -737,6 +844,8 @@ class CallActionService:
                 "❌ Error crítico al originar hacia agente con headers después de reintentos: %s",
                 result.get("error"),
             )
+            if self.pending_dial_store and channel_id and is_dialer_agent_leg:
+                self.pending_dial_store.pop(channel_id)
             return None
 
         data = result.get("data") or {}
@@ -746,6 +855,8 @@ class CallActionService:
                 "❌ Respuesta inválida de ARI al originar hacia agente con headers, falta 'id': %s",
                 data,
             )
+            if self.pending_dial_store and channel_id and is_dialer_agent_leg:
+                self.pending_dial_store.pop(channel_id)
             return None
 
         if channel_id and agent_channel_id != channel_id:
@@ -755,22 +866,13 @@ class CallActionService:
                 channel_id,
                 agent_channel_id,
             )
+            if self.pending_dial_store and is_dialer_agent_leg:
+                self.pending_dial_store.pop(channel_id)
 
-        # Registrar metadata para LegacyEventForwarder: eventos Dial de la pierna agente
-        # (call_type=2 DIALER) para que se reenvíen a process-event con call_type=to_agent.
-        if self.pending_dial_store:
-            call_type_raw = metadata.get("call_type") or metadata.get("id_calltype")
-            if call_type_raw in (2, "2", CallType.DIALER_ID):
-                stored_meta = {
-                    "call_type": call_type_raw,
-                    "channel_type": ChannelType.TO_AGENT.value,
-                    "id_camp": id_campaign,
-                    "id_customer": id_customer,
-                    "tel_customer": phone_number,
-                    "callid": callid,
-                    "uniqueid": uniqueid_tecnico or callid,
-                }
-                self.pending_dial_store.register(agent_channel_id, stored_meta)
+        # Registrar metadata para LegacyEventForwarder si no tenía channel_id previo
+        # o si ARI devolvió un id distinto.
+        if self.pending_dial_store and stored_meta is not None and agent_channel_id != channel_id:
+            self.pending_dial_store.register(agent_channel_id, stored_meta)
 
         self.logger.info(
             f"✅ Canal de agente creado con headers: {agent_channel_id}"
@@ -834,6 +936,21 @@ class CallActionService:
             f"(timeout={timeout_value}s, related_call_id={related_call_id})"
         )
 
+        # Registrar antes del originate: el Dial ARI (protocol_id / Call-ID SIP) llega
+        # mientras originate_channel_op sigue bloqueado, antes del register post-originate
+        # y antes de que el contexto tenga agent_attempt_channel.
+        stored_meta = {
+            "call_type": call_type,
+            "channel_type": ChannelType.TO_AGENT.value,
+            "id_camp": id_campaign,
+            "id_customer": id_customer,
+            "tel_customer": phone_number,
+            "related_call_id": related_call_id,
+            "agentic_leg": "1",
+        }
+        if self.pending_dial_store and channel_id:
+            self.pending_dial_store.register(channel_id, stored_meta)
+
         result = self.ari_client.originate_channel_op(
             endpoint=endpoint,
             app=self.config["ARI_APP"],
@@ -849,6 +966,8 @@ class CallActionService:
                 "❌ Error crítico al originar hacia voicebot: %s",
                 result.get("error"),
             )
+            if self.pending_dial_store and channel_id:
+                self.pending_dial_store.pop(channel_id)
             return None
 
         data = result.get("data") or {}
@@ -858,6 +977,8 @@ class CallActionService:
                 "❌ Respuesta inválida de ARI al originar hacia voicebot, falta 'id': %s",
                 data,
             )
+            if self.pending_dial_store and channel_id:
+                self.pending_dial_store.pop(channel_id)
             return None
 
         if channel_id and agent_channel_id != channel_id:
@@ -867,18 +988,136 @@ class CallActionService:
                 channel_id,
                 agent_channel_id,
             )
+            if self.pending_dial_store and channel_id:
+                self.pending_dial_store.pop(channel_id)
 
         if self.pending_dial_store:
-            stored_meta = {
-                "call_type": call_type,
-                "channel_type": ChannelType.TO_AGENT.value,
-                "id_camp": id_campaign,
-                "id_customer": id_customer,
-                "tel_customer": phone_number,
-            }
             self.pending_dial_store.register(agent_channel_id, stored_meta)
 
         self.logger.info("✅ Canal voicebot creado con headers: %s", agent_channel_id)
+        return agent_channel_id
+
+    def dial_voicebot_audiosocket(
+        self,
+        related_call_id: str,
+        metadata: Dict[str, Any],
+        channel_id: Optional[str] = None,
+        audiosocket_addr: Optional[str] = None,
+    ) -> Optional[str]:
+        """
+        Crea la pierna voicebot vía ARI externalMedia (encapsulation=audiosocket).
+
+        Las variables de negocio no caben en el protocolo AudioSocket: se publican
+        en Redis ``OML:AUDIOSOCKET:{uuid}`` para que audiosocket.py las inyecte en CES.
+        Registra ``pending_dial_store`` (externalMedia no envía appArgs en StasisStart).
+        """
+        addr = (audiosocket_addr or getattr(settings, "AUDIOSOCKET_ADDR", "") or "").strip()
+        if not addr:
+            self.logger.error("dial_voicebot_audiosocket: AUDIOSOCKET_ADDR vacío")
+            return None
+
+        session_uuid = str(uuid.uuid4())
+        agent_channel_id = channel_id or str(uuid.uuid4())
+
+        id_customer = str(metadata.get("id_customer", "") or "")
+        id_campaign = str(metadata.get("id_camp", metadata.get("id_campaign", "")) or "")
+        phone_number = str(metadata.get("phone_number", metadata.get("tel_customer", "")) or "")
+        callid = str(metadata.get("callid") or related_call_id or "")
+        agent_id = str(metadata.get("agent_id", metadata.get("id_agent", "")) or "")
+        call_type = str(metadata.get("call_type", CallType.INBOUND_ID))
+
+        session_payload = {
+            "X-OML-Contact-ID": id_customer,
+            "X-OML-Campaign-ID": id_campaign,
+            "X-OML-Call-ID": callid,
+            "phone_number": phone_number,
+            "agent_id": agent_id,
+        }
+
+        if self.redis_client:
+            try:
+                key = RedisKeys.audiosocket_session(session_uuid)
+                ttl = int(getattr(settings, "AUDIOSOCKET_SESSION_TTL_SEC", 3600))
+                self.redis_client.setex(key, ttl, json.dumps(session_payload))
+            except Exception as e:
+                self.logger.warning(
+                    "dial_voicebot_audiosocket: no se pudo escribir sesión Redis uuid=%s: %s",
+                    session_uuid,
+                    e,
+                )
+        else:
+            self.logger.warning(
+                "dial_voicebot_audiosocket: sin redis_client; sesión %s no publicada",
+                session_uuid,
+            )
+
+        stored_meta = {
+            "call_type": call_type,
+            "channel_type": ChannelType.TO_AGENT.value,
+            "id_camp": id_campaign,
+            "id_customer": id_customer,
+            "tel_customer": phone_number,
+            "related_call_id": related_call_id,
+            "callid": callid,
+            "agentic_leg": "1",
+            "voicebot_transport": "audiosocket",
+            "audiosocket_uuid": session_uuid,
+        }
+        if self.pending_dial_store:
+            self.pending_dial_store.register(agent_channel_id, stored_meta)
+
+        self.logger.info(
+            "🚀 externalMedia AudioSocket hacia %s (uuid=%s, related_call_id=%s, channel_id=%s)",
+            addr,
+            session_uuid,
+            related_call_id,
+            agent_channel_id,
+        )
+
+        try:
+            data = self.ari_client.external_media(
+                external_host=addr,
+                app=self.config["ARI_APP"],
+                format="slin",
+                direction="both",
+                encapsulation="audiosocket",
+                transport="tcp",
+                data=session_uuid,
+                channel_id=agent_channel_id,
+            )
+        except Exception as e:
+            self.logger.error(
+                "❌ Error externalMedia AudioSocket: %s",
+                e,
+                exc_info=True,
+            )
+            if self.pending_dial_store:
+                self.pending_dial_store.pop(agent_channel_id)
+            return None
+
+        if not data or not isinstance(data, dict) or not data.get("id"):
+            self.logger.error(
+                "❌ Respuesta inválida de ARI externalMedia AudioSocket: %s",
+                data,
+            )
+            if self.pending_dial_store:
+                self.pending_dial_store.pop(agent_channel_id)
+            return None
+
+        returned_id = data.get("id")
+        if returned_id != agent_channel_id:
+            self.logger.warning(
+                "dial_voicebot_audiosocket: ARI devolvió id distinto "
+                "(solicitado=%s, recibido=%s)",
+                agent_channel_id,
+                returned_id,
+            )
+            if self.pending_dial_store:
+                self.pending_dial_store.pop(agent_channel_id)
+                self.pending_dial_store.register(returned_id, stored_meta)
+            agent_channel_id = returned_id
+
+        self.logger.info("✅ Canal voicebot AudioSocket creado: %s", agent_channel_id)
         return agent_channel_id
 
     def enqueue_call(self, call_id: str, campaign_id: int) -> bool:

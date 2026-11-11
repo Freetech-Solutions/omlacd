@@ -5,6 +5,9 @@ import logging
 import json
 import ssl
 import os
+import pwd
+import grp
+import re
 import datetime
 import gc
 import base64
@@ -101,12 +104,57 @@ class ARI:
         
         return all_success
 
+    def unload_module(self, module_name):
+        """DELETE /ari/asterisk/modules/{moduleName} en todos los hosts."""
+        route = f'asterisk/modules/{module_name}'
+        all_success = True
+        for host in self.hosts:
+            uri = f'http://{host}:{self.port}/ari/{route}'
+            logging.info(f"URI DELETE: {uri}")
+            try:
+                response = requests.delete(uri, auth=(self.user, self.password))
+                if response.status_code in (200, 204):
+                    logging.info(f"Module {module_name} unloaded successfully on {host}.")
+                else:
+                    logging.error(
+                        f"Failed to unload module {module_name} on {host}: "
+                        f"{response.status_code}"
+                    )
+                    all_success = False
+            except Exception as e:
+                logging.error(f"Error unloading module {module_name} on {host}: {e}")
+                all_success = False
+        return all_success
+
+    def load_module(self, module_name):
+        """POST /ari/asterisk/modules/{moduleName} en todos los hosts."""
+        route = f'asterisk/modules/{module_name}'
+        all_success = True
+        for host in self.hosts:
+            uri = f'http://{host}:{self.port}/ari/{route}'
+            logging.info(f"URI POST: {uri}")
+            try:
+                response = requests.post(uri, auth=(self.user, self.password))
+                if response.status_code in (200, 204):
+                    logging.info(f"Module {module_name} loaded successfully on {host}.")
+                else:
+                    logging.error(
+                        f"Failed to load module {module_name} on {host}: "
+                        f"{response.status_code}"
+                    )
+                    all_success = False
+            except Exception as e:
+                logging.error(f"Error loading module {module_name} on {host}: {e}")
+                all_success = False
+        return all_success
+
 OML_SERVER = os.getenv('OMNILEADS_HOSTNAME') or 'localhost'
 WSURL = f'wss://{OML_SERVER}/consumers/stream/asterisk/conf/updater'
 CONF_FILES_PATH = '/home/omnileads/astconf/'
 ASTERISK_SOUND_FILES = '/home/omnileads/sounds/'
-CUSTOM_AUDIO_FILES_PATH = f'{ASTERISK_SOUND_FILES}/oml/'
-MOH_AUDIO_FILES_PATH = f'{ASTERISK_SOUND_FILES}/oml/'
+CUSTOM_AUDIO_FILES_PATH = f'{ASTERISK_SOUND_FILES}oml/'
+MOH_AUDIO_FILES_PATH = f'{ASTERISK_SOUND_FILES}moh/'
+OML_SOUNDS_OWNER = 'omnileads'
 
 class WebsocketClient(object):
     def __init__(self, ws_url, logger):
@@ -129,7 +177,7 @@ class WebsocketClient(object):
         CONN_LOG = 'Websocket connected'
         self.logger.info(self._log_msg(CONN_LOG))
 
-    def on_close(self, ws):
+    def on_close(self, ws, close_status_code=None, close_msg=None):
         CONN_LOG = 'Websocket connection closed'
         self.logger.error(self._log_msg(CONN_LOG))
 
@@ -178,38 +226,146 @@ class RegenerarConfiguracion(object):
 
     def procesa_stream(self, stream_data):
         lista_data = self._json_string_a_lista(stream_data)
-        audio_custom_modificado = False
-        self.logger.info(f'--- Procesando mensaje ---')
-        comandos = []
+        self.logger.info('--- Procesando mensaje ---')
+
+        # Audios/dirs primero, confs después: el reload MOH corre con WAV en disco.
+        conf_files = []
+        media_ops = []
         for archivo in lista_data:
             tipo_archivo = archivo['type']
+            self.logger.info(f'  -- Clasificando archivo de tipo: {tipo_archivo}')
+            if tipo_archivo == 'CONF_FILE':
+                conf_files.append(archivo)
+            else:
+                media_ops.append(archivo)
+
+        moh_reload_needed = False
+        comandos = []
+
+        for archivo in media_ops:
+            tipo_archivo = archivo['type']
             self.logger.info(f'  -- Procesando archivo de tipo: {tipo_archivo}')
-            if archivo['type'] == 'CONF_FILE':
-                if archivo['archivo'] in self.IGNORED_CONF_FILES:
-                    self.logger.info(
-                        f'  -- Se omite archivo deprecado: {archivo["archivo"]}'
-                    )
-                    continue
-                if self._escribe_archivo_conf(archivo):
-                    comando = self._get_comando_regeneracion_asterisk(archivo['archivo'])
-                    if comando and comando not in comandos:
-                        comandos.append(comando)
-                else:
-                    self.logger.error('ERROR')
-            elif archivo['type'] == 'AUDIO_CUSTOM' and archivo['action'] == 'COPY':
+            if tipo_archivo == 'AUDIO_CUSTOM' and archivo['action'] == 'COPY':
                 self._escribe_audio_custom(archivo)
-                audio_custom_modificado = True
-            elif archivo['type'] == 'AUDIO_CUSTOM' and archivo['action'] == 'DELETE':
+                moh_reload_needed = True
+            elif tipo_archivo == 'AUDIO_CUSTOM' and archivo['action'] == 'DELETE':
                 self._delete_audio_custom(archivo)
-                audio_custom_modificado = True
-            elif archivo['type'] == 'ASTERISK_SOUNDS' and archivo['action'] == 'COPY':
+                moh_reload_needed = True
+            elif tipo_archivo == 'ASTERISK_SOUNDS' and archivo['action'] == 'COPY':
                 self._escribe_asterisk_sounds(archivo)
-            elif archivo['type'] == 'ASTERISK_PLAY_LIST_DIR' and archivo['action'] == 'DELETE':
+            elif tipo_archivo == 'ASTERISK_PLAY_LIST_DIR' and archivo['action'] == 'DELETE':
                 self._delete_playlist_files(archivo)
+                moh_reload_needed = True
+
+        for archivo in conf_files:
+            if archivo['archivo'] in self.IGNORED_CONF_FILES:
+                self.logger.info(
+                    f'  -- Se omite archivo deprecado: {archivo["archivo"]}'
+                )
+                continue
+            self.logger.info('  -- Procesando archivo de tipo: CONF_FILE')
+            if self._escribe_archivo_conf(archivo):
+                comando = self._get_comando_regeneracion_asterisk(archivo['archivo'])
+                if comando == self.RELOAD_RES_MOH:
+                    moh_reload_needed = True
+                elif comando and comando not in comandos:
+                    comandos.append(comando)
+            else:
+                self.logger.error('ERROR')
 
         self._ejecutar_comandos(comandos)
-        if audio_custom_modificado:
-            self.ari.reload_module(self.RELOAD_RES_MOH)
+        if moh_reload_needed:
+            self._reload_moh_module()
+
+    def _ensure_moh_directories_from_conf(self, content):
+        """
+        Crea dirs referenciados por directory= en oml_moh.conf antes del reload.
+        Paths relativos sounds/... viven en el volume compartido ASTERISK_SOUND_FILES.
+        """
+        if not content:
+            return
+        for match in re.finditer(
+            r'^\s*directory\s*=\s*(\S+)', content, flags=re.MULTILINE | re.IGNORECASE
+        ):
+            raw = match.group(1).strip().strip('"').strip("'")
+            if not raw:
+                continue
+            local_path = self._resolve_moh_directory_on_worker(raw)
+            if not local_path:
+                continue
+            try:
+                os.makedirs(local_path, exist_ok=True)
+                self._chown_omnileads(local_path)
+                self.logger.info(f'  -- MOH directory ensured: {local_path}')
+            except OSError as e:
+                self.logger.error(f'  -- Error creating MOH directory {local_path}: {e}')
+
+    def _resolve_moh_directory_on_worker(self, directory_value):
+        """
+        Mapea directory= del conf Asterisk al path del conf-generator.
+        sounds/moh/X -> {ASTERISK_SOUND_FILES}moh/X
+        """
+        path = directory_value.lstrip('./')
+        if path.startswith('sounds/'):
+            return os.path.join(ASTERISK_SOUND_FILES, path[len('sounds/'):])
+        if path.startswith('/var/lib/asterisk/sounds/'):
+            rel = path[len('/var/lib/asterisk/sounds/'):]
+            return os.path.join(ASTERISK_SOUND_FILES, rel)
+        # moh/... estático bajo /var/lib/asterisk/moh (no está en este volume)
+        self.logger.debug(
+            f'  -- Skipping MOH dir ensure for non-sounds path: {directory_value}'
+        )
+        return None
+
+    def _reload_moh_module(self):
+        """
+        Unload+load de res_musiconhold.so.
+        Un module reload no reincorpora clases que fallaron al cargar (dir ausente).
+        """
+        module = self.RELOAD_RES_MOH
+        self.logger.info(f'  -- Ejecutando unload+load: {module}')
+        unloaded = self.ari.unload_module(module)
+        if not unloaded:
+            self.logger.warning(
+                f'  -- unload {module} falló; intentando reload como fallback'
+            )
+            self._ejecutar_comando(module)
+            return
+        loaded = self.ari.load_module(module)
+        if loaded:
+            self.logger.info(f'  -- {module} unload+load exitoso')
+        else:
+            self.logger.error(
+                f'  -- load {module} falló tras unload; intentando reload'
+            )
+            self._ejecutar_comando(module)
+
+    def _chown_omnileads(self, path):
+        """Si corre como root, asigna ownership omnileads al path tocado."""
+        if not path or not os.path.exists(path):
+            return
+        if hasattr(os, 'geteuid') and os.geteuid() != 0:
+            return
+        try:
+            uid = pwd.getpwnam(OML_SOUNDS_OWNER).pw_uid
+            gid = grp.getgrnam(OML_SOUNDS_OWNER).gr_gid
+        except KeyError:
+            self.logger.warning(
+                f'  User/group {OML_SOUNDS_OWNER} not found; skipping chown of {path}'
+            )
+            return
+        try:
+            if os.path.isdir(path):
+                for root, dirs, files in os.walk(path):
+                    os.chown(root, uid, gid)
+                    for name in dirs:
+                        os.chown(os.path.join(root, name), uid, gid)
+                    for name in files:
+                        os.chown(os.path.join(root, name), uid, gid)
+            else:
+                os.chown(path, uid, gid)
+        except OSError as e:
+            self.logger.warning(f'  chown failed for {path}: {e}')
 
     def _escribe_archivo_conf(self, archivo_info):
         nombre_archivo = archivo_info['archivo']
@@ -218,12 +374,15 @@ class RegenerarConfiguracion(object):
             file = open(f'{CONF_FILES_PATH}{nombre_archivo}', 'w')
             file.write(contenido_archivo)
             file.close()
+            if nombre_archivo == 'oml_moh.conf':
+                self._ensure_moh_directories_from_conf(contenido_archivo)
             return True
         except Exception as e:
             self.logger.error(f'Error creating file: {nombre_archivo} {e}')
             return False
 
     def _escribe_audio_custom(self, archivo_info):
+        nombre_archivo = None
         try:
             folder, nombre_archivo = os.path.split(archivo_info['archivo'])
             contenido_encoded = str(archivo_info['content'])
@@ -233,14 +392,17 @@ class RegenerarConfiguracion(object):
             else:
                 file_path = f'{ASTERISK_SOUND_FILES}{folder}/'
             os.makedirs(file_path, exist_ok=True)
-            f = open(f'{file_path}{nombre_archivo}', 'wb')
+            full_path = f'{file_path}{nombre_archivo}'
+            f = open(full_path, 'wb')
             f.write(contenido_bin)
             f.close()
+            self._chown_omnileads(file_path.rstrip('/'))
             self.logger.info(f'  File: {nombre_archivo} copied')
         except Exception as e:
             self.logger.error(f'  Error creating file: {nombre_archivo} {e}')
 
     def _escribe_asterisk_sounds(self, archivo_info):
+        language = None
         try:
             nombre_archivo = archivo_info['archivo']
             contenido_encoded = str(archivo_info['content'])
@@ -255,14 +417,16 @@ class RegenerarConfiguracion(object):
             tar.extractall(files_path)
             tar.close()
             os.remove(f'{files_path}/{nombre_archivo}')
+            self._chown_omnileads(files_path)
             self.logger.info(f'Sounds of language : {language} copied')
         except Exception as e:
             self.logger.error(f'Error creating language files: {language} {e}')
 
     def _delete_audio_custom(self, archivo_info):
+        nombre_archivo = None
         try:
             folder, nombre_archivo = os.path.split(archivo_info['archivo'])
-            if folder is None:
+            if not folder:
                 file_path = f'{CUSTOM_AUDIO_FILES_PATH}'
             else:
                 file_path = f'{ASTERISK_SOUND_FILES}{folder}/'
@@ -272,6 +436,7 @@ class RegenerarConfiguracion(object):
             self.logger.error(f'Error deleting file: {nombre_archivo} {e}')
 
     def _delete_playlist_files(self, archivo_info):
+        playlist = None
         try:
             playlist = archivo_info['archivo']
             playlist_path = f'{MOH_AUDIO_FILES_PATH}{playlist}'

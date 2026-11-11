@@ -42,6 +42,7 @@ if "requests" not in sys.modules:
     _req_exc.RequestException = _RequestException
     _req_adapters.HTTPAdapter = _HTTPAdapter
     _req.exceptions = _req_exc
+    _req.Response = type("Response", (), {})
     sys.modules["requests"] = _req
     sys.modules["requests.exceptions"] = _req_exc
     sys.modules["requests.adapters"] = _req_adapters
@@ -217,6 +218,51 @@ class TestDistributionQueueTimeoutSuppress(unittest.TestCase):
             uniqueid="uq2",
         )
         state_store.mark_call_ended_atomic.assert_not_called()
+
+    def test_on_queue_timeout_callback_survives_loop_finally_race(self):
+        """
+        El finally del distribution loop hace pop del callback al salir.
+        Si eso corre después de stop_event pero antes del pop tardío, se perdía
+        el acusatorio al dialer. El callback debe capturarse al inicio.
+        """
+        ctx = self.CallContext(
+            call_id="c1",
+            type=self.CallType.DIALER,
+            pstn_channel="pstn-1",
+            bridge_id="br-1",
+            agent_attempt_channel=None,
+        )
+        state_store = MagicMock()
+        state_store.lock.return_value.__enter__.return_value = None
+        state_store.lock.return_value.__exit__.return_value = False
+        state_store.get.return_value = ctx
+        state_store.mark_call_ended_atomic.return_value = True
+
+        svc = self._make_service(state_store)
+        called = []
+
+        def _cb(cid, ch):
+            called.append((cid, ch))
+
+        svc._on_queue_timeout_callbacks["c1"] = _cb
+
+        orig_get = svc._get_or_create_call_events
+
+        def steal_cb_like_loop_finally(call_id):
+            # Simula el finally del loop despertado por stop_event.
+            with svc._on_queue_timeout_callbacks_lock:
+                svc._on_queue_timeout_callbacks.pop(call_id, None)
+            return orig_get(call_id)
+
+        svc._get_or_create_call_events = steal_cb_like_loop_finally
+        svc._on_queue_timeout(
+            call_id="c1",
+            pstn_channel_id="pstn-1",
+            bridge_id="br-1",
+            id_camp="14",
+            uniqueid="uq1",
+        )
+        self.assertEqual(called, [("c1", "pstn-1")])
 
 
 if __name__ == "__main__":

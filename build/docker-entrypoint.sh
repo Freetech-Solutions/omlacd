@@ -51,6 +51,9 @@ ACD_SIP_AGENT_BIND_PORT=${ACD_SIP_AGENT_BIND_PORT:-5160}
 ACD_SIP_PUBLIC_BIND_ADDR=${ACD_SIP_PUBLIC_BIND_ADDR:-0.0.0.0}
 ACD_SIP_PUBLIC_BIND_PORT=${ACD_SIP_PUBLIC_BIND_PORT:-5070}
 
+# Asterisk HTTP/ARI bind (default: all interfaces; Ansible sets omni_ip_lan)
+ACD_HTTP_BIND_ADDR=${ACD_HTTP_BIND_ADDR:-0.0.0.0}
+
 # Scale tuning defaults
 STASIS_INITIAL_SIZE=${STASIS_INITIAL_SIZE:-10}
 STASIS_IDLE_TIMEOUT_SEC=${STASIS_IDLE_TIMEOUT_SEC:-120}
@@ -167,6 +170,11 @@ configure_pjsip_bind_addresses() {
   sed -i -E "/^\[trunk-transport-tls\]/,/^\[/ s/^(bind=)[^:]+:[0-9]+/\1${ACD_SIP_PUBLIC_BIND_ADDR}:${public_tls_port}/" /etc/asterisk/oml_pjsip.conf
 }
 
+configure_ari_bind_addresses() {
+  echo "**[omlacd] Configuring ARI HTTP bind ${ACD_HTTP_BIND_ADDR}"
+  sed -i -E "s/^(bindaddr=).*/\1${ACD_HTTP_BIND_ADDR}/" /etc/asterisk/oml_http.conf
+}
+
 configure_outbound_proxy() {
   echo "**[omlacd] Configuring outbound proxy"
   echo "outbound_proxy=sip:${VOIP_PROXY_HOST}:${VOIP_PROXY_PORT}\;lr" >> /etc/asterisk/oml_pjsip_wizard.conf
@@ -240,6 +248,7 @@ main() {
     configure_pjsip_bind_addresses
     configure_outbound_proxy
     configure_webrtc_proxy
+    configure_ari_bind_addresses
 
     start_asterisk "$@"
   else

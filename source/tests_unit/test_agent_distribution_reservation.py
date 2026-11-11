@@ -20,12 +20,18 @@ sys.modules.setdefault("urllib3.util", MagicMock())
 sys.modules.setdefault("urllib3.util.retry", MagicMock())
 import types
 
-_mock_redis_pkg = types.ModuleType("redis")
-_mock_redis_exceptions = types.ModuleType("redis.exceptions")
-_mock_redis_exceptions.RedisError = Exception
-_mock_redis_pkg.exceptions = _mock_redis_exceptions
-sys.modules["redis"] = _mock_redis_pkg
-sys.modules["redis.exceptions"] = _mock_redis_exceptions
+# Solo stubear redis si no está instalado. Un ModuleType vacío sin Redis
+# rompe la recolección de otros tests (AttributeError: redis.Redis).
+try:
+    import redis  # noqa: F401
+except ImportError:
+    _mock_redis_pkg = types.ModuleType("redis")
+    _mock_redis_exceptions = types.ModuleType("redis.exceptions")
+    _mock_redis_exceptions.RedisError = Exception
+    _mock_redis_pkg.exceptions = _mock_redis_exceptions
+    _mock_redis_pkg.Redis = MagicMock
+    sys.modules["redis"] = _mock_redis_pkg
+    sys.modules["redis.exceptions"] = _mock_redis_exceptions
 sys.modules.setdefault("ari_manager", MagicMock())
 sys.modules.setdefault("queue_events", MagicMock())
 sys.modules.setdefault("services.call_manager", MagicMock())
@@ -48,20 +54,34 @@ if not USE_REAL_PYDANTIC:
     _mock_pydantic.BaseModel = RealBaseModel
     sys.modules["pydantic"] = _mock_pydantic
 
-_mock_state = MagicMock()
-_mock_state.CallRegistry = MagicMock()
-_mock_state.CallContext = RealBaseModel
-sys.modules.setdefault("state", _mock_state)
-
+# No poner CallContext = BaseModel en sys.modules['state']: en Pydantic v2
+# BaseModel() no se puede instanciar y contamina toda la suite.
 current_dir = os.path.dirname(os.path.abspath(__file__))
 source_dir = os.path.dirname(current_dir)
 ari_app_dir = os.path.join(source_dir, "ari-app")
 sys.path.insert(0, ari_app_dir)
 
-sys.modules.setdefault("config", MagicMock())
-sys.modules["config"].settings = MagicMock()
-sys.modules["config"].settings.NODE_ID = "test-node"
-sys.modules["config"].settings.AGENT_RESERVATION_MARGIN_SEC = 10
+if "config" not in sys.modules or isinstance(sys.modules.get("config"), MagicMock):
+    # Solo stubear config si aún no hay módulo real cargado.
+    try:
+        import config as _config_check  # noqa: F401
+    except Exception:
+        sys.modules.setdefault("config", MagicMock())
+        sys.modules["config"].settings = MagicMock()
+        sys.modules["config"].settings.NODE_ID = "test-node"
+        sys.modules["config"].settings.AGENT_RESERVATION_MARGIN_SEC = 10
+else:
+    pass
+# Asegurar settings usados por estos tests
+try:
+    from config import settings as _settings
+    if not hasattr(_settings, "AGENT_RESERVATION_MARGIN_SEC"):
+        _settings.AGENT_RESERVATION_MARGIN_SEC = 10
+except Exception:
+    sys.modules.setdefault("config", MagicMock())
+    sys.modules["config"].settings = MagicMock()
+    sys.modules["config"].settings.NODE_ID = "test-node"
+    sys.modules["config"].settings.AGENT_RESERVATION_MARGIN_SEC = 10
 
 from constants import AgentStatus, RedisKeys  # noqa: E402
 from services.agent_status_service import (  # noqa: E402
@@ -144,15 +164,20 @@ class InMemoryReservationRedis:
         raise ValueError(f"Script no soportado en mock: {script[:40]}")
 
     def _reserve(self, keys: list, args: list) -> int:
-        agent_key, lock_key, lease_key = keys
+        agent_key, lock_key, lease_key = keys[0], keys[1], keys[2]
+        cooldown_key = keys[3] if len(keys) > 3 else None
         ready_status, dialing_status, timestamp, call_id, ttl = args
         with self._lock:
             if self.hashes.get(agent_key, {}).get("STATUS") != ready_status:
                 return 0
             if lock_key in self.strings or lease_key in self.strings:
                 return 0
+            if cooldown_key and cooldown_key in self.strings:
+                return 0
             self.strings[lock_key] = call_id
             self.strings[lease_key] = call_id
+            if cooldown_key:
+                self.strings[cooldown_key] = call_id
             self.hashes.setdefault(agent_key, {})
             self.hashes[agent_key].update(
                 {
@@ -164,11 +189,14 @@ class InMemoryReservationRedis:
             return 1
 
     def _release(self, keys: list, args: list) -> int:
-        agent_key, lock_key, lease_key = keys
-        call_id, dialing_status, ready_status, timestamp, restore_flag = args
+        agent_key, lock_key, lease_key = keys[0], keys[1], keys[2]
+        cooldown_key = keys[3] if len(keys) > 3 else None
+        call_id, dialing_status, ready_status, timestamp, restore_flag = args[:5]
+        ringing_status = args[5] if len(args) > 5 else "RINGING"
         with self._lock:
             lock_val = self.strings.get(lock_key)
             lease_val = self.strings.get(lease_key)
+            cool_val = self.strings.get(cooldown_key) if cooldown_key else None
             if lock_val and lock_val != call_id:
                 return 0
             if lease_val and lease_val != call_id:
@@ -177,9 +205,11 @@ class InMemoryReservationRedis:
                 del self.strings[lock_key]
             if lease_val == call_id:
                 del self.strings[lease_key]
+            if cooldown_key and cool_val == call_id:
+                del self.strings[cooldown_key]
             if restore_flag == "1":
                 data = self.hashes.get(agent_key, {})
-                if data.get("STATUS") == dialing_status:
+                if data.get("STATUS") in (dialing_status, ringing_status):
                     callid = data.get("CALLID")
                     if not callid or callid == call_id:
                         data["STATUS"] = ready_status
@@ -188,12 +218,17 @@ class InMemoryReservationRedis:
             return 1
 
     def _revert_stale(self, keys: list, args: list) -> int:
-        agent_key, lock_key, lease_key = keys
-        dialing_status, ready_status, timestamp = args
+        agent_key, lock_key, lease_key = keys[0], keys[1], keys[2]
+        cooldown_key = keys[3] if len(keys) > 3 else None
+        dialing_status, ready_status, timestamp = args[:3]
+        ringing_status = args[3] if len(args) > 3 else "RINGING"
         with self._lock:
-            if self.hashes.get(agent_key, {}).get("STATUS") != dialing_status:
+            status = self.hashes.get(agent_key, {}).get("STATUS")
+            if status not in (dialing_status, ringing_status):
                 return 0
             if lock_key in self.strings or lease_key in self.strings:
+                return 0
+            if cooldown_key and cooldown_key in self.strings:
                 return 0
             self.hashes.setdefault(agent_key, {})
             self.hashes[agent_key]["STATUS"] = ready_status
@@ -286,6 +321,34 @@ class TestAgentStatusServiceReservation(unittest.TestCase):
             AgentStatus.READY.value,
         )
         self.assertIsNone(self.redis.hget(self.agent_key, "CALLID"))
+
+    def test_release_restore_ready_from_ringing(self):
+        """Softphone/Django pisa DIALING→RINGING; release debe volver a READY."""
+        self.service.try_reserve_for_distribution(self.agent_id, self.call_id, 25)
+        self.redis.hset(self.agent_key, mapping={"STATUS": "RINGING"})
+        self.service.release_distribution_reservation(
+            self.agent_id, self.call_id, restore_ready=True
+        )
+        self.assertEqual(
+            self.redis.hget(self.agent_key, "STATUS"),
+            AgentStatus.READY.value,
+        )
+        self.assertIsNone(self.redis.get(RedisKeys.agent_lock(str(self.agent_id))))
+        self.assertIsNone(
+            self.redis.get(RedisKeys.agent_reservation_lease(str(self.agent_id)))
+        )
+
+    def test_revert_stale_ringing_when_no_lock_or_lease(self):
+        self.redis.hset(
+            self.agent_key,
+            mapping={"STATUS": "RINGING", "CALLID": "old-call"},
+        )
+        ok = self.service.revert_stale_dialing(self.agent_id)
+        self.assertTrue(ok)
+        self.assertEqual(
+            self.redis.hget(self.agent_key, "STATUS"),
+            AgentStatus.READY.value,
+        )
 
 
 class TestDistributionServiceReservation(unittest.TestCase):

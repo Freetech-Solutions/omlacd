@@ -15,6 +15,7 @@ import sys
 # Agregar el directorio ari-app al path para importar constants
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'ari-app'))
 from constants import HangupCause, CallType
+from event_stream import STREAM_CALLEVENTS, xadd_event
 
 # --- CONFIGURACIÓN LOKI REMOVIDA (Uso de JSON stdout) ---
 
@@ -64,7 +65,6 @@ _table_columns_cache = {}
 CALLDATA_CAMP_KEY = 'OML:CALLDATA:CAMP:{0}'
 CALLDATA_WAIT_KEY = 'OML:CALLDATA:WAIT-TIME:CAMP:{0}'
 CALLDATA_EXIT_ABANDON_TIME_KEY = 'OML:CALLDATA:EXIT_ABANDON-TIME:CAMP:{0}'
-CALLEVENTS_CHANNEL = 'OML:CHANNEL:CALLEVENTS'
 AGENTDATA_AGENT_KEY = 'OML:AGENTDATA:AGENT:{0}'
 
 # Mapeos de strings a enteros según lógica de negocio
@@ -89,14 +89,17 @@ TIPO_CAMPANA_MAPPING = {
 INITIATION_AGENT = 'AGENT'
 INITIATION_DIALER = 'DIALER'
 INITIATION_BOT = 'BOT'
+INITIATION_EXTERNAL = 'EXTERNAL'
 
 
 def _initiation_method_from_message(t_llamada, t_campana, agent_duration, atendida_por_voicebot):
     """
-    Deriva initiation_method (AGENT, DIALER, BOT) para interactions_summary.
+    Deriva initiation_method (AGENT, DIALER, BOT, EXTERNAL) para interactions_summary.
+    Quién inició la interacción (no quién contestó):
+    - EXTERNAL: inbound (leg PSTN/cliente).
     - DIALER: campaña dialer o progressive (tipo 2 o 5).
-    - AGENT: manual, preview, o inbound atendida por agente.
-    - BOT: inbound atendida solo por voicebot (sin tiempo de agente).
+    - AGENT: manual o preview.
+    - BOT: solo si el bot origina (no se deduce de inbound atendido por voicebot).
     """
     tipo = t_llamada if (t_llamada not in (None, 0)) else t_campana
     if tipo in (CallType.DIALER_ID, CallType.PROGRESSIVE_ID):
@@ -104,9 +107,7 @@ def _initiation_method_from_message(t_llamada, t_campana, agent_duration, atendi
     if tipo in (CallType.MANUAL_ID, CallType.PREVIEW_ID):
         return INITIATION_AGENT
     if tipo == CallType.INBOUND_ID:
-        if atendida_por_voicebot and (agent_duration or 0) <= 0:
-            return INITIATION_BOT
-        return INITIATION_AGENT
+        return INITIATION_EXTERNAL
     return None
 
 
@@ -356,13 +357,33 @@ def log_transfer_to_postgres(message):
         if target_agent_id is None and target_campaign_id is None and numero_extra:
             destination_external_endpoint = numero_extra[:128]
 
-        # destination_type: AGENT, CAMPAIGN, EXTERNAL
-        if target_agent_id is not None:
+        # destination_type: preferir el del mensaje (OVERFLOW→IVR/HANGUP/SURVEY/…).
+        # Fallback legacy: AGENT / CAMPAIGN / EXTERNAL según target_* / numero_extra.
+        _DIALPLAN_OVERFLOW_TYPES = frozenset(
+            {"IVR", "HANGUP", "SURVEY", "TIME_CONDITION"}
+        )
+        explicit_dest_type = (message.get("destination_type") or "").strip().upper()
+
+        if explicit_dest_type in _DIALPLAN_OVERFLOW_TYPES:
+            destination_type = explicit_dest_type
+            # numero_extra FAILOVERDST "tipo,id" → destination_id = id objeto
+            dst_obj_id = None
+            if numero_extra and "," in numero_extra:
+                dst_obj_id = numero_extra.split(",", 1)[1].strip()
+            destination_id = (dst_obj_id or numero_extra or explicit_dest_type)[:128]
+            destination_external_endpoint = (
+                numero_extra[:128] if numero_extra else None
+            )
+            target_agent_id = None
+            target_campaign_id = None
+        elif target_agent_id is not None:
             destination_type = "AGENT"
             destination_id = str(target_agent_id)[:128]
-        elif target_campaign_id is not None:
+        elif target_campaign_id is not None or explicit_dest_type == "CAMPAIGN":
             destination_type = "CAMPAIGN"
-            destination_id = str(target_campaign_id)[:128]
+            destination_id = str(target_campaign_id)[:128] if target_campaign_id is not None else (
+                (numero_extra or "unknown")[:128]
+            )
         elif destination_external_endpoint:
             destination_type = "EXTERNAL"
             destination_id = destination_external_endpoint
@@ -531,9 +552,11 @@ def insert_llamada_resumen(message):
             agent_duration = clean_float(msg_agent) or 0.0
         else:
             agent_duration = max(0.0, total_duration - bridge_wait_time)
-        # Usar initiation_method del payload si es válido; si no, derivar de tipo y voicebot
+        # Usar initiation_method del payload si es válido; si no, derivar de tipo
         _from_msg = message.get("initiation_method")
-        if _from_msg in (INITIATION_AGENT, INITIATION_DIALER, INITIATION_BOT):
+        if _from_msg in (
+            INITIATION_AGENT, INITIATION_DIALER, INITIATION_BOT, INITIATION_EXTERNAL,
+        ):
             initiation_method = _from_msg
         else:
             initiation_method = _initiation_method_from_message(
@@ -570,10 +593,15 @@ def insert_llamada_resumen(message):
         custom_data = message.get("custom_data")
         if not isinstance(custom_data, dict):
             custom_data = {}
+        # Overflow FAILOVER va en channel_data (JSONB); no implica is_transferred
 
         agent_segments = message.get("agent_segments")
         if agent_segments:
             custom_data["agent_segments"] = agent_segments
+
+        sip_agentic_leg_call_id = message.get("sip_agentic_leg_call_id")
+        if sip_agentic_leg_call_id:
+            custom_data["sip_agentic_leg_call_id"] = str(sip_agentic_leg_call_id)
 
         now_iso = datetime.now().astimezone().isoformat()
         
@@ -657,7 +685,21 @@ def insert_llamada_resumen(message):
 # --- ACTUALIZACIÓN DE ESTADÍSTICAS EN REDIS DB 2 ---
 
 
-def _publish_inbound_wait_time(redis_client, campana_id, bridge_wait_time):
+def _call_occurrence_fields(message):
+    """uniqueid/callid for per-call stream event identity."""
+    fields = {}
+    if not message:
+        return fields
+    uniqueid = message.get("uniqueid")
+    if uniqueid is not None and uniqueid != '':
+        fields["uniqueid"] = uniqueid
+    callid = message.get("callid")
+    if callid is not None and callid != '':
+        fields["callid"] = callid
+    return fields
+
+
+def _publish_inbound_wait_time(redis_client, campana_id, bridge_wait_time, message=None):
     """
     Para llamadas entrantes atendidas: escribe en la lista WAIT-TIME y publica
     evento WAIT en CALLEVENTS para que Supervisión (InboundDataManager) actualice
@@ -668,10 +710,9 @@ def _publish_inbound_wait_time(redis_client, campana_id, bridge_wait_time):
     wait_sec = int(round(bridge_wait_time)) if bridge_wait_time is not None else 0
     try:
         redis_client.rpush(CALLDATA_WAIT_KEY.format(campana_id), wait_sec)
-        redis_client.publish(
-            CALLEVENTS_CHANNEL,
-            json.dumps({"type": "WAIT", "id": campana_id, "time": wait_sec}),
-        )
+        payload = {"type": "WAIT", "id": campana_id, "time": wait_sec}
+        payload.update(_call_occurrence_fields(message))
+        xadd_event(redis_client, STREAM_CALLEVENTS, payload)
     except Exception as e:
         logger.error(
             "Error escribiendo WAIT-TIME o publicando WAIT (campana_id=%s): %s",
@@ -681,7 +722,7 @@ def _publish_inbound_wait_time(redis_client, campana_id, bridge_wait_time):
         )
 
 
-def _publish_inbound_abandon_time(redis_client, campana_id, bridge_wait_time):
+def _publish_inbound_abandon_time(redis_client, campana_id, bridge_wait_time, message=None):
     """
     Para llamadas entrantes abandonadas: escribe en la lista EXIT_ABANDON-TIME y
     publica evento EXIT_ABANDON en CALLEVENTS para que Supervisión (InboundDataManager)
@@ -692,10 +733,9 @@ def _publish_inbound_abandon_time(redis_client, campana_id, bridge_wait_time):
     abandon_sec = int(round(bridge_wait_time)) if bridge_wait_time is not None else 0
     try:
         redis_client.rpush(CALLDATA_EXIT_ABANDON_TIME_KEY.format(campana_id), abandon_sec)
-        redis_client.publish(
-            CALLEVENTS_CHANNEL,
-            json.dumps({"type": "EXIT_ABANDON", "id": campana_id, "time": abandon_sec}),
-        )
+        payload = {"type": "EXIT_ABANDON", "id": campana_id, "time": abandon_sec}
+        payload.update(_call_occurrence_fields(message))
+        xadd_event(redis_client, STREAM_CALLEVENTS, payload)
     except Exception as e:
         logger.error(
             "Error escribiendo EXIT_ABANDON-TIME o publicando EXIT_ABANDON (campana_id=%s): %s",
@@ -725,19 +765,24 @@ CAMP_DIALER_NO_CONTACT_EVENTS = frozenset([
 ])
 
 
-def _publish_camp_event(redis_client, campana_id, event_name, call_type="2"):
+def _publish_camp_event(redis_client, campana_id, event_name, call_type="2", message=None):
     """
-    Publica un evento CAMP a CALLEVENTS_CHANNEL para supervisión en tiempo real
+    Publica un evento CAMP a OML:STREAM:CALLEVENTS para supervisión en tiempo real
     (DialerDataManager, OutboundDataManager). Formato:
-    {"type": "CAMP", "event": event_name, "id": campana_id, "call_type": call_type}.
+    {"type": "CAMP", "event": event_name, "id": campana_id, "call_type": call_type,
+     "uniqueid": ..., "callid": ...}.
     """
     if campana_id is None:
         return
     try:
-        redis_client.publish(
-            CALLEVENTS_CHANNEL,
-            json.dumps({"type": "CAMP", "event": event_name, "id": campana_id, "call_type": call_type}),
-        )
+        payload = {
+            "type": "CAMP",
+            "event": event_name,
+            "id": campana_id,
+            "call_type": call_type,
+        }
+        payload.update(_call_occurrence_fields(message))
+        xadd_event(redis_client, STREAM_CALLEVENTS, payload)
     except Exception as e:
         logger.error(
             "Error publicando CAMP %s (campana_id=%s): %s",
@@ -822,9 +867,21 @@ def update_redis_call_stats(message):
         # CORRECCIÓN 1: No registrar DIAL para llamadas inbound
         # DIAL solo debe registrarse para llamadas outbound (dialer, preview, manual)
         # Para inbound, solo se registran eventos de finalización (EXIT_TIMEOUT, EXIT_ABANDON, etc.)
+        custom_data_stats = message.get("custom_data")
+        if not isinstance(custom_data_stats, dict):
+            custom_data_stats = {}
+        overflow_pending = bool(custom_data_stats.get("overflow_pending"))
+        is_overflow_reentry = bool(
+            custom_data_stats.get("is_overflow")
+            or custom_data_stats.get("entry_reason") == "overflow"
+        )
+
         if event_name == 'DIAL':
             if is_inbound:
                 # Para inbound, no registrar DIAL (solo se registra cuando realmente se atiende o finaliza)
+                return True
+            # Re-entrada por FAILOVER/overflow: no nueva oferta DIAL_OUT
+            if is_overflow_reentry:
                 return True
         
         # EXIT_SHORTCALL: categoría propia; solo CALL_TYPE:x:EXIT_SHORTCALL (nunca EXIT_ANSWERED_HUMAN/BOT)
@@ -862,7 +919,7 @@ def update_redis_call_stats(message):
         redis_client.hincrby(redis_key, field_event, 1)
         # Supervisión salientes: DIAL ya excluyó inbound arriba; publicar siempre (evita perder WS si tipo_campana viene 0).
         if event_name == 'DIAL':
-            _publish_camp_event(redis_client, campana_id, 'DIAL')
+            _publish_camp_event(redis_client, campana_id, 'DIAL', message=message)
         
         # Mapeo de eventos a claves de estadísticas específicas
         # EXIT_ANSWERED: llamadas atendidas (diferenciando entre HUMAN y BOT)
@@ -915,14 +972,17 @@ def update_redis_call_stats(message):
                     redis_client.hincrbyfloat(redis_key, field_answered_total_time, duracion_segundos)
             # Supervisión Inbound: lista WAIT-TIME y evento WAIT para campañas entrantes
             if t_campana == CallType.INBOUND_ID:
-                _publish_inbound_wait_time(redis_client, campana_id, bridge_wait_time)
+                _publish_inbound_wait_time(
+                    redis_client, campana_id, bridge_wait_time, message=message)
             elif is_dialer:
-                _publish_camp_event(redis_client, campana_id, 'CONNECT')
+                _publish_camp_event(
+                    redis_client, campana_id, 'CONNECT', message=message)
             elif is_outbound:
                 _publish_camp_event(
                     redis_client,
                     campana_id,
                     'EXIT_ANSWERED_BOT' if atendida_por_voicebot else 'EXIT_ANSWERED_HUMAN',
+                    message=message,
                 )
         elif event_name in [HangupCause.COMPLETEAGENT.value, HangupCause.COMPLETEOUTNUM.value]:
             # Estos eventos también indican que la llamada fue atendida
@@ -972,14 +1032,17 @@ def update_redis_call_stats(message):
                     redis_client.hincrbyfloat(redis_key, field_answered_total_time, duracion_segundos)
             # Supervisión Inbound: lista WAIT-TIME y evento WAIT para campañas entrantes
             if t_campana == CallType.INBOUND_ID:
-                _publish_inbound_wait_time(redis_client, campana_id, bridge_wait_time)
+                _publish_inbound_wait_time(
+                    redis_client, campana_id, bridge_wait_time, message=message)
             elif is_dialer:
-                _publish_camp_event(redis_client, campana_id, 'CONNECT')
+                _publish_camp_event(
+                    redis_client, campana_id, 'CONNECT', message=message)
             elif is_outbound:
                 _publish_camp_event(
                     redis_client,
                     campana_id,
                     'EXIT_ANSWERED_BOT' if atendida_por_voicebot else 'EXIT_ANSWERED_HUMAN',
+                    message=message,
                 )
         
         # EXIT_ABANDON: llamadas abandonadas
@@ -1002,24 +1065,55 @@ def update_redis_call_stats(message):
         # Supervisión Inbound: lista EXIT_ABANDON-TIME y evento EXIT_ABANDON para campañas entrantes
         if event_name in (HangupCause.EXIT_ABANDON.value, 'ABANDON', 'ABANDONWEL') and t_campana == CallType.INBOUND_ID:
             bridge_wait_time_abandon = clean_float(message.get("bridge_wait_time"))
-            _publish_inbound_abandon_time(redis_client, campana_id, bridge_wait_time_abandon)
+            _publish_inbound_abandon_time(
+                redis_client, campana_id, bridge_wait_time_abandon, message=message)
         # Supervisión Inbound: evento CAMP EXIT_TIMEOUT para actualizar expired en tiempo real
         if event_name == HangupCause.EXIT_TIMEOUT.value and t_campana == CallType.INBOUND_ID and campana_id is not None:
-            try:
-                redis_client.publish(
-                    CALLEVENTS_CHANNEL,
-                    json.dumps({"type": "CAMP", "event": "EXIT_TIMEOUT", "id": campana_id}),
+            _publish_camp_event(
+                redis_client,
+                campana_id,
+                'EXIT_TIMEOUT',
+                call_type=str(t_llamada),
+                message=message,
+            )
+        # Supervisión Inbound: flow-out FAILOVER (no es expired)
+        if (
+            event_name == HangupCause.EXIT_OVERFLOW.value
+            and t_campana == CallType.INBOUND_ID
+            and campana_id is not None
+        ):
+            _publish_camp_event(
+                redis_client,
+                campana_id,
+                HangupCause.EXIT_OVERFLOW.value,
+                call_type=str(t_llamada),
+                message=message,
+            )
+            # I6 aditivo: breakdown dialplan (UI vieja solo lee EXIT_OVERFLOW)
+            custom = message.get("custom_data") or {}
+            if not isinstance(custom, dict):
+                custom = {}
+            dest_label = str(custom.get("destination_type") or "").strip().upper()
+            if dest_label and dest_label not in ("CAMPAIGN", "AGENT", ""):
+                redis_client.hincrby(
+                    redis_key,
+                    f"CALL_TYPE:{t_llamada}:EXIT_OVERFLOW:{dest_label}",
+                    1,
                 )
-            except Exception as e:
-                logger.error(
-                    "Error publicando CAMP EXIT_TIMEOUT (campana_id=%s): %s",
-                    campana_id,
-                    e,
-                    exc_info=True,
+                redis_client.hincrby(
+                    redis_key,
+                    f"CALL_TYPE:{t_llamada}:FAILOVER_DIALPLAN",
+                    1,
                 )
         # Supervisión salientes: no contactación / no diálogo (manual, preview, dialer)
-        if is_outbound and event_name in CAMP_DIALER_NO_CONTACT_EVENTS:
-            _publish_camp_event(redis_client, campana_id, event_name)
+        # overflow_pending = EXIT_OVERFLOW hop A→B: PSTN sigue vivo, no acusar fin dialer
+        if (
+            is_outbound
+            and event_name in CAMP_DIALER_NO_CONTACT_EVENTS
+            and not overflow_pending
+        ):
+            _publish_camp_event(
+                redis_client, campana_id, event_name, message=message)
         
         # CORRECCIÓN 2: No duplicar EXIT_EXPIRE cuando ya se registró EXIT_TIMEOUT
         # EXIT_EXPIRE solo se registra si el evento es EXIT_EXPIRE explícitamente, no para EXIT_TIMEOUT

@@ -14,12 +14,13 @@ import logging
 import redis
 from typing import Optional, Tuple
 
+from event_stream import STREAM_CALLEVENTS, get_stream_redis, xadd_event
+
 logger = logging.getLogger(__name__)
 
 # Claves Redis (compatibles con ami.py)
 CALLDATA_QUEUE_SIZE_KEY = 'OML:CALLDATA:QUEUE-SIZE:{0}'
 CALLDATA_QUEUE_KEY = 'OML:CALLDATA:QUEUE:{0}'
-CALLEVENTS_CHANNEL = 'OML:CHANNEL:CALLEVENTS'
 
 _ENTER_QUEUE_SCRIPT = """
 local existed = redis.call('HEXISTS', KEYS[1], ARGV[1])
@@ -82,20 +83,15 @@ class QueueEventManager:
 
     def _publish_event(self, event_data: dict):
         """
-        Publica un evento al canal Redis CALLEVENTS.
-
-        Args:
-            event_data: Diccionario con los datos del evento
-
-        Nota: Si falla la publicación, no se lanza excepción para no interrumpir
-        el flujo principal. El evento ya fue procesado en Redis (tamaño de cola).
+        Publica evento QUEUE a Redis Stream CALLEVENTS (DB 2).
+        No lanza: el tamaño de cola ya quedó en Redis.
         """
         try:
-            event_json = json.dumps(event_data)
-            self.redis.publish(CALLEVENTS_CHANNEL, event_json)
+            stream_conn = get_stream_redis()
+            xadd_event(stream_conn, STREAM_CALLEVENTS, event_data)
             logger.debug(
-                "Evento publicado a %s: %s",
-                CALLEVENTS_CHANNEL,
+                "Evento publicado a stream %s: %s",
+                STREAM_CALLEVENTS,
                 event_data.get('type'),
             )
         except json.JSONEncodeError as e:

@@ -26,6 +26,13 @@ DEFAULT_CAMPAIGN_CFG = {
     "amd": False,
     "voicebot": False,
     "voicebot_strategy": "random",
+    "weight": 0,
+    "wrapuptime": 0,
+    "auto_unpause": 0,
+    "failover": False,
+    "failover_dst_tipo": None,
+    "failover_dst_id": None,
+    "welcome_sound": None,
 }
 
 
@@ -54,7 +61,12 @@ def fetch_campaign_cfg_from_redis(
             continue
         normalized[str(k).lower()] = v
 
-    moh_sound = normalized.get("moh_sound") or normalized.get("mohclass") or None
+    moh_sound = (
+        normalized.get("moh")
+        or normalized.get("moh_sound")
+        or normalized.get("mohclass")
+        or None
+    )
 
     max_wait_raw = (
         normalized.get("max_wait_time")
@@ -128,6 +140,60 @@ def fetch_campaign_cfg_from_redis(
     else:
         voicebot_strategy = "random"
 
+    weight_raw = normalized.get("weight")
+    try:
+        weight = int(weight_raw) if weight_raw is not None and str(weight_raw).strip() != "" else 0
+    except Exception:
+        weight = 0
+    if weight < 0:
+        weight = 0
+
+    wrapup_raw = normalized.get("wrapuptime")
+    try:
+        wrapuptime = int(wrapup_raw) if wrapup_raw is not None and str(wrapup_raw).strip() != "" else 0
+    except Exception:
+        wrapuptime = 0
+    if wrapuptime < 0:
+        wrapuptime = 0
+
+    auto_unpause_raw = normalized.get("auto_unpause")
+    try:
+        auto_unpause = (
+            int(auto_unpause_raw)
+            if auto_unpause_raw is not None and str(auto_unpause_raw).strip() != ""
+            else 0
+        )
+    except Exception:
+        auto_unpause = 0
+    if auto_unpause < 0:
+        auto_unpause = 0
+
+    failover_raw = normalized.get("failover")
+    if failover_raw is not None and isinstance(failover_raw, bytes):
+        failover_raw = failover_raw.decode("utf-8")
+    failover = failover_raw in (True, "true", "1", "True", "yes", "Yes")
+
+    failover_dst_tipo = None
+    failover_dst_id = None
+    failover_dst_raw = normalized.get("failoverdst")
+    if failover_dst_raw is not None:
+        if isinstance(failover_dst_raw, bytes):
+            failover_dst_raw = failover_dst_raw.decode("utf-8")
+        parts = str(failover_dst_raw).strip().split(",")
+        if len(parts) >= 2:
+            try:
+                failover_dst_tipo = int(parts[0].strip())
+                failover_dst_id = int(parts[1].strip())
+            except (TypeError, ValueError):
+                failover_dst_tipo = None
+                failover_dst_id = None
+
+    welcome_raw = normalized.get("welcomeplay") or normalized.get("welcome_sound")
+    if welcome_raw is not None and isinstance(welcome_raw, bytes):
+        welcome_raw = welcome_raw.decode("utf-8")
+    welcome_sound = str(welcome_raw).strip() if welcome_raw is not None else ""
+    welcome_sound = welcome_sound or None
+
     return {
         "moh_sound": moh_sound,
         "max_wait_time": max_wait_time,
@@ -139,6 +205,13 @@ def fetch_campaign_cfg_from_redis(
         "amd": amd,
         "voicebot": voicebot,
         "voicebot_strategy": voicebot_strategy,
+        "weight": weight,
+        "wrapuptime": wrapuptime,
+        "auto_unpause": auto_unpause,
+        "failover": failover,
+        "failover_dst_tipo": failover_dst_tipo,
+        "failover_dst_id": failover_dst_id,
+        "welcome_sound": welcome_sound,
     }
 
 

@@ -102,6 +102,76 @@ def test_audit_json_bytes_up_not_in_ringing():
     assert payload["ringing"] == {"4": 1}
 
 
+def test_up_in_amd_context_is_not_ringing():
+    """Tras AMD los PSTN contestados quedan en context=amd + state=Up."""
+    channels = [
+        {
+            "name": "PJSIP/trunk-00000020",
+            "state": "Up",
+            "dialplan": {
+                "context": "amd",
+                "app_name": "Stasis",
+                "app_data": "oml_acd,amd_done,HUMAN,HUMAN-800-800",
+            },
+            "channelvars": {"OMLCAMPID": "13"},
+        },
+        {
+            "name": "PJSIP/trunk-00000021",
+            "state": "Ringing",
+            "dialplan": {"context": "from-pstn", "app_name": "AppDial2"},
+            "channelvars": {"OMLCAMPID": "13"},
+        },
+        {
+            "name": "PJSIP/trunk-00000022",
+            "state": "Dialing",
+            "dialplan": {"context": "amd"},
+            "channelvars": {"OMLCAMPID": "13"},
+        },
+    ]
+    counts, ringing = count_dialer_channels_by_campaign(channels, acd_app="oml_acd")
+    assert counts == {"13": 3}
+    assert ringing == {"13": 2}
+
+
+def test_up_amd_app_in_progress_is_ringing():
+    """SIP Up pero AMD/Playback aún corriendo → ringing (fase dialer RINGING)."""
+    channels = [
+        {
+            "name": "PJSIP/trunk-00000030",
+            "state": "Up",
+            "dialplan": {
+                "context": "amd",
+                "app_name": "AMD",
+                "app_data": "2500,1500,800,5000,100,50,3,256,5000",
+            },
+            "channelvars": {"OMLCAMPID": "15"},
+        },
+        {
+            "name": "PJSIP/trunk-00000031",
+            "state": "Up",
+            "dialplan": {
+                "context": "amd",
+                "app_name": "Playback",
+                "app_data": "silence/1",
+            },
+            "channelvars": {"OMLCAMPID": "15"},
+        },
+        {
+            "name": "PJSIP/trunk-00000032",
+            "state": "Up",
+            "dialplan": {
+                "context": "amd",
+                "app_name": "Stasis",
+                "app_data": "oml_acd,amd_done,HUMAN,HUMAN-800-800",
+            },
+            "channelvars": {"OMLCAMPID": "15"},
+        },
+    ]
+    counts, ringing = count_dialer_channels_by_campaign(channels, acd_app="oml_acd")
+    assert counts == {"15": 3}
+    assert ringing == {"15": 2}
+
+
 def test_audit_json_bytes_failure_envelope():
     ari = MagicMock()
     ari.list_channels.side_effect = RuntimeError("ari down")

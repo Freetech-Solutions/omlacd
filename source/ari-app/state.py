@@ -86,6 +86,9 @@ class CallContext(BaseModel):
     distribution_campaign_id: Optional[int] = None
 
     phone_number: Optional[str] = None
+    # OUTR elegida por patrón global cuando la campaña no tiene OUTR fija.
+    # La usa get_trunk_callerid para el CALLERID de la troncal en el reporte.
+    effective_route_id: Optional[str] = None
     tel_dialed: Optional[str] = None  # Inbound: número marcado (destino de la llamada)
     command_id: Optional[str] = None  # ID del comando que generó esta llamada (para idempotencia)
     call_type: Optional[int] = 0
@@ -95,7 +98,18 @@ class CallContext(BaseModel):
     transfer_count: int = 0
     transfer_phase: str = TRANSFER_PHASE_NONE
     transfer_in_progress: bool = False
+    # Desborde por timeout de cola (FAILOVER → campaña); distinto de is_transferred
+    is_overflow: bool = False
+    overflow_count: int = 0
+    overflow_origin_campaign_id: Optional[int] = None
+    overflow_from_campaign_id: Optional[int] = None
+    overflow_path: List[Dict[str, Any]] = Field(default_factory=list)
+    entry_reason: Optional[str] = None  # "overflow" al re-encolar tras desborde
+    # True tras redirect FAILOVER a dialplan: StasisEnd no debe finalize/abandon
+    handoff_to_dialplan: bool = False
     pstn_channel_bridged: bool = False
+    # True tras Dial PROGRESS (183): early media ya va al bridge y el ringback no se rearma
+    pstn_early_media: bool = False
     consultation: Optional[ConsultationData] = None
     custom_sip_headers: Optional[Dict[str, str]] = None
     target_agent_id: Optional[int] = None  # ID del agente destino en transferencias blind
@@ -120,6 +134,14 @@ class CallContext(BaseModel):
     # Timeout de cola en segundos (inbound); usado para distinguir EXIT_TIMEOUT vs EXIT_ABANDON en carrera
     queue_timeout_seconds: Optional[int] = None
 
+    # Playback ARI de ringback local (click2call) mientras espera answer PSTN
+    ringback_playback_id: Optional[str] = None
+    # Anuncio WELCOMEPLAY al entrar en cola (antes de MOH/distribución)
+    welcome_playback_id: Optional[str] = None
+    welcome_pending: bool = False
+    # "inbound" | "dialer" | "redistribute" — qué reanudar en PlaybackFinished
+    welcome_resume_action: Optional[str] = None
+
     # Campos para tracking de timestamps de respuesta (para determinar si fue contestada)
     bridge_created_ts: Optional[str] = None  # Timestamp ISO de creación del bridge
     agent_answered_ts: Optional[str] = None  # Timestamp ISO cuando el canal del agente pasó a "Up"
@@ -132,9 +154,24 @@ class CallContext(BaseModel):
     # Duraciones del leg voicebot (para bot_duration en reporte): inicio/fin ISO del canal voicebot en el bridge
     voicebot_leg_start_ts: Optional[str] = None
     voicebot_leg_end_ts: Optional[str] = None
+    # Call-ID SIP del INVITE hacia el voicebot (ARI peer.protocol_id); sobrevive al handoff
+    sip_agentic_leg_call_id: Optional[str] = None
     call_ended: bool = False  # Flag para evitar procesar el evento de finalización múltiples veces
     # Inbound: True si el agente colgó primero (on_hangup_request); usado en on_pstn_stasis_end para reportar quien_corto=1
     inbound_agent_hung_up_first: bool = False
+    # True desde handle_agent_answer hasta ONCALL confirmado o fallo de bridge; inhibe timeout de cola
+    # y mantiene la reserva DIALING+lock hasta try_confirm_distribution_oncall.
+    distribution_answer_accepted: bool = False
+    # True tras el primer claim/reserva exitoso: sale del ZSET waiting pero sigue pudiendo
+    # ofertar (evita HOL mientras suena / prueba el siguiente agente).
+    distribution_offering: bool = False
+    # Params para reiniciar distribución si falla consolidación post-answer
+    distribution_strategy: Optional[str] = None
+    distribution_ring_timeout: Optional[int] = None
+    distribution_queue_timeout_sec: Optional[float] = None
+    distribution_started_at_ts: Optional[str] = None
+    distribution_metadata: Optional[Dict[str, Any]] = None
+    distribution_uniqueid: Optional[str] = None
 
     @model_validator(mode="before")
     @classmethod

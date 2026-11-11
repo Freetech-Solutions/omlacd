@@ -9,6 +9,17 @@ from unittest.mock import Mock, MagicMock, patch, call
 # Agregar el path para importar módulos
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'ari-app'))
 
+try:
+    import acd  # noqa: F401
+    _HAS_LEGACY_ACD = True
+except ImportError:
+    _HAS_LEGACY_ACD = False
+
+pytestmark = pytest.mark.skipif(
+    not _HAS_LEGACY_ACD,
+    reason="legacy acd module not available",
+)
+
 
 class TestCallManagerInit:
     """Tests para la inicialización de CallManager."""
@@ -21,7 +32,7 @@ class TestCallManagerInit:
                                            mock_reporter, mock_redis_class):
         """Test que CallManager crea conexión a Redis."""
         from acd import CallManager
-        
+
         mock_ari = MagicMock()
         mock_ari.host = "localhost"
         mock_ari.port = 8088

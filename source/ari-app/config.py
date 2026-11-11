@@ -92,6 +92,19 @@ class Settings(BaseSettings):
         ge=1,
         description="Umbral en segundos: con agente, talk menor al umbral se reporta como EXIT_SHORTCALL",
     )
+    MAX_OVERFLOW_HOPS: int = Field(
+        default=5,
+        ge=1,
+        description="Tope de desbordes encadenados por timeout de cola (FAILOVER)",
+    )
+    FAILOVER_DIALPLAN_ENABLED: bool = Field(
+        default=False,
+        description=(
+            "Habilita handoff FAILOVER a destinos no-campaña (IVR/TC/Survey/…) vía dialplan. "
+            "Default false: solo campaña→campaña (tipo 1); resto → hangup como hoy. "
+            "Ver docs/failover_dialplan.md"
+        ),
+    )
     TRANSFER_TIMEOUT: int = Field(default=30, ge=1, description="Timeout para transferencias ciegas")
     CONSULT_TIMEOUT: int = Field(default=45, ge=1, description="Timeout para transferencias consultivas")
 
@@ -115,6 +128,13 @@ class Settings(BaseSettings):
         default=3,
         ge=1,
         description="Cantidad de reintentos de submit por job en publisher Gearman asíncrono",
+    )
+    # P0: si process-event queued >= umbral, no encolar AmdLatency (métrica no crítica).
+    # 0 = nunca omitir por cola.
+    AMD_LATENCY_QUEUE_MAX: int = Field(
+        default=100,
+        ge=0,
+        description="Omitir submit AmdLatency si process-event queued >= este valor (0=off)",
     )
     OMNILEADS_HOSTNAME: str = Field(default="nginx", description="Hostname del servidor Django/OMniLeads")
     OMNILEADS_PROTOCOL: str = Field(default="https", description="Protocolo para Django (http/https)")
@@ -183,6 +203,75 @@ class Settings(BaseSettings):
         ge=0,
         description="Segundos extra sobre ring_timeout para el TTL del lock acd:lock:agent durante el ring",
     )
+    # Tras offer fallido (BUSY / NOANSWER inmediato): lease corto sin volver a READY
+    AGENT_OFFER_FAILURE_COOLDOWN_SEC: int = Field(
+        default=5,
+        ge=1,
+        le=60,
+        description=(
+            "Segundos de cooldown (lease) tras un intento fallido de distribución hacia un agente; "
+            "evita que otras llamadas concurrentes re-originen al mismo SIP en ráfaga"
+        ),
+    )
+    # Grace extra sobre max(WRAPUPTIME, AUTO_UNPAUSE) al colgar (bloquea oferta aunque READY)
+    AGENT_WRAPUP_POST_READY_GRACE_SEC: int = Field(
+        default=5,
+        ge=0,
+        le=120,
+        description=(
+            "Segundos extra de cooldown post-colgado sumados a max(WRAPUPTIME, AUTO_UNPAUSE) "
+            "de la campaña; evita oferta inmediata apenas la consola sale de ACW a READY"
+        ),
+    )
+    # Piso de TTL al renovar lock/lease tras handle_agent_answer (ventana hasta ONCALL/bridge)
+    AGENT_ANSWER_RESERVATION_TTL_SEC: int = Field(
+        default=30,
+        ge=5,
+        description=(
+            "TTL mínimo en segundos al renovar lock/lease del agente tras contestación aceptada, "
+            "antes de confirmar ONCALL o fallar el bridge"
+        ),
+    )
+    # Fairness cross-queue: weight de cola + envejecimiento
+    ACD_QUEUE_WEIGHT_ENABLED: bool = Field(
+        default=True,
+        description=(
+            "Si true, usa waiting ZSET + CallPriority (weight+age) y offer gate por agente "
+            "antes de reservar. Si false, comportamiento legacy (CAS por hilo)."
+        ),
+    )
+    ACD_WAITING_ALIVE_TTL_SEC: int = Field(
+        default=15,
+        ge=15,
+        le=600,
+        description=(
+            "TTL del heartbeat acd:queue:waiting:alive:{call_id}. El loop lo refresca; "
+            "tras crash de acd-app, heads huérfanos dejan de bloquear en ≤ este TTL "
+            "(default 15s; el bucle también dequea al detectar PSTN muerto)."
+        ),
+    )
+    ACD_CALL_PRIORITY_TAU_SEC: float = Field(
+        default=40.0,
+        gt=0,
+        description="Tau (segundos) del envejecimiento en CallPriority: age=1-exp(-wait/tau)",
+    )
+    ACD_WEIGHT_NORM_MAX: float = Field(
+        default=10.0,
+        gt=0,
+        description="Tope para normalizar Queue.weight en CallPriority (clamp 0..max / max)",
+    )
+    ACD_CALL_PRIORITY_W_WEIGHT: float = Field(
+        default=0.6,
+        ge=0,
+        le=1,
+        description="Peso del término weight_norm en CallPriority",
+    )
+    ACD_CALL_PRIORITY_W_AGE: float = Field(
+        default=0.4,
+        ge=0,
+        le=1,
+        description="Peso del término age en CallPriority",
+    )
     # TTL de espera del comando Redis tras REFER desde voicebot antes de iniciar distribución
     VOICEBOT_TRANSFER_WAIT_TTL_SEC: int = Field(
         default=120,
@@ -198,10 +287,30 @@ class Settings(BaseSettings):
         le=300,
         description="TTL en segundos del comando voicebot_transfer_proceed pendiente cuando llega antes que el waiter del REFER (race comando/REFER)",
     )
+    # Voicebot AudioSocket (ARI externalMedia)
+    AUDIOSOCKET_ADDR: str = Field(
+        default="audiosocket:9092",
+        description="Host:puerto del servidor AudioSocket para voicebots (ARI externalMedia)",
+    )
+    AUDIOSOCKET_SESSION_TTL_SEC: int = Field(
+        default=3600,
+        ge=60,
+        le=86400,
+        description="TTL en segundos de OML:AUDIOSOCKET:{uuid} con variables de negocio",
+    )
 
     # Prometheus (métricas)
-    PROMETHEUS_METRICS_PORT: int = Field(default=7088, ge=1, le=65535, description="Puerto del servidor HTTP de métricas Prometheus")
-    PROMETHEUS_METRICS_ADDR: str = Field(default="0.0.0.0", description="Dirección de bind del servidor de métricas Prometheus")
+    PROMETHEUS_METRICS_PORT: int = Field(
+        default=7088,
+        ge=1,
+        le=65535,
+        description="Puerto del servidor HTTP de métricas Prometheus (env: PROMETHEUS_METRICS_PORT)",
+    )
+    PROMETHEUS_METRICS_ADDR: str = Field(
+        default="0.0.0.0",
+        description="Dirección de bind del servidor de métricas Prometheus (env: ACD_HTTP_BIND_ADDR)",
+        validation_alias=AliasChoices('ACD_HTTP_BIND_ADDR', 'PROMETHEUS_METRICS_ADDR'),
+    )
 
     # -------------------------------------------------------------------------
     # Validadores: aceptar aliases de env y normalizar valores
@@ -239,6 +348,15 @@ class Settings(BaseSettings):
         if isinstance(v, bool):
             return v
         s = (str(v).lower() if v is not None else 'true').strip()
+        return s in ('true', '1', 'yes', 'on')
+
+    @field_validator('FAILOVER_DIALPLAN_ENABLED', mode='before')
+    @classmethod
+    def _failover_dialplan_enabled_bool(cls, v: object) -> bool:
+        """Acepta 'true', '1', 'yes', 'on' como True; default False si vacío."""
+        if isinstance(v, bool):
+            return v
+        s = (str(v).lower() if v is not None else 'false').strip()
         return s in ('true', '1', 'yes', 'on')
 
     @field_validator('OMNILEADS_VERIFY_SSL', mode='before')

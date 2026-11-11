@@ -13,6 +13,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "ari-app"))
 
 sys.modules.setdefault("redis", MagicMock())
 sys.modules.setdefault("gearman", MagicMock())
+# requests debe ser el paquete real si está instalado (ari_manager lo usa).
+# No mockearlo aquí para no contaminar otros tests de la misma sesión.
 
 # Mock liviano de config/settings para evitar depender de envs reales en import.
 if "config" not in sys.modules:
@@ -20,6 +22,7 @@ if "config" not in sys.modules:
 
     class _Settings:
         GEARMAN_SERVERS = ["gearman:4730"]
+        AMD_LATENCY_QUEUE_MAX = 100
 
     config_module.settings = _Settings()
     sys.modules["config"] = config_module
@@ -113,6 +116,28 @@ def test_handle_channel_destroyed_includes_callid_from_metadata():
     assert forwarder.client.submit_job.call_count == 1
     payload = _decode_payload(forwarder.client.submit_job.call_args_list[0])
     assert payload["callid"] == "1739372776.2"
+    assert "attempt_id" not in payload
+
+
+def test_handle_channel_destroyed_echoes_attempt_id():
+    pending_store = PendingDialMetadataStore()
+    pending_store.register(
+        "PJSIP-m0",
+        {
+            "call_type": "2",
+            "channel_type": "to_pstn",
+            "id_camp": "4",
+            "id_customer": "1",
+            "tel_customer": "6093017590",
+            "callid": "c-m0",
+            "attempt_id": "att-echo-1",
+        },
+    )
+    forwarder = LegacyEventForwarder(pending_dial_store=pending_store)
+    forwarder.client = MagicMock()
+    forwarder.handle_channel_destroyed("PJSIP-m0")
+    payload = _decode_payload(forwarder.client.submit_job.call_args_list[0])
+    assert payload["attempt_id"] == "att-echo-1"
 
 
 def test_submit_dial_originate_failed_includes_business_fields():
@@ -280,6 +305,7 @@ def test_handle_dial_event_uses_pending_metadata_for_business_fields():
     )
     event = {
         "type": "Dial",
+        "dialstatus": "BUSY",
         "dialstring": "11445566@trunk",
         "peer": {
             "id": "PJSIP-0002",
@@ -295,6 +321,7 @@ def test_handle_dial_event_uses_pending_metadata_for_business_fields():
     assert forwarder.client.submit_job.call_count == 1
     payload = _decode_payload(forwarder.client.submit_job.call_args_list[0])
     assert payload["type"] == "Dial"
+    assert payload["dialstatus"] == "BUSY"
     assert payload["call_type"] == "to_pstn"
     assert payload["id_campaign"] == "7"
     assert payload["contact_id"] == "55"
@@ -315,6 +342,74 @@ def _pending_pstn(peer_id="PJSIP-SKIP", channel_type="to_pstn"):
         },
     )
     return pending_store
+
+
+def test_handle_dial_event_skips_empty_dialstatus_to_pstn():
+    pending_store = _pending_pstn("PJSIP-EMPTY")
+    event = {
+        "type": "Dial",
+        "dialstatus": "",
+        "dialstring": "11445566@trunk",
+        "peer": {
+            "id": "PJSIP-EMPTY",
+            "dialplan": {"app_data": "(Outgoing Line)"},
+        },
+    }
+    forwarder = LegacyEventForwarder(pending_dial_store=pending_store)
+    forwarder.client = MagicMock()
+    forwarder.handle_dial_event(event)
+    assert forwarder.client.submit_job.call_count == 0
+
+
+def test_handle_dial_event_skips_ringing_to_pstn():
+    pending_store = _pending_pstn("PJSIP-RING")
+    event = {
+        "type": "Dial",
+        "dialstatus": "RINGING",
+        "dialstring": "11445566@trunk",
+        "peer": {
+            "id": "PJSIP-RING",
+            "dialplan": {"app_data": "(Outgoing Line)"},
+        },
+    }
+    forwarder = LegacyEventForwarder(pending_dial_store=pending_store)
+    forwarder.client = MagicMock()
+    forwarder.handle_dial_event(event)
+    assert forwarder.client.submit_job.call_count == 0
+
+
+def test_handle_dial_event_skips_empty_dialstatus_to_agent():
+    pending_store = _pending_pstn("PJSIP-AGT-EMPTY", channel_type="to_agent")
+    event = {
+        "type": "Dial",
+        "dialstatus": "",
+        "dialstring": "1004@webrtc-trunk",
+        "peer": {
+            "id": "PJSIP-AGT-EMPTY",
+            "dialplan": {"app_data": "(Outgoing Line)"},
+        },
+    }
+    forwarder = LegacyEventForwarder(pending_dial_store=pending_store)
+    forwarder.client = MagicMock()
+    forwarder.handle_dial_event(event)
+    assert forwarder.client.submit_job.call_count == 0
+
+
+def test_handle_dial_event_skips_ringing_to_agent():
+    pending_store = _pending_pstn("PJSIP-AGT-RING", channel_type="to_agent")
+    event = {
+        "type": "Dial",
+        "dialstatus": "RINGING",
+        "dialstring": "1004@webrtc-trunk",
+        "peer": {
+            "id": "PJSIP-AGT-RING",
+            "dialplan": {"app_data": "(Outgoing Line)"},
+        },
+    }
+    forwarder = LegacyEventForwarder(pending_dial_store=pending_store)
+    forwarder.client = MagicMock()
+    forwarder.handle_dial_event(event)
+    assert forwarder.client.submit_job.call_count == 0
 
 
 def test_handle_dial_event_skips_noanswer_to_pstn():
@@ -547,3 +642,117 @@ def test_submit_amd_latency_skips_invalid_campaign():
     forwarder.client = MagicMock()
     forwarder.submit_amd_latency(None, 1.0, callid="x")
     forwarder.client.submit_job.assert_not_called()
+
+
+def test_handle_dial_answer_to_pstn_deferred_when_amd_enabled_then_sent_on_human():
+    from datetime import datetime, timedelta, timezone
+
+    peer_id = "PJSIP-AMD-DEF"
+    originate = datetime(2026, 8, 7, 12, 0, 0, tzinfo=timezone.utc)
+    answer = originate + timedelta(seconds=6.25)
+    pending_store = PendingDialMetadataStore()
+    pending_store.register(
+        peer_id,
+        {
+            "call_type": "2",
+            "channel_type": "to_pstn",
+            "id_camp": "7",
+            "id_customer": "55",
+            "tel_customer": "11445566",
+            "callid": "call-def-1",
+            "originate_ts": originate.isoformat(),
+            "amd": True,
+        },
+    )
+    event = {
+        "type": "Dial",
+        "dialstatus": "ANSWER",
+        "timestamp": answer.isoformat().replace("+00:00", "Z"),
+        "dialstring": "11445566@trunk",
+        "peer": {
+            "id": peer_id,
+            "dialplan": {"app_data": "(Outgoing Line)"},
+        },
+    }
+    forwarder = LegacyEventForwarder(pending_dial_store=pending_store)
+    forwarder.client = MagicMock()
+
+    # 1) 200 OK de troncal: difiere el envío de ANSWERED_PSTN pero persiste ring_duration
+    forwarder.handle_dial_event(event)
+    forwarder.client.submit_job.assert_not_called()
+    stored = pending_store.get(peer_id)
+    assert stored is not None
+    assert abs(float(stored["ring_duration"]) - 6.25) < 0.01
+
+    # 2) on_amd_done HUMAN: envía Dial ANSWER to_pstn con ring_duration preservado
+    forwarder.submit_dial_answered_pstn(
+        "7", "55", "11445566", callid="call-def-1", channel_id=peer_id
+    )
+    assert forwarder.client.submit_job.call_count == 1
+    payload = _decode_payload(forwarder.client.submit_job.call_args_list[0])
+    assert payload["type"] == "Dial"
+    assert payload["call_type"] == "to_pstn"
+    assert payload["dialstatus"] == "ANSWER"
+    assert payload["id_campaign"] == "7"
+    assert payload["contact_id"] == "55"
+    assert payload["phone_number"] == "11445566"
+    assert payload["callid"] == "call-def-1"
+    assert abs(payload["ring_duration"] - 6.25) < 0.01
+    assert pending_store.get(peer_id)["amd"] is False
+
+
+def test_submit_dial_answered_agent_sends_to_agent_answer():
+    forwarder = LegacyEventForwarder()
+    forwarder.client = MagicMock()
+    forwarder.submit_dial_answered_agent("7", "55", "11445566", callid="call-vb-1")
+    assert forwarder.client.submit_job.call_count == 1
+    payload = _decode_payload(forwarder.client.submit_job.call_args_list[0])
+    assert payload["type"] == "Dial"
+    assert payload["call_type"] == "to_agent"
+    assert payload["dialstatus"] == "ANSWER"
+    assert payload["id_campaign"] == "7"
+    assert payload["contact_id"] == "55"
+    assert payload["phone_number"] == "11445566"
+    assert payload["callid"] == "call-vb-1"
+
+
+def test_submit_dial_amd_embeds_amd_duration():
+    forwarder = LegacyEventForwarder()
+    forwarder.client = MagicMock()
+    forwarder.submit_dial_amd("5", "99", "11001100", callid="c-amd-1", amd_duration=4.5)
+    assert forwarder.client.submit_job.call_count == 1
+    payload = _decode_payload(forwarder.client.submit_job.call_args_list[0])
+    assert payload["type"] == "Dial"
+    assert payload["dialstatus"] == "AMD"
+    assert payload["amd_duration"] == 4.5
+    assert payload["id_campaign"] == "5"
+    assert payload["contact_id"] == "99"
+    assert "attempt_id" not in payload
+
+
+def test_submit_dial_amd_echoes_attempt_id():
+    forwarder = LegacyEventForwarder()
+    forwarder.client = MagicMock()
+    forwarder.submit_dial_amd(
+        "5", "99", "11001100", callid="c-amd-2", amd_duration=1.0,
+        attempt_id="att-amd-1",
+    )
+    payload = _decode_payload(forwarder.client.submit_job.call_args_list[0])
+    assert payload["attempt_id"] == "att-amd-1"
+
+
+def test_optional_attempt_id_helpers():
+    """M0 helpers: echo solo si hay valor; omitir si falta."""
+    assert LegacyEventForwarder._optional_attempt_id({"attempt_id": "a1"}) == "a1"
+    assert LegacyEventForwarder._optional_attempt_id({}, {"x": 1}) is None
+    assert LegacyEventForwarder._with_attempt_id({"t": 1}, None) == {"t": 1}
+    assert LegacyEventForwarder._with_attempt_id({"t": 1}, "a1")["attempt_id"] == "a1"
+
+
+def test_submit_amd_latency_skipped_on_backlog():
+    forwarder = LegacyEventForwarder()
+    forwarder.client = MagicMock()
+    forwarder.fetch_process_event_queued = MagicMock(return_value=250)
+    forwarder.submit_amd_latency("5", 3.2, callid="c-lat-1")
+    forwarder.client.submit_job.assert_not_called()
+

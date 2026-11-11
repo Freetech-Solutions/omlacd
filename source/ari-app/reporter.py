@@ -258,15 +258,16 @@ class ACDReporter:
         is_voicebot_transfer = call_data.get('is_voicebot_transfer', False)
         atencion_hibrida = bool(atendida_por_voicebot and (is_transfer or is_voicebot_transfer))
 
-        # initiation_method para interactions_summary: AGENT, DIALER o BOT
+        # initiation_method: quién inició (no quién contestó).
+        # INBOUND → EXTERNAL (leg PSTN/cliente); DIALER/PROGRESSIVE → DIALER;
+        # MANUAL/PREVIEW → AGENT; BOT solo si el bot origina (no inbound atendido por bot).
         call_type_id = self._clean_id(call_data.get('call_type'))
-        agent_dur = self._clean_metric(agent_duration) if agent_duration is not None else 0.0
         if call_type_id in (2, 5):  # DIALER, PROGRESSIVE
             initiation_method = 'DIALER'
         elif call_type_id in (1, 4):  # MANUAL, PREVIEW
             initiation_method = 'AGENT'
         elif call_type_id == 3:  # INBOUND
-            initiation_method = 'BOT' if (atendida_por_voicebot and agent_dur <= 0) else 'AGENT'
+            initiation_method = 'EXTERNAL'
         else:
             initiation_method = None
 
@@ -328,6 +329,9 @@ class ACDReporter:
             "initiation_method": initiation_method,
             "agent_segments": agent_segments,
         }
+        sip_agentic = call_data.get("sip_agentic_leg_call_id")
+        if sip_agentic:
+            msg["sip_agentic_leg_call_id"] = str(sip_agentic)
         self._send_job(msg)
 
     # --------------------------------------------------------------------------

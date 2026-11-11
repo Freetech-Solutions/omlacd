@@ -29,6 +29,7 @@ if "requests" not in sys.modules:
     _req_exc.RequestException = _RequestException
     _req_adapters.HTTPAdapter = _HTTPAdapter
     _req.exceptions = _req_exc
+    _req.Response = type("Response", (), {})
     sys.modules["requests"] = _req
     sys.modules["requests.exceptions"] = _req_exc
     sys.modules["requests.adapters"] = _req_adapters
@@ -57,7 +58,7 @@ class TestTransferContextReporting(unittest.TestCase):
         cls.CallContext = CallContext
         cls.InboundCallHandler = InboundCallHandler
         cls.DistributionService = DistributionService
-        cls.call_has_prior_agent_handling = call_has_prior_agent_handling
+        cls.call_has_prior_agent_handling = staticmethod(call_has_prior_agent_handling)
 
     def test_call_has_prior_agent_handling_false_on_pristine(self):
         ctx = self.CallContext(

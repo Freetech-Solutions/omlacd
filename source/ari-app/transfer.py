@@ -23,6 +23,12 @@ from state_helpers import (
     resolve_consult_initiator_channel,
 )
 from utils import build_oml_sip_headers
+from services.queue_welcome import (
+    RESUME_REDISTRIBUTE,
+    claim_welcome_resume,
+    clear_welcome_flags,
+    start_welcome_or_continue,
+)
 
 # Estados de reporting para blind transfer (ver blind_to_endpoint / on_transfer_leg_start)
 _BLIND_TF_REQUESTED = "requested"
@@ -118,6 +124,12 @@ class TransferManager:
         self.asterisk_app = settings.ARI_APP
         # Node ID para reportes
         self.node_id = settings.NODE_ID
+        self._welcome_deferred: Dict[str, Dict[str, Any]] = {}
+        self._welcome_deferred_lock = threading.Lock()
+        if distribution_service is not None and hasattr(
+            distribution_service, "set_overflow_to_campaign"
+        ):
+            distribution_service.set_overflow_to_campaign(self.overflow_to_campaign)
 
     # ----------------- Helpers -----------------
     def _get_context(self, call_id: str) -> Optional[CallContext]:
@@ -507,8 +519,13 @@ class TransferManager:
         # blind_to_endpoint ya colgó al agente origen antes de originar: no dejar IDs de pierna muerta.
         saved_connected = getattr(ctx, "agent_connected_channel", None)
         call_type = getattr(getattr(ctx, "type", None), "value", getattr(ctx, "type", None))
+        is_inbound_or_progressive = call_type in (
+            CallType.INBOUND.value,
+            CallType.PROGRESSIVE.value,
+            CallType.DIALER.value,
+        )
         prior_answered_inbound_agent_blind = bool(
-            call_type == CallType.INBOUND.value
+            is_inbound_or_progressive
             and ctx.target_agent_id is not None
             and saved_connected
             and getattr(ctx, "agent_answered_ts", None)
@@ -588,8 +605,13 @@ class TransferManager:
             is_voicebot = bool(getattr(ctx, "is_voicebot", False))
             pstn_channel = getattr(ctx, "pstn_channel", None) or getattr(ctx, "uniqueid_pstn", None)
             call_type = getattr(getattr(ctx, "type", None), "value", getattr(ctx, "type", None))
+            is_inbound_or_progressive = call_type in (
+                CallType.INBOUND.value,
+                CallType.PROGRESSIVE.value,
+                CallType.DIALER.value,
+            )
             should_hangup_inbound_pstn = bool(
-                call_type == CallType.INBOUND.value
+                is_inbound_or_progressive
                 and getattr(ctx, "target_agent_id", None) is not None
                 and getattr(ctx, "inbound_agent_hung_up_first", False)
             )
@@ -634,7 +656,10 @@ class TransferManager:
 
         if self.agent_status_service and agent_id and not is_voicebot:
             try:
-                self.agent_status_service.set_postcall_and_clear_fields(agent_id)
+                self.agent_status_service.set_postcall_and_clear_fields(
+                    agent_id,
+                    call_id=call_id,
+                )
             except Exception:
                 self.logger.warning(
                     "recover_after_blind_transfer_leg_failed: error set_postcall agent_id=%s call_id=%s",
@@ -955,6 +980,7 @@ class TransferManager:
             
             # Leer todos los valores necesarios dentro del lock para mantener consistencia
             initiator = "VOICEBOT" if ctx.is_voicebot else "AGENTE"
+            is_voicebot = bool(getattr(ctx, "is_voicebot", False))
             bridge_id = ctx.bridge_id
             agent_channel = active_agent_channel(ctx)
             call_id = ctx.call_id
@@ -1022,8 +1048,25 @@ class TransferManager:
                         f"⚠️ No se pudo colgar canal de agente {agent_channel} después de reintentos. "
                         f"Continuando con la transferencia."
                     )
-                # TODO: Aquí podrías liberar al agente en Redis si tienes lógica de presencia
-            
+                # Liberar presencia del agente origen humano (ONCALL→POSTCALL)
+                if (
+                    self.agent_status_service
+                    and agent_id
+                    and not is_voicebot
+                ):
+                    try:
+                        self.agent_status_service.set_postcall_and_clear_fields(
+                            agent_id,
+                            call_id=call_id,
+                        )
+                    except Exception:
+                        self.logger.warning(
+                            "blind_to_endpoint: error set_postcall agent_id=%s call_id=%s",
+                            agent_id,
+                            call_id,
+                            exc_info=True,
+                        )
+
             # 4. Originar llamada (operación crítica irreversible)
             #    NOTA: originate se ejecuta fuera del lock para no bloquear, pero ya verificamos
             #    el estado dentro del lock y tenemos los valores copiados (no el objeto ctx)
@@ -1130,10 +1173,22 @@ class TransferManager:
             )
             return False
 
+    def _stop_bridge_moh(self, bridge_id: Optional[str]) -> None:
+        if not bridge_id:
+            return
+        try:
+            self.ari.delete(f"bridges/{bridge_id}/moh")
+        except Exception:
+            self.logger.debug(
+                "_stop_bridge_moh: bridge=%s (puede no haber MOH activo)",
+                bridge_id,
+                exc_info=True,
+            )
+
     def _start_redistribution_after_blind_to_campaign(self, call_id: str, target_camp_id: str) -> None:
         """
-        Tras blind_to_campaign: cancela timer/eventos de la distribución previa e inicia
-        el loop de cola hacia la campaña destino (misma mecánica que InboundCallHandler.on_start).
+        Tras blind_to_campaign / overflow: cancela timer/eventos de la distribución previa
+        e inicia cola hacia la campaña destino (welcome → MOH → dist si aplica).
         """
         if not self.distribution_service:
             self.logger.error(
@@ -1155,7 +1210,7 @@ class TransferManager:
             call_id, cancel_timer=True, hangup_agent_channel=False
         )
 
-        campaign_cfg = self.get_campaign_config(target_camp_id)
+        campaign_cfg = self.get_campaign_config(target_camp_id) or {}
         strategy = str(campaign_cfg.get("strategy") or "fewestcalls")
         ring_timeout = int(
             campaign_cfg.get("ring_timeout")
@@ -1180,6 +1235,94 @@ class TransferManager:
             tel_customer = ctx.phone_number
             call_type_val = ctx.call_type
             callid_meta = ctx.call_id
+            entry_reason = getattr(ctx, "entry_reason", None)
+
+        deferred = {
+            "target_camp_id": str(target_camp_id),
+            "campaign_cfg": dict(campaign_cfg),
+            "strategy": strategy,
+            "ring_timeout": ring_timeout,
+            "max_wait_time": max_wait_time,
+            "bridge_id": bridge_id,
+            "pstn_channel_id": pstn_channel_id,
+            "uniqueid": uniqueid,
+            "id_customer": id_customer,
+            "tel_customer": tel_customer,
+            "call_type_val": call_type_val,
+            "callid_meta": callid_meta,
+            "entry_reason": entry_reason,
+        }
+
+        welcome_sound = campaign_cfg.get("welcome_sound")
+        if welcome_sound:
+            self._stop_bridge_moh(bridge_id)
+
+        if start_welcome_or_continue(
+            self.ari,
+            self.state_store,
+            call_id,
+            pstn_channel_id,
+            welcome_sound,
+            RESUME_REDISTRIBUTE,
+        ):
+            with self._welcome_deferred_lock:
+                self._welcome_deferred[call_id] = deferred
+            self.logger.info(
+                "TransferManager: WELCOMEPLAY pendiente redistrib call_id=%s "
+                "camp=%s sound=%s",
+                call_id,
+                target_camp_id,
+                welcome_sound,
+            )
+            return
+
+        self._begin_redistribution_queue_hold_and_distribute(call_id, deferred)
+
+    def _begin_redistribution_queue_hold_and_distribute(
+        self, call_id: str, deferred: Dict[str, Any]
+    ) -> None:
+        """MOH destino + on_enter_queue + distribución (tras welcome o sin audio)."""
+        with self.state_store.lock(call_id):
+            ctx = self.state_store.get(call_id)
+            if not ctx or getattr(ctx, "call_ended", False):
+                self.logger.info(
+                    "TransferManager _begin_redistribution: omitiendo call_id=%s "
+                    "(ended/sin ctx)",
+                    call_id,
+                )
+                return
+            clear_welcome_flags(ctx)
+            self.state_store.register_unsafe(call_id, ctx)
+
+        target_camp_id = deferred["target_camp_id"]
+        campaign_cfg = deferred.get("campaign_cfg") or {}
+        strategy = deferred["strategy"]
+        ring_timeout = deferred["ring_timeout"]
+        max_wait_time = deferred["max_wait_time"]
+        bridge_id = deferred["bridge_id"]
+        pstn_channel_id = deferred["pstn_channel_id"]
+        uniqueid = deferred["uniqueid"]
+        id_customer = deferred.get("id_customer")
+        tel_customer = deferred.get("tel_customer")
+        call_type_val = deferred.get("call_type_val")
+        callid_meta = deferred.get("callid_meta")
+        entry_reason = deferred.get("entry_reason")
+
+        moh_class = campaign_cfg.get("moh_sound")
+        try:
+            if moh_class:
+                self.ari.post(
+                    f"bridges/{bridge_id}/moh",
+                    params={"mohClass": moh_class},
+                )
+            else:
+                self._start_moh(bridge_id)
+        except Exception:
+            self.logger.exception(
+                "_begin_redistribution: error MOH bridge=%s call_id=%s",
+                bridge_id,
+                call_id,
+            )
 
         if self.queue_event_manager:
             try:
@@ -1203,6 +1346,8 @@ class TransferManager:
             if call_type_val is not None
             else CallType.INBOUND_ID,
         }
+        if entry_reason:
+            distribution_metadata["entry_reason"] = entry_reason
 
         on_queue_timeout_callback = None
         if self.inbound_handler and hasattr(
@@ -1210,6 +1355,9 @@ class TransferManager:
         ):
             mark_fn = self.inbound_handler._mark_pstn_hangup_by_app
             on_queue_timeout_callback = lambda cid, ch: mark_fn(ch)
+
+        if not self.distribution_service:
+            return
 
         if campaign_cfg.get("voicebot") and campaign_cfg.get("external_ag_host"):
             self.distribution_service.start_voicebot_distribution(
@@ -1239,6 +1387,158 @@ class TransferManager:
                 distribution_metadata=distribution_metadata,
                 on_queue_timeout_callback=on_queue_timeout_callback,
             )
+
+    def on_welcome_finished(self, call_id: str) -> None:
+        """PlaybackFinished de WELCOMEPLAY en overflow/blind redistrib."""
+        if not claim_welcome_resume(self.state_store, call_id):
+            with self._welcome_deferred_lock:
+                self._welcome_deferred.pop(call_id, None)
+            self.logger.info(
+                "TransferManager.on_welcome_finished: resume no autorizado call_id=%s",
+                call_id,
+            )
+            return
+        with self._welcome_deferred_lock:
+            deferred = self._welcome_deferred.pop(call_id, None)
+        if not deferred:
+            self.logger.warning(
+                "TransferManager.on_welcome_finished: sin deferred call_id=%s",
+                call_id,
+            )
+            return
+        self._begin_redistribution_queue_hold_and_distribute(call_id, deferred)
+
+    # -------------------------------------------------------------------------
+    # 2a) Overflow por timeout de cola -> Campaña (sin agente)
+    # -------------------------------------------------------------------------
+    def overflow_to_campaign(self, call_id: str, target_camp_id: str) -> bool:
+        """
+        Re-encola la misma llamada en otra campaña tras timeout de cola (FAILOVER).
+
+        No cuelga PSTN ni marca is_transferred. Actualiza id_camp a la cola destino
+        (atribución = última cola). Emite TRANSFER OVERFLOW SYSTEM.
+        """
+        try:
+            target_id = int(target_camp_id)
+        except (TypeError, ValueError):
+            self.logger.error(
+                "overflow_to_campaign: target_camp_id inválido %r call_id=%s",
+                target_camp_id,
+                call_id,
+            )
+            return False
+
+        max_hops = int(getattr(settings, "MAX_OVERFLOW_HOPS", 5) or 5)
+
+        with self.state_store.lock(call_id):
+            ctx = self.state_store.get(call_id)
+            if not ctx or getattr(ctx, "call_ended", False):
+                self.logger.warning(
+                    "overflow_to_campaign: contexto ausente o finalizado call_id=%s",
+                    call_id,
+                )
+                return False
+            if not ctx.bridge_id or not ctx.pstn_channel:
+                self.logger.warning(
+                    "overflow_to_campaign: sin bridge/PSTN call_id=%s",
+                    call_id,
+                )
+                return False
+
+            source_camp_id = int(
+                getattr(ctx, "distribution_campaign_id", None)
+                or ctx.id_camp
+                or 0
+            )
+            if source_camp_id <= 0:
+                self.logger.warning(
+                    "overflow_to_campaign: sin campaña origen call_id=%s",
+                    call_id,
+                )
+                return False
+            if target_id == source_camp_id:
+                self.logger.warning(
+                    "overflow_to_campaign: destino igual a origen %s call_id=%s",
+                    target_id,
+                    call_id,
+                )
+                return False
+
+            overflow_count = int(getattr(ctx, "overflow_count", 0) or 0)
+            if overflow_count >= max_hops:
+                self.logger.warning(
+                    "overflow_to_campaign: hops %s >= MAX_OVERFLOW_HOPS=%s call_id=%s",
+                    overflow_count,
+                    max_hops,
+                    call_id,
+                )
+                return False
+
+            now_iso = datetime.now().astimezone().isoformat()
+            path = list(getattr(ctx, "overflow_path", None) or [])
+            path.append(
+                {
+                    "from_campaign_id": source_camp_id,
+                    "to_campaign_id": target_id,
+                    "reason": "QUEUE_TIMEOUT",
+                    "at": now_iso,
+                }
+            )
+            if not getattr(ctx, "is_overflow", False):
+                ctx.overflow_origin_campaign_id = source_camp_id
+            ctx.is_overflow = True
+            ctx.overflow_count = overflow_count + 1
+            ctx.overflow_from_campaign_id = source_camp_id
+            ctx.overflow_path = path
+            ctx.entry_reason = "overflow"
+            # Atribución = última cola
+            ctx.id_camp = target_id
+            ctx.distribution_campaign_id = target_id
+            ctx.agent_id = None
+            ctx.agent_attempt_channel = None
+            ctx.agent_connected_channel = None
+            ctx.agent_answered_ts = None
+
+            id_customer = ctx.id_customer
+            call_type = ctx.call_type
+            self.state_store.register_unsafe(call_id, ctx)
+
+        # MOH destino (o WELCOMEPLAY) lo arranca _start_redistribution_after_blind_to_campaign
+
+        self._log_transfer_result(
+            ctx=None,
+            initiator="SYSTEM",
+            transfer_type="OVERFLOW",
+            destination_type="CAMPAIGN",
+            endpoint="",
+            result="OK",
+            target_camp_id=target_id,
+            call_id=call_id,
+            id_customer=id_customer,
+            id_camp=source_camp_id,
+            call_type=call_type,
+            agent_id=None,
+        )
+
+        try:
+            self._start_redistribution_after_blind_to_campaign(
+                call_id, str(target_id)
+            )
+            self.logger.info(
+                "overflow_to_campaign: call_id=%s re-encolada %s -> %s (hops=%s)",
+                call_id,
+                source_camp_id,
+                target_id,
+                overflow_count + 1,
+            )
+            return True
+        except Exception:
+            self.logger.exception(
+                "overflow_to_campaign: fallo redistribution call_id=%s target=%s",
+                call_id,
+                target_id,
+            )
+            return False
 
     # -------------------------------------------------------------------------
     # 2) Blind Transfer -> Campaña (Re-encolar)
@@ -1290,9 +1590,10 @@ class TransferManager:
             source_camp_id = ctx.id_camp
             call_type = ctx.call_type
             source_agent_id = ctx.agent_id
+            is_voicebot_source = bool(getattr(ctx, "is_voicebot", False))
         
         # 2. Ejecución física fuera del lock (no modifica estado compartido)
-        self._start_moh(bridge_id)
+        # MOH / WELCOMEPLAY destino: _start_redistribution_after_blind_to_campaign
         
         if old_agent_ch:
             # hangup_channel ya tiene retry logic, si retorna False significa que falló después de reintentos
@@ -1333,6 +1634,25 @@ class TransferManager:
             ctx.transfer_phase = TRANSFER_PHASE_NONE
 
             self.state_store.register_unsafe(unique_id, ctx)
+
+        # Liberar presencia del agente origen humano (ONCALL→POSTCALL)
+        if (
+            self.agent_status_service
+            and source_agent_id
+            and not is_voicebot_source
+        ):
+            try:
+                self.agent_status_service.set_postcall_and_clear_fields(
+                    source_agent_id,
+                    call_id=call_id,
+                )
+            except Exception:
+                self.logger.warning(
+                    "blind_to_campaign: error set_postcall agent_id=%s call_id=%s",
+                    source_agent_id,
+                    call_id,
+                    exc_info=True,
+                )
 
         # 4. Reporte (fuera del lock, usando copias locales)
         self._log_transfer_result(
@@ -1780,6 +2100,25 @@ class TransferManager:
                     campaign_id=id_camp,
                     contact_number=phone_number,
                 )
+
+            # Liberar presencia del agente iniciador A (ONCALL→POSTCALL)
+            if (
+                self.agent_status_service
+                and agent_id
+                and agent_id != target_agent_id
+            ):
+                try:
+                    self.agent_status_service.set_postcall_and_clear_fields(
+                        agent_id,
+                        call_id=call_id,
+                    )
+                except Exception:
+                    self.logger.warning(
+                        "consult_complete: error set_postcall agent_id=%s call_id=%s",
+                        agent_id,
+                        call_id,
+                        exc_info=True,
+                    )
 
             # 4. Registrar resultado de la transferencia
             # Todos los valores ya fueron obtenidos dentro del lock antes de liberarlo
@@ -2361,7 +2700,7 @@ class TransferManager:
                 f"(call_id={call_id}, channel_id={channel_id})"
             )
 
-        # 5. Colgar agente anterior si sigue vivo
+        # 5. Colgar agente anterior si sigue vivo y liberar su presencia
         if old_agent:
             # hangup_channel ya tiene retry logic, si retorna False significa que falló después de reintentos
             hangup_result = self.ari.hangup_channel(old_agent)
@@ -2369,6 +2708,23 @@ class TransferManager:
                 self.logger.warning(
                     f"⚠️ No se pudo colgar canal de agente anterior {old_agent} después de reintentos. "
                     f"Continuando con la transferencia."
+                )
+        if (
+            self.agent_status_service
+            and old_agent_id
+            and old_agent_id != target_agent_id
+        ):
+            try:
+                self.agent_status_service.set_postcall_and_clear_fields(
+                    old_agent_id,
+                    call_id=call_id,
+                )
+            except Exception:
+                self.logger.warning(
+                    "on_transfer_leg_start: error set_postcall old_agent_id=%s call_id=%s",
+                    old_agent_id,
+                    call_id,
+                    exc_info=True,
                 )
 
         self.logger.info(f"✅ Blind Transfer completada para {call_id}")

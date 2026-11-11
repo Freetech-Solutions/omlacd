@@ -44,7 +44,10 @@ class RecordingEventHandler:
             return
 
         self.logger.debug(f"RecordingHandler: ChannelEnteredBridge: bridge={bridge_id}, channel={channel_id}")
-        
+        self.try_start(bridge_id, channel_id)
+
+    def try_start(self, bridge_id: str, channel_id: str) -> None:
+        """Intenta iniciar la grabación del bridge si se cumplen las condiciones."""
         context = self.state_store.get_by_bridge_id(bridge_id)
         if not context:
             self.logger.debug(f"No context found for bridge {bridge_id} in ChannelEnteredBridge")
