@@ -87,6 +87,7 @@ if not USE_REAL_PYDANTIC:
 if ARI_APP_DIR not in sys.path:
     sys.path.insert(0, ARI_APP_DIR)
 
+from constants import ChannelType  # noqa: E402
 from router import AcDRouter  # noqa: E402
 
 
@@ -96,7 +97,7 @@ class TestRouterDistributionServiceAttr(unittest.TestCase):
         self.mock_legacy = MagicMock()
         self.mock_legacy.should_forward_dial.return_value = True
         self.mock_legacy._get_dial_event_args.return_value = {
-            "channel_type": "to_agent",
+            "channel_type": ChannelType.TO_AGENT.value,
             "call_type": "2",
             "related_call_id": "1794326086.418",
             "callid": "1794326086.418",
@@ -108,10 +109,12 @@ class TestRouterDistributionServiceAttr(unittest.TestCase):
             handlers={},
             legacy_forwarder=self.mock_legacy,
             distribution_service=self.mock_dist,
+            get_campaign_config=lambda _cid: {},
         )
 
     def test_distribution_service_assigned_on_init(self):
         self.assertIs(self.router.distribution_service, self.mock_dist)
+        self.assertTrue(callable(self.router.get_campaign_config))
 
     @patch("router.parse_ari_event")
     def test_dial_to_agent_failure_calls_handle_agent_leg_dial_failure(self, mock_parse):
@@ -122,11 +125,13 @@ class TestRouterDistributionServiceAttr(unittest.TestCase):
             "type": "Dial",
             "dialstatus": "CANCEL",
             "peer": {"id": "f3cd7e65-af32-4086-934b-c519cc4a9596"},
+            "timestamp": "2026-11-09T14:48:05.000-0300",
         }
         self.router.handle_event(event_dict)
         self.mock_dist.handle_agent_leg_dial_failure.assert_called_once_with(
             "1794326086.418"
         )
+        self.mock_legacy.handle_dial_event.assert_called_once_with(event_dict)
 
 
 if __name__ == "__main__":

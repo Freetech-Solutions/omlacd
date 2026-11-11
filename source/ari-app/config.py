@@ -97,6 +97,14 @@ class Settings(BaseSettings):
         ge=1,
         description="Tope de desbordes encadenados por timeout de cola (FAILOVER)",
     )
+    FAILOVER_DIALPLAN_ENABLED: bool = Field(
+        default=False,
+        description=(
+            "Habilita handoff FAILOVER a destinos no-campaña (IVR/TC/Survey/…) vía dialplan. "
+            "Default false: solo campaña→campaña (tipo 1); resto → hangup como hoy. "
+            "Ver docs/failover_dialplan.md"
+        ),
+    )
     TRANSFER_TIMEOUT: int = Field(default=30, ge=1, description="Timeout para transferencias ciegas")
     CONSULT_TIMEOUT: int = Field(default=45, ge=1, description="Timeout para transferencias consultivas")
 
@@ -340,6 +348,15 @@ class Settings(BaseSettings):
         if isinstance(v, bool):
             return v
         s = (str(v).lower() if v is not None else 'true').strip()
+        return s in ('true', '1', 'yes', 'on')
+
+    @field_validator('FAILOVER_DIALPLAN_ENABLED', mode='before')
+    @classmethod
+    def _failover_dialplan_enabled_bool(cls, v: object) -> bool:
+        """Acepta 'true', '1', 'yes', 'on' como True; default False si vacío."""
+        if isinstance(v, bool):
+            return v
+        s = (str(v).lower() if v is not None else 'false').strip()
         return s in ('true', '1', 'yes', 'on')
 
     @field_validator('OMNILEADS_VERIFY_SSL', mode='before')

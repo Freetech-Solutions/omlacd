@@ -6,6 +6,7 @@ ejecuta el bucle de marcado con timeouts y coordina parada/timeout de cola.
 Reutilizable por InboundCallHandler y futuros handlers de campañas salientes (Discador).
 """
 
+import json
 import logging
 import threading
 import time
@@ -17,7 +18,14 @@ import redis
 
 from ari_manager import ARI
 from config import settings
-from constants import HangupCause, RedisKeys
+from constants import (
+    FAILOVER_DEST_TYPE_LABEL,
+    FAILOVER_DIALPLAN_ALLOWLIST,
+    FAILOVER_HANDOFF_TTL_SEC,
+    FailoverDestTipo,
+    HangupCause,
+    RedisKeys,
+)
 from queue_events import QueueEventManager
 from services.call_manager import CallActionService
 from services.campaign_config import get_campaign_config_with_defaults
@@ -2387,6 +2395,659 @@ class DistributionService:
                     loop_gen,
                 )
 
+    def _report_failover_to_hangup(
+        self,
+        call_id: str,
+        id_camp: str,
+        uniqueid: Optional[str],
+        dst_id: Any,
+        context_for_report: Optional[CallContext],
+        pstn_channel_id: Optional[str] = None,
+    ) -> None:
+        """
+        I2: FAILOVERDST tipo HANGUP. Emite EXIT_OVERFLOW (no FINAL) + transfer OVERFLOW→HANGUP
+        y marca contexto is_overflow. El caller debe seguir con cleanup EXIT_TIMEOUT (return False).
+        """
+        ctx = context_for_report or self.state_store.get(call_id)
+        if not ctx or getattr(ctx, "call_ended", False):
+            return
+
+        camp_id_int = int(id_camp) if str(id_camp).isdigit() else 0
+        dst_id_int = int(dst_id) if str(dst_id).isdigit() else dst_id
+        now_iso = datetime.now().astimezone().isoformat()
+
+        try:
+            with self.state_store.lock(call_id):
+                c = self.state_store.get(call_id)
+                if not c or getattr(c, "call_ended", False):
+                    return
+                if not getattr(c, "is_overflow", False):
+                    c.overflow_origin_campaign_id = (
+                        getattr(c, "distribution_campaign_id", None) or c.id_camp
+                    )
+                path = list(getattr(c, "overflow_path", None) or [])
+                path.append(
+                    {
+                        "from_campaign_id": camp_id_int or c.id_camp,
+                        "to_destination_type": "HANGUP",
+                        "to_destination_id": dst_id_int,
+                        "reason": "QUEUE_TIMEOUT",
+                        "at": now_iso,
+                    }
+                )
+                c.is_overflow = True
+                c.overflow_count = int(getattr(c, "overflow_count", 0) or 0) + 1
+                c.overflow_path = path
+                c.entry_reason = "overflow"
+                self.state_store.register_unsafe(call_id, c)
+                ctx = c
+        except Exception:
+            logger.exception(
+                "_report_failover_to_hangup: error actualizando contexto call_id=%s",
+                call_id,
+            )
+
+        if self.reporter and uniqueid:
+            try:
+                custom_data = {
+                    "is_overflow": True,
+                    "overflow_pending": False,
+                    "failover_dst_tipo": FailoverDestTipo.HANGUP,
+                    "failover_dst_id": dst_id_int,
+                    "destination_type": "HANGUP",
+                    "overflow_count": int(getattr(ctx, "overflow_count", 0) or 0),
+                    "overflow_origin_campaign_id": getattr(
+                        ctx, "overflow_origin_campaign_id", None
+                    )
+                    or camp_id_int,
+                    "overflow_path": list(getattr(ctx, "overflow_path", None) or []),
+                }
+                end_iso = datetime.now().isoformat()
+                bridge_wait_time = 0.0
+                duracion_llamada = 0.0
+                if getattr(ctx, "bridge_created_ts", None):
+                    try:
+                        start_dt = datetime.fromisoformat(ctx.bridge_created_ts)
+                        end_dt = datetime.fromisoformat(end_iso)
+                        duracion_llamada = max(0.0, (end_dt - start_dt).total_seconds())
+                        bridge_wait_time = duracion_llamada
+                    except Exception:
+                        pass
+                call_data = {
+                    "callid": call_id,
+                    "id_camp": camp_id_int or getattr(ctx, "id_camp", None),
+                    "id_customer": getattr(ctx, "id_customer", None),
+                    "phone_number": getattr(ctx, "phone_number", None),
+                    "tel_dialed": getattr(ctx, "tel_dialed", None),
+                    "call_type": getattr(ctx, "call_type", None) or 0,
+                    "is_voicebot": bool(getattr(ctx, "is_voicebot", False)),
+                    "is_voicebot_transfer": bool(
+                        getattr(ctx, "is_voicebot_transfer", False)
+                    ),
+                    "transfer_count": int(getattr(ctx, "transfer_count", 0) or 0),
+                    "agent_segments": list(getattr(ctx, "agent_segments", None) or []),
+                    "ts_start_iso": getattr(ctx, "bridge_created_ts", None),
+                    "ts_answer_iso": getattr(ctx, "pstn_answered_ts", None)
+                    or getattr(ctx, "agent_answered_ts", None),
+                }
+                self.reporter.log_segment_end(
+                    call_data=call_data,
+                    event_final=HangupCause.EXIT_OVERFLOW.value,
+                    is_transfer=False,
+                    quien_corto=0,
+                    uniqueid=uniqueid,
+                    callid=call_id,
+                    end_iso=end_iso,
+                    bridge_wait_time=bridge_wait_time,
+                    duracion_llamada=duracion_llamada,
+                    channel_leg="PSTN",
+                    channel_leg_id=getattr(ctx, "uniqueid_pstn", None) or pstn_channel_id,
+                    channel_leg_name=getattr(ctx, "pstn_channel", None) or pstn_channel_id,
+                    channel_leg_start_ts=getattr(ctx, "bridge_created_ts", None),
+                    channel_leg_answer_ts=getattr(ctx, "pstn_answered_ts", None),
+                    channel_leg_end_ts=end_iso,
+                    custom_data=custom_data,
+                )
+            except Exception:
+                logger.exception(
+                    "_report_failover_to_hangup: error EXIT_OVERFLOW call_id=%s",
+                    call_id,
+                )
+
+        if self.reporter:
+            try:
+                self.reporter.log_transfer(
+                    call_id=call_id,
+                    transfer_type="OVERFLOW",
+                    destination_type="HANGUP",
+                    initiated_by="SYSTEM",
+                    resultado="OK",
+                    campana_id_origen=camp_id_int or getattr(ctx, "id_camp", None),
+                    tipo_llamada=getattr(ctx, "call_type", None),
+                    contacto_id=getattr(ctx, "id_customer", None),
+                    numero_extra=f"{FailoverDestTipo.HANGUP},{dst_id_int}",
+                    leg_unique_id=uniqueid,
+                )
+            except Exception:
+                logger.exception(
+                    "_report_failover_to_hangup: error log_transfer call_id=%s",
+                    call_id,
+                )
+
+        logger.info(
+            "_report_failover_to_hangup: call_id=%s camp=%s → HANGUP dst_id=%s",
+            call_id,
+            id_camp,
+            dst_id_int,
+        )
+
+    def _failover_dest_label(self, dst_tipo: int) -> str:
+        return FAILOVER_DEST_TYPE_LABEL.get(int(dst_tipo), f"DEST_{dst_tipo}")
+
+    def _write_failover_handoff_ticket(
+        self,
+        call_id: str,
+        channel_id: str,
+        payload: Dict[str, Any],
+    ) -> None:
+        if not self.redis_client or not channel_id:
+            return
+        node_id = str(getattr(settings, "NODE_ID", "") or "default")
+        ttl = int(FAILOVER_HANDOFF_TTL_SEC)
+        raw = json.dumps(payload, default=str)
+        try:
+            pipe = self.redis_client.pipeline()
+            pipe.set(
+                RedisKeys.failover_handoff(node_id, call_id),
+                raw,
+                ex=ttl,
+            )
+            pipe.set(
+                RedisKeys.failover_handoff_by_channel(node_id, channel_id),
+                call_id,
+                ex=ttl,
+            )
+            pipe.execute()
+        except Exception:
+            logger.exception(
+                "_write_failover_handoff_ticket: error call_id=%s channel=%s",
+                call_id,
+                channel_id,
+            )
+
+    def _load_failover_handoff_by_channel(
+        self, channel_id: str
+    ) -> Optional[Dict[str, Any]]:
+        if not self.redis_client or not channel_id:
+            return None
+        node_id = str(getattr(settings, "NODE_ID", "") or "default")
+        try:
+            call_id = self.redis_client.get(
+                RedisKeys.failover_handoff_by_channel(node_id, channel_id)
+            )
+            if isinstance(call_id, bytes):
+                call_id = call_id.decode("utf-8")
+            if not call_id:
+                return None
+            raw = self.redis_client.get(
+                RedisKeys.failover_handoff(node_id, str(call_id))
+            )
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8")
+            if not raw:
+                return {"call_id": str(call_id), "pstn_channel": channel_id}
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                data.setdefault("call_id", str(call_id))
+                return data
+        except Exception:
+            logger.exception(
+                "_load_failover_handoff_by_channel: error channel=%s", channel_id
+            )
+        return None
+
+    def _delete_failover_handoff_ticket(
+        self, call_id: Optional[str], channel_id: Optional[str]
+    ) -> None:
+        if not self.redis_client:
+            return
+        node_id = str(getattr(settings, "NODE_ID", "") or "default")
+        try:
+            keys = []
+            if call_id:
+                keys.append(RedisKeys.failover_handoff(node_id, str(call_id)))
+            if channel_id:
+                keys.append(
+                    RedisKeys.failover_handoff_by_channel(node_id, str(channel_id))
+                )
+            if keys:
+                self.redis_client.delete(*keys)
+        except Exception:
+            logger.exception(
+                "_delete_failover_handoff_ticket: call_id=%s channel=%s",
+                call_id,
+                channel_id,
+            )
+
+    def peek_failover_handoff(self, channel_id: str) -> Optional[Dict[str, Any]]:
+        """Lee ticket de handoff sin borrarlo (I5 reentrada a campaña)."""
+        ticket = self._load_failover_handoff_by_channel(channel_id)
+        return ticket if isinstance(ticket, dict) else None
+
+    def consume_failover_handoff(
+        self, channel_id: str, call_id: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        I5: consume ticket al reentrar a Stasis (sin EXIT_TIMEOUT FINAL).
+        True path: dialplan → OBJ/1 → misma call_id. None si no había ticket.
+        """
+        ticket = self._load_failover_handoff_by_channel(channel_id)
+        if not isinstance(ticket, dict):
+            return None
+        tid = str(ticket.get("call_id") or call_id or "")
+        self._delete_failover_handoff_ticket(tid or call_id, channel_id)
+        logger.info(
+            "consume_failover_handoff: ticket consumido call_id=%s channel=%s "
+            "(reentrada Stasis)",
+            tid,
+            channel_id,
+        )
+        return ticket
+
+    def try_finalize_failover_handoff(self, channel_id: str) -> bool:
+        """
+        ChannelDestroyed fuera de Stasis tras handoff dialplan.
+        Emite EXIT_TIMEOUT FINAL (1 summary) y borra ticket. True si consumió handoff.
+        """
+        ticket = self._load_failover_handoff_by_channel(channel_id)
+        if not ticket:
+            return False
+
+        call_id = str(ticket.get("call_id") or "")
+        uniqueid = ticket.get("uniqueid") or call_id
+        id_camp = ticket.get("id_camp")
+        end_iso = datetime.now().isoformat()
+
+        if self.reporter:
+            try:
+                call_data = {
+                    "callid": call_id,
+                    "id_camp": id_camp,
+                    "id_customer": ticket.get("id_customer"),
+                    "phone_number": ticket.get("phone_number"),
+                    "tel_dialed": ticket.get("tel_dialed"),
+                    "call_type": ticket.get("call_type") or 0,
+                    "is_voicebot": False,
+                    "is_voicebot_transfer": False,
+                    "transfer_count": 0,
+                    "agent_segments": [],
+                    "ts_start_iso": ticket.get("bridge_created_ts"),
+                    "ts_answer_iso": ticket.get("pstn_answered_ts"),
+                }
+                custom_data = {
+                    "is_overflow": True,
+                    "overflow_pending": False,
+                    "failover_dst_tipo": ticket.get("failover_dst_tipo"),
+                    "failover_dst_id": ticket.get("failover_dst_id"),
+                    "destination_type": ticket.get("destination_type"),
+                    "overflow_path": ticket.get("overflow_path") or [],
+                    "handoff_to_dialplan": True,
+                }
+                self.reporter.log_segment_end(
+                    call_data=call_data,
+                    event_final=HangupCause.EXIT_TIMEOUT.value,
+                    is_transfer=False,
+                    quien_corto=0,
+                    uniqueid=uniqueid,
+                    callid=call_id,
+                    end_iso=end_iso,
+                    bridge_wait_time=0.0,
+                    duracion_llamada=0.0,
+                    channel_leg="PSTN",
+                    channel_leg_id=ticket.get("uniqueid_pstn") or channel_id,
+                    channel_leg_name=ticket.get("pstn_channel") or channel_id,
+                    channel_leg_start_ts=ticket.get("bridge_created_ts"),
+                    channel_leg_answer_ts=ticket.get("pstn_answered_ts"),
+                    channel_leg_end_ts=end_iso,
+                    custom_data=custom_data,
+                )
+            except Exception:
+                logger.exception(
+                    "try_finalize_failover_handoff: error EXIT_TIMEOUT call_id=%s",
+                    call_id,
+                )
+
+        self._delete_failover_handoff_ticket(call_id, channel_id)
+        try:
+            if call_id:
+                self.state_store.unregister(call_id)
+        except Exception:
+            logger.exception(
+                "try_finalize_failover_handoff: unregister call_id=%s", call_id
+            )
+
+        logger.info(
+            "try_finalize_failover_handoff: FINAL EXIT_TIMEOUT call_id=%s channel=%s",
+            call_id,
+            channel_id,
+        )
+        return True
+
+    def _overflow_to_dialplan(
+        self,
+        call_id: str,
+        id_camp: str,
+        uniqueid: Optional[str],
+        pstn_channel_id: Optional[str],
+        bridge_id: Optional[str],
+        dst_tipo: int,
+        dst_id: Any,
+        context_for_report: Optional[CallContext],
+        on_leave_acd_callback: Optional[OnQueueTimeoutCallback] = None,
+    ) -> bool:
+        """
+        I3: FAILOVER a IVR/TC/Survey — cleanup bridge, ticket Redis, redirect [oml-failover].
+        True = handoff OK (_on_queue_timeout return); False = fallback hangup timeout.
+        """
+        ctx = context_for_report or self.state_store.get(call_id)
+        if not ctx or getattr(ctx, "call_ended", False):
+            return False
+        if not pstn_channel_id:
+            logger.warning(
+                "_overflow_to_dialplan: sin pstn_channel call_id=%s", call_id
+            )
+            return False
+
+        camp_id_int = int(id_camp) if str(id_camp).isdigit() else 0
+        dst_id_int = int(dst_id) if str(dst_id).isdigit() else dst_id
+        dest_label = self._failover_dest_label(dst_tipo)
+        failover_dst = f"{int(dst_tipo)},{dst_id_int}"
+        now_iso = datetime.now().astimezone().isoformat()
+
+        if self.queue_event_manager:
+            try:
+                self.queue_event_manager.on_timeout(
+                    callid=call_id,
+                    uniqueid=uniqueid or call_id,
+                    campana_id=str(id_camp),
+                )
+            except Exception:
+                logger.exception(
+                    "_overflow_to_dialplan: on_timeout call_id=%s", call_id
+                )
+
+        path_entry = {
+            "from_campaign_id": camp_id_int or getattr(ctx, "id_camp", None),
+            "to_destination_type": dest_label,
+            "to_destination_id": dst_id_int,
+            "reason": "QUEUE_TIMEOUT",
+            "at": now_iso,
+        }
+
+        try:
+            with self.state_store.lock(call_id):
+                c = self.state_store.get(call_id)
+                if not c or getattr(c, "call_ended", False):
+                    return False
+                if not getattr(c, "is_overflow", False):
+                    c.overflow_origin_campaign_id = (
+                        getattr(c, "distribution_campaign_id", None) or c.id_camp
+                    )
+                path = list(getattr(c, "overflow_path", None) or [])
+                path.append(path_entry)
+                c.is_overflow = True
+                c.overflow_count = int(getattr(c, "overflow_count", 0) or 0) + 1
+                c.overflow_path = path
+                c.entry_reason = "overflow"
+                c.handoff_to_dialplan = True
+                self.state_store.register_unsafe(call_id, c)
+                ctx = c
+        except Exception:
+            logger.exception(
+                "_overflow_to_dialplan: error marcando handoff call_id=%s", call_id
+            )
+            return False
+
+        if self.reporter and uniqueid:
+            try:
+                custom_data = {
+                    "is_overflow": True,
+                    "overflow_pending": True,
+                    "failover_dst_tipo": int(dst_tipo),
+                    "failover_dst_id": dst_id_int,
+                    "destination_type": dest_label,
+                    "overflow_count": int(getattr(ctx, "overflow_count", 0) or 0),
+                    "overflow_origin_campaign_id": getattr(
+                        ctx, "overflow_origin_campaign_id", None
+                    )
+                    or camp_id_int,
+                    "overflow_path": list(getattr(ctx, "overflow_path", None) or []),
+                    "handoff_to_dialplan": True,
+                }
+                end_iso = datetime.now().isoformat()
+                bridge_wait_time = 0.0
+                duracion_llamada = 0.0
+                if getattr(ctx, "bridge_created_ts", None):
+                    try:
+                        start_dt = datetime.fromisoformat(ctx.bridge_created_ts)
+                        end_dt = datetime.fromisoformat(end_iso)
+                        duracion_llamada = max(
+                            0.0, (end_dt - start_dt).total_seconds()
+                        )
+                        bridge_wait_time = duracion_llamada
+                    except Exception:
+                        pass
+                call_data = {
+                    "callid": call_id,
+                    "id_camp": camp_id_int or getattr(ctx, "id_camp", None),
+                    "id_customer": getattr(ctx, "id_customer", None),
+                    "phone_number": getattr(ctx, "phone_number", None),
+                    "tel_dialed": getattr(ctx, "tel_dialed", None),
+                    "call_type": getattr(ctx, "call_type", None) or 0,
+                    "is_voicebot": bool(getattr(ctx, "is_voicebot", False)),
+                    "is_voicebot_transfer": bool(
+                        getattr(ctx, "is_voicebot_transfer", False)
+                    ),
+                    "transfer_count": int(getattr(ctx, "transfer_count", 0) or 0),
+                    "agent_segments": list(
+                        getattr(ctx, "agent_segments", None) or []
+                    ),
+                    "ts_start_iso": getattr(ctx, "bridge_created_ts", None),
+                    "ts_answer_iso": getattr(ctx, "pstn_answered_ts", None)
+                    or getattr(ctx, "agent_answered_ts", None),
+                }
+                self.reporter.log_segment_end(
+                    call_data=call_data,
+                    event_final=HangupCause.EXIT_OVERFLOW.value,
+                    is_transfer=False,
+                    quien_corto=0,
+                    uniqueid=uniqueid,
+                    callid=call_id,
+                    end_iso=end_iso,
+                    bridge_wait_time=bridge_wait_time,
+                    duracion_llamada=duracion_llamada,
+                    channel_leg="PSTN",
+                    channel_leg_id=getattr(ctx, "uniqueid_pstn", None)
+                    or pstn_channel_id,
+                    channel_leg_name=getattr(ctx, "pstn_channel", None)
+                    or pstn_channel_id,
+                    channel_leg_start_ts=getattr(ctx, "bridge_created_ts", None),
+                    channel_leg_answer_ts=getattr(ctx, "pstn_answered_ts", None),
+                    channel_leg_end_ts=end_iso,
+                    custom_data=custom_data,
+                )
+            except Exception:
+                logger.exception(
+                    "_overflow_to_dialplan: EXIT_OVERFLOW call_id=%s", call_id
+                )
+
+        if self.reporter:
+            try:
+                self.reporter.log_transfer(
+                    call_id=call_id,
+                    transfer_type="OVERFLOW",
+                    destination_type=dest_label,
+                    initiated_by="SYSTEM",
+                    resultado="OK",
+                    campana_id_origen=camp_id_int or getattr(ctx, "id_camp", None),
+                    tipo_llamada=getattr(ctx, "call_type", None),
+                    contacto_id=getattr(ctx, "id_customer", None),
+                    numero_extra=failover_dst,
+                    leg_unique_id=uniqueid,
+                )
+            except Exception:
+                logger.exception(
+                    "_overflow_to_dialplan: log_transfer call_id=%s", call_id
+                )
+
+        ticket = {
+            "call_id": call_id,
+            "uniqueid": uniqueid or call_id,
+            "id_camp": camp_id_int or getattr(ctx, "id_camp", None),
+            "id_customer": getattr(ctx, "id_customer", None),
+            "phone_number": getattr(ctx, "phone_number", None),
+            "tel_dialed": getattr(ctx, "tel_dialed", None),
+            "call_type": getattr(ctx, "call_type", None) or 0,
+            "pstn_channel": pstn_channel_id,
+            "uniqueid_pstn": getattr(ctx, "uniqueid_pstn", None),
+            "bridge_created_ts": getattr(ctx, "bridge_created_ts", None),
+            "pstn_answered_ts": getattr(ctx, "pstn_answered_ts", None),
+            "failover_dst_tipo": int(dst_tipo),
+            "failover_dst_id": dst_id_int,
+            "destination_type": dest_label,
+            "overflow_count": int(getattr(ctx, "overflow_count", 0) or 0),
+            "overflow_origin_campaign_id": getattr(
+                ctx, "overflow_origin_campaign_id", None
+            )
+            or camp_id_int,
+            "overflow_path": list(getattr(ctx, "overflow_path", None) or []),
+        }
+        self._write_failover_handoff_ticket(call_id, pstn_channel_id, ticket)
+
+        # Channel vars para [oml-failover] / IVR / TC / Survey (I4 terminal)
+        outnum = getattr(ctx, "phone_number", None) or ""
+        codcli = getattr(ctx, "id_customer", None)
+        if codcli is None or str(codcli) == "":
+            codcli = "-1"
+        call_type_id = getattr(ctx, "call_type", None) or 0
+        tel_dialed = getattr(ctx, "tel_dialed", None) or ""
+        camp_str = str(camp_id_int or getattr(ctx, "id_camp", "") or "")
+        uid_str = str(uniqueid or call_id)
+        for var_name, var_val in (
+            ("OMLFAILOVERDST", failover_dst),
+            ("__OMLFAILOVERDST", failover_dst),
+            ("OMLUNIQUEID", uid_str),
+            ("__OMLUNIQUEID", uid_str),
+            ("OMLCAMPID", camp_str),
+            ("__OMLCAMPID", camp_str),
+            ("OMLOUTNUM", str(outnum)),
+            ("__OMLOUTNUM", str(outnum)),
+            ("OMLCODCLI", str(codcli)),
+            ("__OMLCODCLI", str(codcli)),
+            ("OMLCALLTYPEID", str(call_type_id)),
+            ("__OMLCALLTYPEID", str(call_type_id)),
+            ("OMLINBOUNDID", str(tel_dialed)),
+            ("__OMLINBOUNDID", str(tel_dialed)),
+            ("__OMLFAILOVER", "true"),
+        ):
+            try:
+                self.ari_client.set_channel_variable(
+                    pstn_channel_id, var_name, var_val
+                )
+            except Exception:
+                logger.exception(
+                    "_overflow_to_dialplan: set var %s call_id=%s",
+                    var_name,
+                    call_id,
+                )
+
+        if bridge_id:
+            try:
+                if self.call_service and hasattr(
+                    self.call_service, "stop_moh_on_bridge"
+                ):
+                    self.call_service.stop_moh_on_bridge(bridge_id)
+                else:
+                    self.ari_client.delete(f"bridges/{bridge_id}/moh")
+            except Exception:
+                logger.debug(
+                    "_overflow_to_dialplan: stop MOH bridge=%s",
+                    bridge_id,
+                    exc_info=True,
+                )
+            try:
+                self.ari_client.remove_channel_from_bridge(
+                    bridge_id, pstn_channel_id
+                )
+            except Exception:
+                logger.exception(
+                    "_overflow_to_dialplan: remove PSTN del bridge call_id=%s",
+                    call_id,
+                )
+            try:
+                self.ari_client.destroy_bridge(bridge_id)
+            except Exception:
+                logger.exception(
+                    "_overflow_to_dialplan: destroy_bridge call_id=%s", call_id
+                )
+
+        redirect_ok = False
+        try:
+            redirect_ok = bool(
+                self.ari_client.redirect_to_dialplan(
+                    pstn_channel_id,
+                    context="oml-failover",
+                    extension="s",
+                    priority=1,
+                )
+            )
+        except Exception:
+            logger.exception(
+                "_overflow_to_dialplan: redirect falló call_id=%s", call_id
+            )
+
+        if not redirect_ok:
+            logger.warning(
+                "_overflow_to_dialplan: redirect_to_dialplan falló call_id=%s → fallback",
+                call_id,
+            )
+            self._delete_failover_handoff_ticket(call_id, pstn_channel_id)
+            try:
+                with self.state_store.lock(call_id):
+                    c = self.state_store.get(call_id)
+                    if c:
+                        c.handoff_to_dialplan = False
+                        self.state_store.register_unsafe(call_id, c)
+            except Exception:
+                pass
+            return False
+
+        # Progressive/dialer: acusar antes de unregister (callback lee id_camp del ctx).
+        if on_leave_acd_callback is not None:
+            try:
+                on_leave_acd_callback(call_id, pstn_channel_id)
+            except Exception:
+                logger.exception(
+                    "_overflow_to_dialplan: on_leave_acd_callback call_id=%s",
+                    call_id,
+                )
+
+        try:
+            self.state_store.unregister(call_id)
+        except Exception:
+            logger.exception(
+                "_overflow_to_dialplan: unregister call_id=%s", call_id
+            )
+
+        logger.info(
+            "_overflow_to_dialplan: OK call_id=%s camp=%s → %s (%s) dialplan oml-failover",
+            call_id,
+            id_camp,
+            dest_label,
+            failover_dst,
+        )
+        return True
+
     def _attempt_queue_overflow(
         self,
         call_id: str,
@@ -2395,15 +3056,18 @@ class DistributionService:
         pstn_channel_id: Optional[str],
         bridge_id: Optional[str],
         context_for_report: Optional[CallContext],
+        on_leave_acd_callback: Optional[OnQueueTimeoutCallback] = None,
     ) -> bool:
         """
         Si FAILOVER apunta a otra campaña y hay handler, reporta EXIT_OVERFLOW
         (flow-out en A) y desborda sin hangup PSTN. True = overflow OK (caller return).
-        """
-        overflow_fn = self._overflow_to_campaign
-        if overflow_fn is None:
-            return False
 
+        I2: tipo HANGUP + FAILOVER_DIALPLAN_ENABLED → reportes hop + return False
+        (cleanup EXIT_TIMEOUT / hangup PSTN / destroy bridge en _on_queue_timeout).
+
+        I3: IVR/TC/Survey + flag → redirect [oml-failover]; on_leave_acd_callback
+        se invoca antes de unregister (dialer progressive).
+        """
         try:
             cfg = get_campaign_config_with_defaults(self.redis_client, str(id_camp))
         except Exception:
@@ -2419,14 +3083,66 @@ class DistributionService:
 
         dst_tipo = cfg.get("failover_dst_tipo")
         dst_id = cfg.get("failover_dst_id")
-        if dst_tipo != 1 or not dst_id:
-            logger.info(
-                "_attempt_queue_overflow: FAILOVER no es campaña (tipo=%s dst=%s) "
-                "call_id=%s → hangup",
-                dst_tipo,
-                dst_id,
-                call_id,
+        dialplan_enabled = bool(
+            getattr(settings, "FAILOVER_DIALPLAN_ENABLED", False)
+        )
+
+        # I2: DestinoEntrante.HANGUP — reportar y dejar que el timeout cierre canales.
+        if (
+            dialplan_enabled
+            and dst_tipo == FailoverDestTipo.HANGUP
+            and dst_id
+        ):
+            self._report_failover_to_hangup(
+                call_id=call_id,
+                id_camp=str(id_camp),
+                uniqueid=uniqueid,
+                dst_id=dst_id,
+                context_for_report=context_for_report,
+                pstn_channel_id=pstn_channel_id,
             )
+            return False
+
+        # I3: IVR / TC / Survey → dialplan [oml-failover]
+        if (
+            dialplan_enabled
+            and dst_tipo in FAILOVER_DIALPLAN_ALLOWLIST
+            and dst_id
+        ):
+            return self._overflow_to_dialplan(
+                call_id=call_id,
+                id_camp=str(id_camp),
+                uniqueid=uniqueid,
+                pstn_channel_id=pstn_channel_id,
+                bridge_id=bridge_id,
+                dst_tipo=int(dst_tipo),
+                dst_id=dst_id,
+                context_for_report=context_for_report,
+                on_leave_acd_callback=on_leave_acd_callback,
+            )
+
+        # tipo 1 = DestinoEntrante.CAMPANA (overflow Stasis→Stasis).
+        if dst_tipo != FailoverDestTipo.CAMPANA or not dst_id:
+            if dialplan_enabled and dst_tipo not in (None, FailoverDestTipo.CAMPANA) and dst_id:
+                logger.info(
+                    "_attempt_queue_overflow: FAILOVER_DIALPLAN_ENABLED=true pero "
+                    "destino tipo=%s no en allowlist dialplan "
+                    "call_id=%s → hangup",
+                    dst_tipo,
+                    call_id,
+                )
+            else:
+                logger.info(
+                    "_attempt_queue_overflow: FAILOVER no es campaña (tipo=%s dst=%s) "
+                    "call_id=%s → hangup",
+                    dst_tipo,
+                    dst_id,
+                    call_id,
+                )
+            return False
+
+        overflow_fn = self._overflow_to_campaign
+        if overflow_fn is None:
             return False
 
         target_camp_id = str(dst_id)
@@ -2749,7 +3465,7 @@ class DistributionService:
                 )
             current_agent_channel = None
 
-        # Desborde FAILOVER → campaña (antes de mark_call_ended / hangup PSTN)
+        # Desborde FAILOVER → campaña / dialplan (antes de mark_call_ended / hangup PSTN)
         if self._attempt_queue_overflow(
             call_id=call_id,
             id_camp=str(id_camp),
@@ -2757,6 +3473,7 @@ class DistributionService:
             pstn_channel_id=pstn_channel_id,
             bridge_id=bridge_id,
             context_for_report=context_for_report,
+            on_leave_acd_callback=cb,
         ):
             return
 

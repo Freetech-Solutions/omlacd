@@ -46,6 +46,8 @@ def _voicebot_context(**overrides):
     ctx.agent_answered_ts = "2026-06-04T16:16:46"
     ctx.queue_timeout_seconds = 10
     ctx.inbound_agent_hung_up_first = False
+    # Explicit False: MagicMock attrs are otherwise truthy and trip handoff skip.
+    ctx.handoff_to_dialplan = False
     for key, value in overrides.items():
         setattr(ctx, key, value)
     return ctx

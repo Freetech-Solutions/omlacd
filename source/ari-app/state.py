@@ -105,6 +105,8 @@ class CallContext(BaseModel):
     overflow_from_campaign_id: Optional[int] = None
     overflow_path: List[Dict[str, Any]] = Field(default_factory=list)
     entry_reason: Optional[str] = None  # "overflow" al re-encolar tras desborde
+    # True tras redirect FAILOVER a dialplan: StasisEnd no debe finalize/abandon
+    handoff_to_dialplan: bool = False
     pstn_channel_bridged: bool = False
     # True tras Dial PROGRESS (183): early media ya va al bridge y el ringback no se rearma
     pstn_early_media: bool = False

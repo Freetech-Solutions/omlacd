@@ -3,7 +3,7 @@ import threading
 import time
 import uuid
 from datetime import datetime
-from typing import Any, Optional, Dict, Union, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from handlers.base import BaseHandler
 from state import CallContext
@@ -13,6 +13,7 @@ from state_helpers import (
     is_agent_leg_channel,
     is_consult_initiator_channel,
     is_pstn_hangup_during_blind_transfer_ringing,
+    pending_blind_transfer_abort_legs,
     should_block_operation_for_transfer,
 )
 from utils import compute_bot_agent_durations, parse_ari_args, determine_who_hung_up
@@ -1191,48 +1192,57 @@ class ManualCallHandler(BaseHandler):
         call_id = context.call_id
         if not call_id:
             return
-        candidate_transfer_channel_to_abort: Optional[str] = None
+        channels_to_abort: List[str] = []
         with self.state_store.lock(call_id):
             fresh_context = self.state_store.get(call_id)
             if not fresh_context or not is_pstn_hangup_during_blind_transfer_ringing:
                 return
+            # Preferir blind_transfer_leg_id (originate / RING pre-Stasis); complementar
+            # con agent_attempt si TransferLegStart ya corrió y aún no consolidó.
+            seen: set = set()
+            for ch in pending_blind_transfer_abort_legs(fresh_context):
+                if ch and ch not in seen and ch != channel_id:
+                    seen.add(ch)
+                    channels_to_abort.append(ch)
             potential_transfer_ch = getattr(fresh_context, "agent_attempt_channel", None)
             uniqueid_agent = getattr(fresh_context, "uniqueid_agent", None)
             if (
                 potential_transfer_ch
                 and potential_transfer_ch.strip()
                 and potential_transfer_ch != uniqueid_agent
+                and potential_transfer_ch not in seen
+                and potential_transfer_ch != channel_id
             ):
-                candidate_transfer_channel_to_abort = potential_transfer_ch
+                seen.add(potential_transfer_ch)
+                channels_to_abort.append(potential_transfer_ch)
+            if channels_to_abort:
                 logging.info(
-                    "🧵 _process_call_end: Preparando aborto de pierna de transferencia "
+                    "🧵 _process_call_end: Preparando aborto de pierna(s) de transferencia "
                     "durante transferencia ciega en Ringing: "
                     f"call_id={fresh_context.call_id}, "
-                    f"candidate_transfer_channel={candidate_transfer_channel_to_abort}"
+                    f"channels={channels_to_abort}"
                 )
             if getattr(fresh_context, "transfer_in_progress", False):
                 fresh_context.transfer_in_progress = False
                 self.state_store.register_unsafe(call_id, fresh_context)
-        if candidate_transfer_channel_to_abort and (
-            not channel_id or candidate_transfer_channel_to_abort != channel_id
-        ):
+        for abort_ch in channels_to_abort:
             try:
-                hangup_result = self.ari_client.hangup_channel(candidate_transfer_channel_to_abort)
+                hangup_result = self.ari_client.hangup_channel(abort_ch)
                 if hangup_result:
                     logging.info(
                         "✅ Pierna de transferencia colgada exitosamente tras "
                         "PSTN hangup durante transferencia ciega en Ringing: "
-                        f"channel_id={candidate_transfer_channel_to_abort}"
+                        f"channel_id={abort_ch}"
                     )
                 else:
                     logging.debug(
                         "⚠️ hangup_channel retornó False para canal de transferencia "
-                        f"{candidate_transfer_channel_to_abort} (puede que ya no exista)"
+                        f"{abort_ch} (puede que ya no exista)"
                     )
             except Exception as e:
                 logging.error(
                     "❌ Error al colgar canal de transferencia "
-                    f"{candidate_transfer_channel_to_abort}: {e}",
+                    f"{abort_ch}: {e}",
                     exc_info=True,
                 )
 

@@ -42,7 +42,7 @@ from services.queue_welcome import (
     start_welcome_or_continue,
     stop_welcome_if_playing,
 )
-from state import CallContext, CallRegistry
+from state import TRANSFER_PHASE_NONE, CallContext, CallRegistry
 from state_helpers import (
     active_agent_channel,
     call_has_prior_agent_handling,
@@ -50,6 +50,9 @@ from state_helpers import (
     effective_queue_campaign_id,
     finalize_current_agent_segment,
     is_agent_leg_channel,
+    pending_blind_transfer_abort_legs,
+    pending_consult_abort_bridges,
+    pending_consult_abort_legs,
 )
 
 if TYPE_CHECKING:
@@ -212,15 +215,67 @@ class ProgressiveCampaignHandler(BaseHandler):
                 )
 
     def _pstn_safety_net_cleanup(self, context: CallContext, call_id: str) -> None:
-        """Purga recursos ARI cuando el PSTN se va (bridge, agentes, distribución)."""
-        bridge_id = getattr(context, "bridge_id", None)
-        if bridge_id and str(bridge_id).strip():
-            self._stop_active_recording(context, bridge_id)
+        """Purga recursos ARI cuando el PSTN se va (bridge, agentes, distribución).
+
+        Incluye blind_transfer_leg_id (RING pre-consolidación) y recursos de consulta activa.
+        """
+        fresh_ctx = context
+        extra_legs: List[str] = []
+        extra_bridges: List[str] = []
+        try:
+            with self.state_store.lock(call_id):
+                locked = self.state_store.get(call_id)
+                # Solo refrescar con CallContext real (MagicMock de get() sin stub no sirve).
+                if isinstance(locked, CallContext):
+                    fresh_ctx = locked
+                extra_legs = (
+                    list(pending_blind_transfer_abort_legs(fresh_ctx))
+                    + list(pending_consult_abort_legs(fresh_ctx))
+                )
+                extra_bridges = list(pending_consult_abort_bridges(fresh_ctx))
+                dirty = False
+                if extra_legs and getattr(fresh_ctx, "transfer_in_progress", False) is True:
+                    fresh_ctx.transfer_in_progress = False
+                    dirty = True
+                cons = getattr(fresh_ctx, "consultation", None)
+                if cons is not None and getattr(cons, "active", False) is True:
+                    cons.active = False
+                    dirty = True
+                    fresh_ctx.transfer_phase = TRANSFER_PHASE_NONE
+                if dirty:
+                    self.state_store.register_unsafe(call_id, fresh_ctx)
+        except Exception:
+            logger.exception(
+                "ProgressiveCampaignHandler: PSTN Hangup - error leyendo contexto abort "
+                "blind/consult (call_id=%s)",
+                call_id,
+            )
+            extra_legs = (
+                list(pending_blind_transfer_abort_legs(fresh_ctx))
+                + list(pending_consult_abort_legs(fresh_ctx))
+            )
+            extra_bridges = list(pending_consult_abort_bridges(fresh_ctx))
+
+        bridges: List[str] = []
+        bridge_seen: Set[str] = set()
+        for bid in [getattr(fresh_ctx, "bridge_id", None)] + extra_bridges:
+            if isinstance(bid, str) and bid.strip() and bid not in bridge_seen:
+                bridge_seen.add(bid)
+                bridges.append(bid)
+
+        for bridge_id in bridges:
+            if bridge_id == getattr(fresh_ctx, "bridge_id", None):
+                self._stop_active_recording(fresh_ctx, bridge_id)
             try:
                 self.ari_client.destroy_bridge(bridge_id)
             except Exception:
                 pass
-        for agent_leg in distinct_agent_leg_ids(context):
+
+        seen: Set[str] = set()
+        for agent_leg in list(distinct_agent_leg_ids(fresh_ctx)) + extra_legs:
+            if not isinstance(agent_leg, str) or not agent_leg or agent_leg in seen:
+                continue
+            seen.add(agent_leg)
             try:
                 self.ari_client.hangup_channel(agent_leg)
             except Exception:
@@ -2187,6 +2242,15 @@ class ProgressiveCampaignHandler(BaseHandler):
             if not context:
                 return
             if not self._is_pstn_leg_channel(channel_id, context):
+                return
+            # Comparar con `is True` evita que mocks truthy activen el skip.
+            if getattr(context, "handoff_to_dialplan", False) is True:
+                logger.info(
+                    "ProgressiveCampaignHandler.on_pstn_stasis_end: handoff FAILOVER→dialplan "
+                    "(call_id=%s, channel_id=%s); no finalize",
+                    context.call_id,
+                    channel_id,
+                )
                 return
             self.finalize_progressive_pstn_end(context, channel_id, source="stasis_end")
         except Exception as e:

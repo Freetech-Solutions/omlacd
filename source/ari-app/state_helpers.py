@@ -75,6 +75,66 @@ def distinct_agent_leg_ids(context: CallContext) -> List[str]:
     return out
 
 
+def pending_blind_transfer_abort_legs(context: CallContext) -> List[str]:
+    """
+    Pierna B originada por blind_to_endpoint aún no consolidada.
+
+    ``blind_transfer_leg_id`` se setea al originate (destino puede seguir en AppDial2
+    RINGING sin StasisStart). En ese intervalo no está en agent_attempt/connected,
+    así que distinct_agent_leg_ids no la cuelga.
+
+    No afecta distribución de cola ni handoff voicebot (no setean este campo).
+    Tras consolidar (is_transferred / reset tracking) el campo queda None → [].
+    """
+    if getattr(context, "is_transferred", False) is True:
+        return []
+    btl = getattr(context, "blind_transfer_leg_id", None)
+    # Exigir str real: MagicMock es truthy y rompe assert_called_once en safety-net.
+    if isinstance(btl, str) and btl.strip():
+        return [btl.strip()]
+    return []
+
+
+def _consultation_active(context: CallContext) -> bool:
+    """True solo si consultation.active es bool True (no MagicMock truthy)."""
+    cons = getattr(context, "consultation", None)
+    if cons is None:
+        return False
+    return getattr(cons, "active", False) is True
+
+
+def pending_consult_abort_legs(context: CallContext) -> List[str]:
+    """
+    Pierna B de consulta activa (``consultation.consult_leg_ch``).
+
+    Vive en el bridge de consulta, no en agent_attempt/connected del bridge principal;
+    el safety-net del PSTN debe colgarla explícitamente.
+    """
+    if not _consultation_active(context):
+        return []
+    cons = getattr(context, "consultation", None)
+    leg = getattr(cons, "consult_leg_ch", None)
+    if isinstance(leg, str) and leg.strip():
+        return [leg.strip()]
+    return []
+
+
+def pending_consult_abort_bridges(context: CallContext) -> List[str]:
+    """
+    Bridge de consulta activo, distinto del bridge principal de la llamada.
+    """
+    if not _consultation_active(context):
+        return []
+    cons = getattr(context, "consultation", None)
+    consult_bridge = getattr(cons, "consult_bridge", None)
+    if not isinstance(consult_bridge, str) or not consult_bridge.strip():
+        return []
+    main_bridge = getattr(context, "bridge_id", None)
+    if isinstance(main_bridge, str) and consult_bridge.strip() == main_bridge.strip():
+        return []
+    return [consult_bridge.strip()]
+
+
 def effective_queue_campaign_id(ctx: CallContext) -> Optional[int]:
     """
     Campaña de cola operativa (eventos en vivo, stats ACD, voicebot-calls).

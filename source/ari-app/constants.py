@@ -76,6 +76,36 @@ class HangupCause(Enum):
     EXIT_UNKNOWN = 'EXIT_UNKNOWN'
 
 
+# DestinoEntrante.tipo (Django configuracion_telefonia_app) para FAILOVERDST.
+class FailoverDestTipo:
+    CAMPANA = 1
+    VALIDACION_FECHA_HORA = 2
+    IVR = 3
+    HANGUP = 5
+    SURVEY = 6
+
+
+# Allowlist I3+: handoff Stasis → dialplan [oml-failover] (no incluye HANGUP=ARI puro).
+FAILOVER_DIALPLAN_ALLOWLIST = frozenset(
+    {
+        FailoverDestTipo.VALIDACION_FECHA_HORA,
+        FailoverDestTipo.IVR,
+        FailoverDestTipo.SURVEY,
+    }
+)
+
+FAILOVER_DEST_TYPE_LABEL = {
+    FailoverDestTipo.VALIDACION_FECHA_HORA: "TIME_CONDITION",
+    FailoverDestTipo.IVR: "IVR",
+    FailoverDestTipo.SURVEY: "SURVEY",
+    FailoverDestTipo.HANGUP: "HANGUP",
+    FailoverDestTipo.CAMPANA: "CAMPAIGN",
+}
+
+# TTL ticket Redis tras handoff a dialplan (IVR puede demorar).
+FAILOVER_HANDOFF_TTL_SEC = 3600
+
+
 # Mapeo Q.850 (Asterisk cause) → evento de negocio para pierna PSTN no contestada.
 AST_CAUSE_TO_EVENT = {
     1: HangupCause.NOT_FOUND.value,      # Unallocated (unassigned) number — tip. SIP 404
@@ -294,6 +324,16 @@ class RedisKeys:
     def pending_amd(node_id: str, channel_id: str) -> str:
         """Estado pendiente post-AMD para canal (metadata para continuar distribución)."""
         return f"acd:{node_id}:pending_amd:{channel_id}"
+
+    @staticmethod
+    def failover_handoff(node_id: str, call_id: str) -> str:
+        """Ticket de handoff FAILOVER → dialplan (por call_id)."""
+        return f"acd:{node_id}:failover_handoff:{call_id}"
+
+    @staticmethod
+    def failover_handoff_by_channel(node_id: str, channel_id: str) -> str:
+        """Índice canal → call_id de handoff FAILOVER (ChannelDestroyed fuera de Stasis)."""
+        return f"acd:{node_id}:failover_handoff_ch:{channel_id}"
 
     @staticmethod
     def agent_hash(agent_id: str) -> str:
