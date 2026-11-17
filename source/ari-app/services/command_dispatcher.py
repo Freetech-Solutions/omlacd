@@ -2,6 +2,7 @@ import logging
 from typing import Dict, Any, Optional
 
 from config import settings
+from constants import CallType
 from services.call_manager import CallActionService
 from services.agent_status_service import AgentStatusService
 from transfer import TransferManager
@@ -127,6 +128,7 @@ class CommandDispatcher:
         bridge_id = None
         bridge_id_3way = None
         bridge_id_moh = None
+        hangup_via_finalize = False
 
         # 1. Lectura bajo lock (evita race conditions; el lock no es reentrante)
         with self.state_store.lock(call_id):
@@ -138,6 +140,15 @@ class CommandDispatcher:
             if action_normalized == 'HANGUP':
                 channel_ids = self.state_store._get_all_associated_channels(ctx).copy()
                 bridge_id = ctx.bridge_id
+                call_type_val = self._call_type_value(ctx)
+                if call_type_val in (
+                    CallType.PROGRESSIVE.value,
+                    CallType.INBOUND.value,
+                ):
+                    # Agente corta: quien_corto=1 en el reporte del finalize.
+                    ctx.inbound_agent_hung_up_first = True
+                    self.state_store.register_unsafe(call_id, ctx)
+                    hangup_via_finalize = True
             elif action == 'TRANSFER':
                 transfer_handler = self.handlers.get('TRANSFER')
             elif action == 'three_way_conf':
@@ -156,6 +167,8 @@ class CommandDispatcher:
             return
 
         if action_normalized == 'HANGUP':
+            if hangup_via_finalize and self._hangup_via_finalize(call_id, ctx):
+                return
             self._handle_hangup(call_id, channel_ids, bridge_id)
             return
 
@@ -449,6 +462,85 @@ class CommandDispatcher:
                 f"CommandDispatcher: Error stopping MOH for call_id={call_id}: {e}",
                 exc_info=True,
             )
+
+    @staticmethod
+    def _call_type_value(ctx) -> str:
+        """Normaliza ctx.type a string (enum o valor crudo)."""
+        raw = getattr(ctx, "type", None)
+        if raw is None:
+            return ""
+        return str(raw.value if hasattr(raw, "value") else raw)
+
+    def _hangup_via_finalize(self, call_id: str, ctx) -> bool:
+        """
+        Progressive/inbound: reutiliza finalize_*_pstn_end (stop recording,
+        log_segment_end → interactions_summary, POSTCALL, unregister).
+
+        Retorna True si el cierre quedó a cargo del handler (incluye False del
+        finalize: otro hilo ya cerró). False solo si no hay handler/PSTN y hay
+        que caer al hangup legado.
+        """
+        call_type_val = self._call_type_value(ctx)
+        pstn_channel = getattr(ctx, "pstn_channel", None) or getattr(
+            ctx, "uniqueid_pstn", None
+        )
+        if not pstn_channel or not str(pstn_channel).strip():
+            self.logger.warning(
+                "CommandDispatcher: HANGUP call_id=%s tipo=%s sin pstn_channel; "
+                "fallback a hangup legado",
+                call_id,
+                call_type_val,
+            )
+            return False
+
+        if call_type_val == CallType.PROGRESSIVE.value:
+            handler = self.handlers.get(CallType.PROGRESSIVE.value)
+            finalize = (
+                getattr(handler, "finalize_progressive_pstn_end", None)
+                if handler
+                else None
+            )
+        elif call_type_val == CallType.INBOUND.value:
+            handler = self.handlers.get(CallType.INBOUND.value)
+            finalize = (
+                getattr(handler, "finalize_inbound_pstn_end", None)
+                if handler
+                else None
+            )
+        else:
+            return False
+
+        if not callable(finalize):
+            self.logger.warning(
+                "CommandDispatcher: HANGUP call_id=%s sin finalize en handler tipo=%s; "
+                "fallback a hangup legado",
+                call_id,
+                call_type_val,
+            )
+            return False
+
+        try:
+            won = finalize(ctx, str(pstn_channel).strip(), source="hangup_command")
+        except Exception:
+            self.logger.exception(
+                "CommandDispatcher: error en finalize HANGUP call_id=%s tipo=%s",
+                call_id,
+                call_type_val,
+            )
+            return False
+
+        if won is False:
+            self.logger.info(
+                "CommandDispatcher: HANGUP call_id=%s ya finalizada por otro flujo",
+                call_id,
+            )
+        else:
+            self.logger.info(
+                "CommandDispatcher: HANGUP call_id=%s cerrado vía finalize (%s)",
+                call_id,
+                call_type_val,
+            )
+        return True
 
     def _handle_hangup(
         self,
