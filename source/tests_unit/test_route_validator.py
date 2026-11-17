@@ -50,7 +50,7 @@ class TestRouteValidatorGetTrunkCallerid(unittest.TestCase):
     def _hget_model(outcid=None, outr=None, trunk_for_route=None, trunk_callerid=None):
         """Construye un side_effect de hget que emula el modelo de datos real.
 
-        - OML:CAMP:{id} campo OUTCID         -> outcid
+        - OML:CAMP:{id} campo OUTCID         -> outcid (str) o outcid[camp_id] (dict)
         - OML:CAMP:{id} campo OUTR           -> outr
         - OML:OUTR:{route} campo TRUNK-1     -> trunk_for_route[route]
         - OML:TRUNK:{trunk} campo CALLERID   -> trunk_callerid[trunk]
@@ -60,6 +60,9 @@ class TestRouteValidatorGetTrunkCallerid(unittest.TestCase):
 
         def hget(k, f):
             if k.startswith("OML:CAMP:") and f == "OUTCID":
+                if isinstance(outcid, dict):
+                    camp_id = k.split(":")[-1]
+                    return outcid.get(camp_id)
                 return outcid
             if k.startswith("OML:CAMP:") and f == "OUTR":
                 return outr
@@ -178,12 +181,51 @@ class TestRouteValidatorGetTrunkCallerid(unittest.TestCase):
             trunk_callerid={"10": "+1DEFAULT", "20": "+1OVERRIDE"},
         )
 
-        # Primero poblamos el caché por campaña (sin override).
+        # Primero poblamos el caché por ruta default (sin override).
         self.assertEqual(self.validator.get_trunk_callerid("42"), "+1DEFAULT")
-        # El override debe ir por su propia ruta, ignorando el caché por campaña.
+        # El override debe ir por su propia ruta, ignorando el caché de la ruta default.
         self.assertEqual(
             self.validator.get_trunk_callerid("42", override_route_id="55"),
             "+1OVERRIDE",
+        )
+
+    def test_two_campaigns_same_route_keep_own_outcid(self):
+        """Campañas distintas con la misma ruta y override_route_id no comparten OUTCID."""
+        self.redis.hget.side_effect = self._hget_model(
+            outcid={"6": None, "7": "923125350"},
+            outr="1",
+            trunk_for_route={"1": "10"},
+            trunk_callerid={"10": ""},
+        )
+        # Campaña 6 sin OUTCID ni CALLERID de trunk: None (no cachea).
+        self.assertIsNone(
+            self.validator.get_trunk_callerid("6", override_route_id="1")
+        )
+        # Campaña 7 con OUTCID propio: no hereda el vacío de la 6 vía caché de ruta.
+        self.assertEqual(
+            self.validator.get_trunk_callerid("7", override_route_id="1"),
+            "923125350",
+        )
+
+    def test_none_result_is_not_cached(self):
+        """Un None (sin OUTCID ni CALLERID de trunk) no se cachea; la siguiente
+        lectura con OUTCID ya en Redis lo ve."""
+        self.redis.hget.side_effect = self._hget_model(
+            outcid=None, outr="1", trunk_for_route={"1": "10"}, trunk_callerid={"10": ""}
+        )
+        self.assertIsNone(self.validator.get_trunk_callerid("7", override_route_id="1"))
+        self.assertEqual(len(self.RouteValidator._CALLERID_CACHE_BY_ROUTE), 0)
+        self.assertNotIn("7", self.RouteValidator._CALLERID_CACHE)
+
+        self.redis.hget.side_effect = self._hget_model(
+            outcid="923125350",
+            outr="1",
+            trunk_for_route={"1": "10"},
+            trunk_callerid={"10": ""},
+        )
+        self.assertEqual(
+            self.validator.get_trunk_callerid("7", override_route_id="1"),
+            "923125350",
         )
 
 

@@ -461,10 +461,11 @@ class CallActionService:
         # Construir endpoint PSTN
         endpoint = f'{ProtocolPrefix.PJSIP.value}{number}@{pstn_gateway}'
         
-        # CallerId para PSTN: OUTCID de la campaña (fallback CALLERID de la troncal);
-        # si no hay ninguno, fallback a tel_customer/number.
+        # CallerId para PSTN: OUTCID de la campaña (fallback CALLERID de la troncal).
+        # Sin CID configurado no se usa el número del cliente: se origina con
+        # presentación restringida (CALLERID(pres)=prohib). La pierna voicebot SIP
+        # externo sigue usando phone_number en dial_voicebot_with_headers.
         id_camp = metadata.get('id_camp', '')
-        tel_customer = metadata.get('tel_customer', number)
         if self.route_validator and id_camp:
             caller_id = self.route_validator.get_trunk_callerid(
                 id_camp,
@@ -472,8 +473,17 @@ class CallActionService:
             )
         else:
             caller_id = None
+        restrict_presentation = False
         if caller_id is None or caller_id == '':
-            caller_id = tel_customer or number or ''
+            caller_id = None
+            restrict_presentation = True
+            self.logger.warning(
+                "PSTN dial without CallerID (campaign=%s route=%s trunk=%s); "
+                "originating with restricted presentation",
+                id_camp,
+                metadata.get("effective_route_id"),
+                pstn_gateway,
+            )
 
         call_type_raw = metadata.get("call_type") or metadata.get("id_calltype") or ""
         id_camp_meta = metadata.get("id_camp") or metadata.get("campaign_id") or ""
@@ -496,11 +506,15 @@ class CallActionService:
         )
 
         # Variables de canal OML para el leg PSTN en llamadas DIALER (tipo 2)
+        variables: Dict[str, Any] = {}
         if call_type_raw in (2, "2", CallType.DIALER_ID):
             _id_camp = metadata.get("id_camp") or metadata.get("campaign_id") or "0"
             _id_customer = metadata.get("id_customer") or metadata.get("contact_id") or "0"
-            variables = {"OMLCAMPID": str(_id_camp), "OMLCODCLI": str(_id_customer)}
-        else:
+            variables["OMLCAMPID"] = str(_id_camp)
+            variables["OMLCODCLI"] = str(_id_customer)
+        if restrict_presentation:
+            variables["CALLERID(pres)"] = "prohib"
+        if not variables:
             variables = None
 
         # Timeout de negocio (timer acd-app) vs timeout ARI (margen de seguridad).
@@ -546,6 +560,7 @@ class CallActionService:
                 app_args=app_args,
                 timeout=ari_timeout,
                 channel_id=pre_channel_id,
+                restrict_presentation=restrict_presentation,
             )
         else:
             result = self.ari_client.originate_channel_op(
@@ -595,9 +610,14 @@ class CallActionService:
         app_args: Optional[str],
         timeout: int,
         channel_id: str,
+        restrict_presentation: bool = False,
     ) -> Dict[str, Any]:
         """
         Create en Stasis y luego dial. Si el dial falla, cuelga el canal creado.
+
+        ARI POST /channels/{id}/dial usa `caller` como Channel ID de otro canal,
+        no como CallerID SIP. El From del INVITE en create+dial sale de
+        CONNECTEDLINE(num) (y CALLERID); se setean antes del dial.
         """
         created = self.ari_client.create_stasis_channel_op(
             endpoint=endpoint,
@@ -610,9 +630,51 @@ class CallActionService:
 
         data = created.get("data") or {}
         created_id = data.get("id") or channel_id
+        # En create+dial, PJSIP toma el From del INVITE de CONNECTEDLINE(num)
+        # (originate con callerId setea CALLERID y CONNECTEDLINE). CALLERID(num)
+        # solo no alcanza: el INVITE sale Anonymous.
+        if caller_id:
+            cid = str(caller_id)
+            for var_name in (
+                "CALLERID(num)",
+                "CALLERID(name)",
+                "CONNECTEDLINE(num)",
+                "CONNECTEDLINE(name)",
+            ):
+                try:
+                    if not self.ari_client.set_channel_variable(created_id, var_name, cid):
+                        self.logger.warning(
+                            "No se pudo setear %s=%s en %s",
+                            var_name,
+                            cid,
+                            created_id,
+                        )
+                except Exception as exc:
+                    self.logger.warning(
+                        "Error seteando %s=%s en %s: %s",
+                        var_name,
+                        cid,
+                        created_id,
+                        exc,
+                    )
+        if restrict_presentation:
+            try:
+                if not self.ari_client.set_channel_variable(
+                    created_id, "CALLERID(pres)", "prohib"
+                ):
+                    self.logger.warning(
+                        "No se pudo setear CALLERID(pres)=prohib en %s",
+                        created_id,
+                    )
+            except Exception as exc:
+                self.logger.warning(
+                    "No se pudo setear CALLERID(pres)=prohib en %s: %s",
+                    created_id,
+                    exc,
+                )
+        # No pasar caller= aquí: en ARI es Channel ID, no CallerID SIP.
         dialed = self.ari_client.dial_channel_op(
             created_id,
-            caller=caller_id,
             timeout=timeout,
         )
         if dialed.get("ok"):
