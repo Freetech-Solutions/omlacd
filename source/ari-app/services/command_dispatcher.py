@@ -144,10 +144,13 @@ class CommandDispatcher:
                 if call_type_val in (
                     CallType.PROGRESSIVE.value,
                     CallType.INBOUND.value,
+                    CallType.MANUAL.value,
                 ):
-                    # Agente corta: quien_corto=1 en el reporte del finalize.
-                    ctx.inbound_agent_hung_up_first = True
-                    self.state_store.register_unsafe(call_id, ctx)
+                    # Agente corta vía API: progressive/inbound marcan quien_corto;
+                    # manual lo deriva del canal de agente en finalize_manual_pstn_end.
+                    if call_type_val != CallType.MANUAL.value:
+                        ctx.inbound_agent_hung_up_first = True
+                        self.state_store.register_unsafe(call_id, ctx)
                     hangup_via_finalize = True
             elif action == 'TRANSFER':
                 transfer_handler = self.handlers.get('TRANSFER')
@@ -473,25 +476,17 @@ class CommandDispatcher:
 
     def _hangup_via_finalize(self, call_id: str, ctx) -> bool:
         """
-        Progressive/inbound: reutiliza finalize_*_pstn_end (stop recording,
+        Progressive/inbound/manual: reutiliza finalize_* (stop recording,
         log_segment_end → interactions_summary, POSTCALL, unregister).
 
         Retorna True si el cierre quedó a cargo del handler (incluye False del
-        finalize: otro hilo ya cerró). False solo si no hay handler/PSTN y hay
+        finalize: otro hilo ya cerró). False solo si no hay handler/canal y hay
         que caer al hangup legado.
         """
         call_type_val = self._call_type_value(ctx)
         pstn_channel = getattr(ctx, "pstn_channel", None) or getattr(
             ctx, "uniqueid_pstn", None
         )
-        if not pstn_channel or not str(pstn_channel).strip():
-            self.logger.warning(
-                "CommandDispatcher: HANGUP call_id=%s tipo=%s sin pstn_channel; "
-                "fallback a hangup legado",
-                call_id,
-                call_type_val,
-            )
-            return False
 
         if call_type_val == CallType.PROGRESSIVE.value:
             handler = self.handlers.get(CallType.PROGRESSIVE.value)
@@ -500,6 +495,7 @@ class CommandDispatcher:
                 if handler
                 else None
             )
+            channel_for_finalize = str(pstn_channel).strip() if pstn_channel else ""
         elif call_type_val == CallType.INBOUND.value:
             handler = self.handlers.get(CallType.INBOUND.value)
             finalize = (
@@ -507,7 +503,27 @@ class CommandDispatcher:
                 if handler
                 else None
             )
+            channel_for_finalize = str(pstn_channel).strip() if pstn_channel else ""
+        elif call_type_val == CallType.MANUAL.value:
+            handler = self.handlers.get(CallType.MANUAL.value)
+            finalize = (
+                getattr(handler, "finalize_manual_pstn_end", None)
+                if handler
+                else None
+            )
+            # Manual puede no tener PSTN aún (cancel antes de dial); el finalize
+            # resuelve la pierna de agente. Pasamos PSTN si existe como hint.
+            channel_for_finalize = str(pstn_channel).strip() if pstn_channel else ""
         else:
+            return False
+
+        if call_type_val != CallType.MANUAL.value and not channel_for_finalize:
+            self.logger.warning(
+                "CommandDispatcher: HANGUP call_id=%s tipo=%s sin pstn_channel; "
+                "fallback a hangup legado",
+                call_id,
+                call_type_val,
+            )
             return False
 
         if not callable(finalize):
@@ -520,7 +536,7 @@ class CommandDispatcher:
             return False
 
         try:
-            won = finalize(ctx, str(pstn_channel).strip(), source="hangup_command")
+            won = finalize(ctx, channel_for_finalize, source="hangup_command")
         except Exception:
             self.logger.exception(
                 "CommandDispatcher: error en finalize HANGUP call_id=%s tipo=%s",

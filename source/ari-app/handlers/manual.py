@@ -1502,6 +1502,129 @@ class ManualCallHandler(BaseHandler):
                 except Exception as e:
                     logging.error(f"❌ Error al destruir bridge {bridge_id}: {e}", exc_info=True)
 
+    def finalize_manual_pstn_end(
+        self,
+        context: CallContext,
+        channel_id: str,
+        source: str = "",
+    ) -> bool:
+        """
+        Cierre unificado para hangup por comando (API HangUpCallView).
+
+        Delega reporte + stop recording + POSTCALL + unregister en
+        ``_process_call_end`` (misma semántica que colgar desde el fono) y
+        asegura hangup de piernas ARI restantes (el fono no envió BYE).
+
+        Retorna True si este flujo se encargó del cierre (o lo intentó tras
+        ganar el camino de reporte). False si la llamada ya no existe / ya
+        estaba finalizada (CommandDispatcher no debe caer al hangup legado).
+        """
+        call_id = getattr(context, "call_id", None)
+        if not call_id:
+            return False
+
+        preview = self.state_store.get(call_id)
+        if not preview:
+            logging.info(
+                "finalize_manual_pstn_end: contexto inexistente call_id=%s source=%s",
+                call_id,
+                source or "unknown",
+            )
+            return False
+        if getattr(preview, "call_ended", False):
+            logging.info(
+                "finalize_manual_pstn_end: llamada %s ya finalizada (source=%s)",
+                call_id,
+                source or "unknown",
+            )
+            return False
+
+        # API = agente corta: preferir pierna de agente para quien_corto=1
+        hangup_channel = (
+            active_agent_channel(preview)
+            or getattr(preview, "agent_connected_channel", None)
+            or getattr(preview, "agent_attempt_channel", None)
+            or (str(channel_id).strip() if channel_id else None)
+            or getattr(preview, "pstn_channel", None)
+        )
+        if not hangup_channel or not str(hangup_channel).strip():
+            logging.warning(
+                "finalize_manual_pstn_end: sin canal para call_id=%s source=%s",
+                call_id,
+                source or "unknown",
+            )
+            return False
+
+        hangup_channel = str(hangup_channel).strip()
+        logging.info(
+            "finalize_manual_pstn_end: cerrando call_id=%s channel=%s source=%s",
+            call_id,
+            hangup_channel,
+            source or "unknown",
+        )
+
+        try:
+            # cause 16 = Normal Clearing → EXIT_ANSWERED si contestada, HANGUP/CANCEL si no
+            self._process_call_end(
+                event=None,
+                context=preview,
+                channel_id=hangup_channel,
+                cause=16,
+                cause_txt="Normal Clearing",
+            )
+        except Exception:
+            logging.exception(
+                "finalize_manual_pstn_end: error en _process_call_end call_id=%s source=%s",
+                call_id,
+                source or "unknown",
+            )
+            return False
+
+        # Asegurar hangup de piernas que siguen vivas (API no genera BYE del softphone).
+        # _cleanup_bridge_and_channels con quien_corto=1 cuelga PSTN solo si contestó;
+        # aquí cubrimos agente + PSTN remanentes de forma idempotente.
+        legs_to_hangup = set()
+        for leg in list(distinct_agent_leg_ids(preview)):
+            if isinstance(leg, str) and leg.strip():
+                legs_to_hangup.add(leg.strip())
+        pstn = getattr(preview, "pstn_channel", None)
+        if isinstance(pstn, str) and pstn.strip():
+            legs_to_hangup.add(pstn.strip())
+        for leg in legs_to_hangup:
+            try:
+                ok = self.ari_client.hangup_channel(leg)
+                if ok:
+                    logging.debug(
+                        "finalize_manual_pstn_end: hangup_channel %s call_id=%s",
+                        leg,
+                        call_id,
+                    )
+            except Exception as e:
+                logging.debug(
+                    "finalize_manual_pstn_end: hangup_channel %s call_id=%s: %s",
+                    leg,
+                    call_id,
+                    e,
+                )
+
+        bridge_id = getattr(preview, "bridge_id", None)
+        if isinstance(bridge_id, str) and bridge_id.strip():
+            try:
+                self._stop_active_recording(preview, bridge_id.strip())
+            except Exception:
+                pass
+            try:
+                self.ari_client.destroy_bridge(bridge_id.strip())
+            except Exception as e:
+                logging.debug(
+                    "finalize_manual_pstn_end: destroy_bridge %s call_id=%s: %s",
+                    bridge_id,
+                    call_id,
+                    e,
+                )
+
+        return True
+
     def _process_call_end(self, event, context: CallContext, channel_id: Optional[str],
                           cause: Optional[int], cause_txt: Optional[str],
                           event_final_override: Optional[str] = None) -> None:

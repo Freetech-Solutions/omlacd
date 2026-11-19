@@ -1,12 +1,10 @@
 """
-HANGUP por comando Redis: progressive/inbound usan finalize; manual conserva hangup legado.
+HANGUP por comando Redis: progressive/inbound/manual usan finalize_* (no hangup legado).
 """
 import os
 import sys
 from contextlib import contextmanager
 from unittest.mock import MagicMock
-
-import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "ari-app"))
 
@@ -116,14 +114,53 @@ def test_hangup_progressive_already_closed_skips_legacy():
     dispatcher.ari_client.hangup_channel.assert_not_called()
 
 
-def test_hangup_manual_keeps_legacy_hangup():
+def test_hangup_manual_uses_finalize_not_legacy():
+    manual = MagicMock()
+    manual.finalize_manual_pstn_end.return_value = True
     ctx = _ctx(CallType.MANUAL, call_id="man-1", pstn="pstn-m", agent="ag-m", bridge="br-m")
+    dispatcher = _make_dispatcher(
+        {CallType.MANUAL.value: manual},
+        ctx,
+    )
+
+    dispatcher.dispatch({"action": "HANGUP", "call_id": ctx.call_id})
+
+    manual.finalize_manual_pstn_end.assert_called_once_with(
+        ctx, "pstn-m", source="hangup_command"
+    )
+    assert ctx.inbound_agent_hung_up_first is False
+    dispatcher.state_store.register_unsafe.assert_not_called()
+    dispatcher.state_store.unregister.assert_not_called()
+    dispatcher.ari_client.hangup_channel.assert_not_called()
+    dispatcher.ari_client.destroy_bridge.assert_not_called()
+
+
+def test_hangup_manual_without_pstn_still_uses_finalize():
+    """Cancel antes de dial: sin pstn_channel, igual se reporta vía finalize."""
+    manual = MagicMock()
+    manual.finalize_manual_pstn_end.return_value = True
+    ctx = _ctx(CallType.MANUAL, call_id="man-2", pstn=None, agent="ag-m2", bridge=None)
+    dispatcher = _make_dispatcher(
+        {CallType.MANUAL.value: manual},
+        ctx,
+    )
+
+    dispatcher.dispatch({"action": "HANGUP", "call_id": ctx.call_id})
+
+    manual.finalize_manual_pstn_end.assert_called_once_with(
+        ctx, "", source="hangup_command"
+    )
+    dispatcher.ari_client.hangup_channel.assert_not_called()
+    dispatcher.state_store.unregister.assert_not_called()
+
+
+def test_hangup_manual_without_handler_falls_back_to_legacy():
+    ctx = _ctx(CallType.MANUAL, call_id="man-3", pstn="pstn-m3", agent="ag-m3", bridge="br-m3")
     dispatcher = _make_dispatcher({}, ctx)
 
     dispatcher.dispatch({"action": "HANGUP", "call_id": ctx.call_id})
 
-    dispatcher.ari_client.hangup_channel.assert_any_call("pstn-m")
-    dispatcher.ari_client.hangup_channel.assert_any_call("ag-m")
-    dispatcher.ari_client.destroy_bridge.assert_called_once_with("br-m")
-    dispatcher.state_store.unregister.assert_called_once_with("man-1")
-    assert ctx.inbound_agent_hung_up_first is False
+    dispatcher.ari_client.hangup_channel.assert_any_call("pstn-m3")
+    dispatcher.ari_client.hangup_channel.assert_any_call("ag-m3")
+    dispatcher.ari_client.destroy_bridge.assert_called_once_with("br-m3")
+    dispatcher.state_store.unregister.assert_called_once_with("man-3")
