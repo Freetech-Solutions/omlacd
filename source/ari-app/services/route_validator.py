@@ -478,8 +478,10 @@ class RouteValidator:
             self._invalidate_trunk_cache(id_campaign, override_route_id)
             return None
 
-    # Cache local de CALLERID por campaña: {campaign_id: (callerid_value, expires_at_ts)}
-    # TTL corto alineado con ROUTE_CACHE_TTL / TRUNK_CACHE_TTL.
+    # Cache de OUTCID por campaña: {campaign_id: (outcid, expires_at_ts)}.
+    # Nunca se indexa por ruta: campañas que comparten OUTR no deben compartir OUTCID.
+    # Cache de CALLERID de troncal por ruta: {route_id: (trunk_callerid, expires_at_ts)}.
+    # Solo guarda valores no vacíos; None no se cachea para no tapar correcciones en Redis.
     _CALLERID_CACHE = {}
     _CALLERID_CACHE_LOCK = threading.RLock()
     _CALLERID_CACHE_BY_ROUTE = {}
@@ -490,10 +492,11 @@ class RouteValidator:
         Obtiene el CallerID saliente para una campaña desde Redis.
 
         Precedencia:
-          1. OUTCID del hash OML:CAMP:{id_campaign} (CID de la Ruta Saliente
-             configurado por campaña). Fuente primaria.
+          1. OUTCID del hash OML:CAMP:{id_campaign} (CID configurado por campaña).
+             Fuente primaria. Se cachea solo por campaign_id.
           2. Fallback: campo CALLERID del hash OML:TRUNK:{trunk_id} resolviendo
-             la cadena OML:CAMP -> OUTR -> OML:OUTR:{id} -> TRUNK-1.
+             la cadena OUTR (override o OML:CAMP -> OUTR) -> TRUNK-1.
+             Se cachea solo por route_id (CALLERID de troncal, no OUTCID).
 
         Se usa como callerId del leg PSTN y como numero_origen en reportes a
         acd-log-processor para llamadas tipo 1 (manual) y 2 (dialer).
@@ -515,65 +518,70 @@ class RouteValidator:
             return None
 
         now = time.time()
-        # Cuando hay override_route_id la resolución es exclusivamente por ruta:
-        # no se debe leer ni escribir el caché por campaña, para no devolver el
-        # CALLERID de la ruta por defecto ni contaminar la entrada de la campaña.
         with RouteValidator._CALLERID_CACHE_LOCK:
-            if override_route_id:
-                cached = RouteValidator._CALLERID_CACHE_BY_ROUTE.get(override_route_id)
-            else:
-                cached = RouteValidator._CALLERID_CACHE.get(id_campaign)
-            if cached:
-                callerid_val, expires_at = cached
+            cached_camp = RouteValidator._CALLERID_CACHE.get(id_campaign)
+            if cached_camp:
+                callerid_val, expires_at = cached_camp
                 if expires_at > now:
                     return callerid_val
 
         try:
             camp_key = RedisKeys.campaign_config(id_campaign)
-            # 1. OUTCID de la campaña (CID de la Ruta Saliente). Fuente primaria.
-            callerid_val = self._normalize_redis_value(
+            # 1. OUTCID de la campaña. Siempre se lee por campaña, nunca por ruta.
+            outcid = self._normalize_redis_value(
                 self.redis_client.hget(camp_key, 'OUTCID')
             )
-            if not callerid_val:
-                # 2. Fallback: CALLERID de la troncal (campo del hash OML:TRUNK:{id}).
-                if override_route_id:
-                    outr_id = override_route_id
-                else:
-                    outr_id = self._resolve_route_id_from_campaign(id_campaign)
-                if outr_id:
-                    outr_key = f'OML:OUTR:{outr_id}'
-                    trunk_id = self._normalize_redis_value(
-                        self.redis_client.hget(outr_key, 'TRUNK-1')
-                    )
-                    if trunk_id:
-                        callerid_val = self._normalize_redis_value(
-                            self.redis_client.hget(f'OML:TRUNK:{trunk_id}', 'CALLERID')
-                        )
-            # Normalizar cadena vacía a None para no cachear/propagar "".
-            if callerid_val == '':
-                callerid_val = None
-            with RouteValidator._CALLERID_CACHE_LOCK:
-                if override_route_id:
-                    RouteValidator._CALLERID_CACHE_BY_ROUTE[override_route_id] = (
-                        callerid_val,
-                        now + RouteValidator.CALLERID_CACHE_TTL,
-                    )
-                else:
+            if outcid:
+                with RouteValidator._CALLERID_CACHE_LOCK:
                     RouteValidator._CALLERID_CACHE[id_campaign] = (
-                        callerid_val,
+                        outcid,
                         now + RouteValidator.CALLERID_CACHE_TTL,
                     )
-            return callerid_val
+                return outcid
+
+            # 2. Fallback: CALLERID de la troncal de la ruta (caché solo por ruta).
+            if override_route_id:
+                outr_id = override_route_id
+            else:
+                outr_id = self._resolve_route_id_from_campaign(id_campaign)
+            if not outr_id:
+                return None
+
+            with RouteValidator._CALLERID_CACHE_LOCK:
+                cached_route = RouteValidator._CALLERID_CACHE_BY_ROUTE.get(outr_id)
+                if cached_route:
+                    trunk_cid, expires_at = cached_route
+                    if expires_at > now:
+                        return trunk_cid
+
+            outr_key = f'OML:OUTR:{outr_id}'
+            trunk_id = self._normalize_redis_value(
+                self.redis_client.hget(outr_key, 'TRUNK-1')
+            )
+            if not trunk_id:
+                return None
+
+            trunk_cid = self._normalize_redis_value(
+                self.redis_client.hget(f'OML:TRUNK:{trunk_id}', 'CALLERID')
+            )
+            if not trunk_cid:
+                return None
+
+            with RouteValidator._CALLERID_CACHE_LOCK:
+                RouteValidator._CALLERID_CACHE_BY_ROUTE[outr_id] = (
+                    trunk_cid,
+                    now + RouteValidator.CALLERID_CACHE_TTL,
+                )
+            return trunk_cid
         except (redis.ConnectionError, redis.TimeoutError) as e:
             logger.debug(
                 "get_trunk_callerid: Error Redis para campaign %s: %s",
                 id_campaign, e,
             )
             with RouteValidator._CALLERID_CACHE_LOCK:
+                RouteValidator._CALLERID_CACHE.pop(id_campaign, None)
                 if override_route_id:
                     RouteValidator._CALLERID_CACHE_BY_ROUTE.pop(override_route_id, None)
-                else:
-                    RouteValidator._CALLERID_CACHE.pop(id_campaign, None)
             return None
         except Exception as e:
             logger.debug(
@@ -581,10 +589,9 @@ class RouteValidator:
                 id_campaign, e,
             )
             with RouteValidator._CALLERID_CACHE_LOCK:
+                RouteValidator._CALLERID_CACHE.pop(id_campaign, None)
                 if override_route_id:
                     RouteValidator._CALLERID_CACHE_BY_ROUTE.pop(override_route_id, None)
-                else:
-                    RouteValidator._CALLERID_CACHE.pop(id_campaign, None)
             return None
 
     def get_route_ringtime(self, route_id) -> Optional[int]:

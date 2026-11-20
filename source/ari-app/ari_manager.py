@@ -91,13 +91,24 @@ class ARI:
 
     # --- Métodos Base HTTP (siempre retornan ARIOperationResult) ---
 
-    def post(self, route, payload=None, headers=None, params=None) -> ARIOperationResult:
+    def post(
+        self,
+        route,
+        payload=None,
+        headers=None,
+        params=None,
+        quiet_http_codes: Optional[set] = None,
+    ) -> ARIOperationResult:
         """
         Método POST genérico. Siempre retorna ARIOperationResult.
         Soporta 'params' para Query Strings (ej: ?key=val) y 'payload' para JSON Body.
+
+        quiet_http_codes: status HTTP esperados (ej. {404} al stop de grabación)
+        que se loguean en debug en lugar de error.
         """
         uri = f'http://{self.host}:{self.port}/ari/{route}'
         logger.info(f"POST URI: {uri} | Params: {params} | Payload: {payload}")
+        quiet = quiet_http_codes or set()
 
         try:
             response = self.session.request(
@@ -122,8 +133,16 @@ class ARI:
                     return self._build_result(ok=False, error="Invalid JSON", code=code)
 
             # 4xx/5xx
-            logger.error(f"HTTP error en POST request: Status {code} - {response.text}")
             msg = self._error_message_from_response(response)
+            if code in quiet:
+                logger.debug(
+                    "HTTP %s en POST %s (esperado): %s",
+                    code,
+                    route,
+                    response.text,
+                )
+            else:
+                logger.error(f"HTTP error en POST request: Status {code} - {response.text}")
             return self._build_result(ok=False, error=msg, code=code)
 
         except RequestException as e:
@@ -555,7 +574,8 @@ class ARI:
         """
         Marca un canal ya creado en Stasis (POST /channels/{id}/dial).
 
-        caller y timeout van como query params, que es lo que espera ARI.
+        caller y timeout van como query params. `caller` es el Channel ID de otro
+        canal (no el CallerID SIP); el CLI se setea con CALLERID(num) antes del dial.
         """
         params: Dict[str, Any] = {}
         if caller:
@@ -788,7 +808,8 @@ class ARI:
         404 se trata como éxito (la grabación ya terminó).
         """
         route = f'recordings/live/{recording_name}/stop'
-        result = self.post(route)
+        # 404 es éxito de negocio (ya terminó); no loguear como ERROR en post().
+        result = self.post(route, quiet_http_codes={404})
         if result.get('ok'):
             return True
         if result.get('code') == 404:
