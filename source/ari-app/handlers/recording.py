@@ -103,6 +103,10 @@ class RecordingEventHandler:
         Read-only respecto a Redis: solo lee contexto (get). No escribe ni bloquea.
         Si StasisEnd borró el contexto (race), se envían metadatos mínimos para no perder el archivo.
         El nombre del archivo es siempre el call_id (recording_id del evento).
+
+        ``call_ended`` no debe impedir el upload: tras hangup/finalize el contexto
+        suele marcarse terminado antes de que llegue este evento ARI; el archivo
+        recién está listo cuando llega RecordingFinished.
         """
         recording_info = event.recording
         if not recording_info:
@@ -125,11 +129,13 @@ class RecordingEventHandler:
             # Lectura única en Redis, sin lock
             context = self._find_context_for_recording(recording_id, bridge_id)
 
-            if context and context.call_ended:
-                self.logger.debug(f"RecordingFinished: Llamada {context.call_id} ya fue procesada, ignorando evento duplicado")
-                return
-
             if context:
+                if context.call_ended:
+                    self.logger.debug(
+                        "RecordingFinished: llamada %s ya cerrada (call_ended); "
+                        "procesando upload igual",
+                        context.call_id,
+                    )
                 metadata = self._build_recording_metadata(context)
                 unique_id = self._determine_unique_id(context, recording_file, recording_id)
                 if context.call_id:

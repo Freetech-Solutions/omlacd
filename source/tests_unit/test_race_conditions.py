@@ -501,6 +501,38 @@ class TestRecordingEventHandlerRaceConditions(unittest.TestCase):
         call_kw = self.mock_recording_manager.process_recording.call_args[1]
         self.assertIsNone(call_kw.get("local_wav_path"))
 
+    def test_handle_recording_finished_still_processes_when_call_ended(self):
+        """Tras hangup/finalize call_ended=True; RecordingFinished debe igual subir/encolar."""
+        base_path = "/var/spool/asterisk/recording"
+        mock_config = {
+            "RECORDING_BASE_PATH": base_path,
+            "BUCKET_NAME": "bucket",
+            "BUCKET_ACCESS_KEY_ID": "key",
+            "BUCKET_SECRET_ACCESS_KEY": "secret",
+        }
+        handler_with_config = RecordingEventHandler(
+            state_store=self.state_store,
+            recording_service=self.mock_recording_service,
+            recording_manager=self.mock_recording_manager,
+            config=mock_config,
+        )
+        call_id = "call-ended-789"
+        ctx = CallContext(call_id=call_id, type=CallType.MANUAL, bridge_id="bridge-ended")
+        ctx.call_ended = True
+        self.state_store.register(call_id, ctx)
+        event = MagicMock()
+        event.recording = {
+            "name": call_id,
+            "id": call_id,
+            "target_uri": None,
+            "bridge_id": "bridge-ended",
+        }
+        handler_with_config.handle_recording_finished(event)
+        self.mock_recording_manager.process_recording.assert_called_once()
+        call_kw = self.mock_recording_manager.process_recording.call_args[1]
+        self.assertEqual(call_kw["unique_id"], call_id)
+        self.assertEqual(call_kw["local_wav_path"], f"{base_path}/{call_id}.wav")
+
 
 class TestManualCallHandlerRaceConditions(unittest.TestCase):
     """Tests para validar que ManualCallHandler crea contextos con lock."""
