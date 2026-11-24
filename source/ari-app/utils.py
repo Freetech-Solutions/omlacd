@@ -75,7 +75,8 @@ def build_oml_sip_headers(
     asterisk_id: Optional[str] = None,
     include_legacy_vars: bool = False,
     include_branch_id: bool = False,
-    additional_headers: Optional[Dict[str, str]] = None
+    additional_headers: Optional[Dict[str, str]] = None,
+    camp_name: Optional[str] = None,
 ) -> Dict[str, str]:
     """
     Construye headers SIP con prefijo X-OML-* para llamadas PJSIP.
@@ -101,6 +102,8 @@ def build_oml_sip_headers(
         include_legacy_vars: Si True, incluye variables legacy (OMLUNIQUEID, OMLCAMPID, etc.)
         include_branch_id: Si True, incluye X-OML-BranchID y X-OML-ExternalTelNumber
         additional_headers: Diccionario con headers adicionales a incluir
+        camp_name: Nombre de campaña para pop-up softphone (header X-OML-CampName).
+                Tipicamente OML:CAMP SHOWCAMPNAME (vacío si mostrar_nombre=False).
         
     Returns:
         Diccionario con los headers SIP construidos, incluyendo:
@@ -135,6 +138,11 @@ def build_oml_sip_headers(
     headers["PJSIP_HEADER(add,X-OML-AgentID)"] = str(agent_id) if agent_id else "0"
     headers["PJSIP_HEADER(add,X-OML-PhoneNumber)"] = str(phone_number) if phone_number else ""
     headers["PJSIP_HEADER(add,X-OML-CallType)"] = str(call_type) if call_type else ""
+
+    # Softphone: #omlcampname ← header X-OML-CampName (popup Llamada Entrante)
+    camp_name_str = str(camp_name).strip() if camp_name else ""
+    if camp_name_str:
+        headers["PJSIP_HEADER(add,X-OML-CampName)"] = camp_name_str
     
     # Variable de canal X-OML-AgentID (sin prefijo PJSIP_HEADER) para que el ACD pueda leerla
     if agent_id:

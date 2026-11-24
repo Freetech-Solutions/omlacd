@@ -166,13 +166,29 @@ class InMemoryReservationRedis:
     def _reserve(self, keys: list, args: list) -> int:
         agent_key, lock_key, lease_key = keys[0], keys[1], keys[2]
         cooldown_key = keys[3] if len(keys) > 3 else None
-        ready_status, dialing_status, timestamp, call_id, ttl = args
+        ready_status, dialing_status, timestamp, call_id, ttl = args[:5]
+        outbound = len(args) > 5 and args[5] == "1"
+        postcall_status = args[6] if len(args) > 6 else "POSTCALL"
+
+        def status_ok(status: Any) -> bool:
+            if outbound:
+                if status == ready_status or status == postcall_status:
+                    return True
+                if isinstance(status, str) and status.startswith("PAUSE"):
+                    return True
+                return False
+            return status == ready_status
+
         with self._lock:
-            if self.hashes.get(agent_key, {}).get("STATUS") != ready_status:
+            if not status_ok(self.hashes.get(agent_key, {}).get("STATUS")):
                 return 0
             if lock_key in self.strings or lease_key in self.strings:
                 return 0
-            if cooldown_key and cooldown_key in self.strings:
+            if (
+                not outbound
+                and cooldown_key
+                and cooldown_key in self.strings
+            ):
                 return 0
             self.strings[lock_key] = call_id
             self.strings[lease_key] = call_id
@@ -186,6 +202,7 @@ class InMemoryReservationRedis:
                     "CALLID": call_id,
                 }
             )
+            self.hashes[agent_key].pop("PAUSE_ID", None)
             return 1
 
     def _release(self, keys: list, args: list) -> int:
@@ -266,6 +283,73 @@ class TestAgentStatusServiceReservation(unittest.TestCase):
         lease_key = RedisKeys.agent_reservation_lease(str(self.agent_id))
         self.assertEqual(self.redis.get(lock_key), self.call_id)
         self.assertEqual(self.redis.get(lease_key), self.call_id)
+
+    def test_reserve_blocked_by_cooldown_unless_ignored(self):
+        cooldown_key = RedisKeys.agent_offer_cooldown(str(self.agent_id))
+        self.redis.set(cooldown_key, "wrapup")
+        self.assertFalse(
+            self.service.try_reserve_for_distribution(
+                self.agent_id, self.call_id, 25
+            )
+        )
+        ok = self.service.try_reserve_for_distribution(
+            self.agent_id, self.call_id, 25, ignore_cooldown=True
+        )
+        self.assertTrue(ok)
+        self.assertEqual(self.redis.get(cooldown_key), self.call_id)
+
+    def test_outbound_reserve_from_pause_acw(self):
+        self.redis.hset(
+            self.agent_key,
+            mapping={
+                "STATUS": "PAUSE-ACW",
+                "PAUSE_ID": "0",
+                "SIP": "SIP/100",
+            },
+        )
+        self.assertFalse(
+            self.service.try_reserve_for_distribution(
+                self.agent_id, self.call_id, 25
+            )
+        )
+        ok = self.service.try_reserve_for_distribution(
+            self.agent_id, self.call_id, 25, ignore_cooldown=True
+        )
+        self.assertTrue(ok)
+        self.assertEqual(
+            self.redis.hget(self.agent_key, "STATUS"),
+            AgentStatus.DIAL_CALL.value,
+        )
+        self.assertIsNone(self.redis.hget(self.agent_key, "PAUSE_ID"))
+
+    def test_outbound_reserve_from_pause_and_postcall(self):
+        for status in ("PAUSE", "PAUSE-BREAK", AgentStatus.POSTCALL.value):
+            self.redis.strings.clear()
+            self.redis.hset(
+                self.agent_key,
+                mapping={"STATUS": status, "SIP": "SIP/100"},
+            )
+            ok = self.service.try_reserve_for_distribution(
+                self.agent_id,
+                f"call-{status}",
+                25,
+                ignore_cooldown=True,
+            )
+            self.assertTrue(ok, msg=f"expected reserve from {status}")
+            self.assertEqual(
+                self.redis.hget(self.agent_key, "STATUS"),
+                AgentStatus.DIAL_CALL.value,
+            )
+
+    def test_outbound_reserve_rejects_oncall(self):
+        self.redis.hset(
+            self.agent_key,
+            mapping={"STATUS": AgentStatus.ONCALL.value, "SIP": "SIP/100"},
+        )
+        ok = self.service.try_reserve_for_distribution(
+            self.agent_id, self.call_id, 25, ignore_cooldown=True
+        )
+        self.assertFalse(ok)
 
     def test_concurrent_reserve_only_one_wins(self):
         results = []

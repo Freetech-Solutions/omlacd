@@ -592,6 +592,21 @@ class DistributionService:
             self._active_attempt_loop_gens.pop(call_id, None)
             return agent_ch, attempt_agent_id
 
+    def _pop_voicebot_attempt_if_loop(
+        self, call_id: str, loop_gen: int
+    ) -> Tuple[Optional[str], Optional[int]]:
+        """
+        Pop del intento voicebot solo si pertenece a loop_gen.
+        Usa _voicebot_attempt_agent_id (no _active_attempt_agents).
+        """
+        with self._dialing_lock:
+            if int(self._active_attempt_loop_gens.get(call_id, -1)) != int(loop_gen):
+                return None, None
+            agent_ch = self._active_attempts.pop(call_id, None)
+            attempt_agent_id = self._voicebot_attempt_agent_id.pop(call_id, None)
+            self._active_attempt_loop_gens.pop(call_id, None)
+            return agent_ch, attempt_agent_id
+
     def _clear_attempt_if_loop(self, call_id: str, loop_gen: int) -> bool:
         """Limpia intento activo si pertenece a loop_gen. Retorna True si era nuestro."""
         with self._dialing_lock:
@@ -909,6 +924,25 @@ class DistributionService:
             return None
         return lock_key
 
+    def _release_voicebot_pending_slot(
+        self,
+        campaign_id: Any,
+        agent_id: Any,
+        call_id: str,
+    ) -> None:
+        """Libera cupo MAXQCALLS pendiente si el originate no llegó a register."""
+        if not self.agent_status_service:
+            return
+        try:
+            self.agent_status_service.release_voicebot_pending_slot(
+                campaign_id, agent_id, call_id
+            )
+        except Exception as e:
+            logger.debug(
+                "DistributionService._release_voicebot_pending_slot: %s",
+                e,
+            )
+
     def _release_agent_reservation(
         self,
         agent_id: int,
@@ -1069,13 +1103,17 @@ class DistributionService:
     ) -> None:
         """
         Inicia el loop de distribución hacia voicebots (trunk externo) y el timer de timeout de cola.
-        Respeta MAXQCALLS vía contadores OML:CALLDATA:VOICEBOT-CALLS:{id_camp}:{id_agent_voicebot}.
+        Respeta MAXQCALLS vía reserva atómica de OML:CALLDATA:VOICEBOT-CALLS
+        (pending in-flight + activas al answer).
         """
         if self._should_skip_start_distribution(call_id):
             self._cancel_queue_timer(call_id)
             return
 
+        loop_gen = self._bump_loop_generation(call_id)
         stop_event, attempt_finished = self._get_or_create_call_events(call_id)
+        # Despierta loop previo (si hay) y deja stop limpio para el nuevo.
+        stop_event.set()
         stop_event.clear()
         attempt_finished.clear()
         if on_queue_timeout_callback is not None:
@@ -1109,7 +1147,7 @@ class DistributionService:
                 external_host,
                 max_qcalls,
             ),
-            kwargs={"caller_channel_id": pstn_channel_id},
+            kwargs={"caller_channel_id": pstn_channel_id, "loop_gen": loop_gen},
             daemon=True,
         ).start()
 
@@ -1125,6 +1163,7 @@ class DistributionService:
         max_qcalls: int,
         *,
         caller_channel_id: Optional[str] = None,
+        loop_gen: int = 0,
     ) -> None:
         """Loop de distribución hacia voicebots: candidatos VOICEBOT=1 (sin exigir READY), origen a PJSIP/sip@{external_host}.
         El orden de candidatos viene de la estrategia (p. ej. \"random\" por defecto vía voicebot_strategy en config).
@@ -1134,10 +1173,12 @@ class DistributionService:
         El handoff a humanos solo ocurre vía SIP REFER (sip_refer_listener → start_distribution)."""
         try:
             logger.info(
-                "[DistributionService] Loop voicebot iniciado para call_id=%s, campaña=%s, external_host=%s",
+                "[DistributionService] Loop voicebot iniciado para call_id=%s, "
+                "campaña=%s, external_host=%s, gen=%s",
                 call_id,
                 id_camp,
                 external_host,
+                loop_gen,
             )
             stop_event, attempt_finished = self._get_or_create_call_events(call_id)
             last_agents_fetch_time = 0.0
@@ -1145,6 +1186,8 @@ class DistributionService:
 
             try:
                 while not stop_event.is_set():
+                    if not self._is_current_loop(call_id, loop_gen):
+                        return
                     try:
                         context = self.state_store.get(call_id)
                         if not context:
@@ -1230,27 +1273,6 @@ class DistributionService:
                                 return
                             attempt_finished.clear()
 
-                            voicebot_calls_key = RedisKeys.voicebot_calls(id_camp, candidate.agent_id)
-                            try:
-                                current_vb = int(self.redis_client.get(voicebot_calls_key) or 0)
-                            except Exception:
-                                current_vb = 0
-                            if max_qcalls > 0 and current_vb >= max_qcalls:
-                                # Regla de negocio: campaña voicebot nunca deriva a humanos
-                                # desde este loop; se espera y se reintenta el voicebot.
-                                logger.info(
-                                    "VoicebotLoop: voicebot %s en tope MAXQCALLS=%s (actual=%s), "
-                                    "se reintenta voicebot call_id=%s",
-                                    candidate.agent_id,
-                                    max_qcalls,
-                                    current_vb,
-                                    call_id,
-                                )
-                                continue
-
-                            # El cupo MAXQCALLS (INCR de VOICEBOT-CALLS) se toma recién en
-                            # register_voicebot_active_call, cuando el bot contesta: originar
-                            # no consume cupo y los originates muertos en vuelo no lo fugan.
                             metadata = {
                                 "id_customer": distribution_metadata.get("id_customer"),
                                 "id_camp": distribution_metadata.get("id_camp"),
@@ -1273,6 +1295,45 @@ class DistributionService:
                                     call_id,
                                 )
                                 continue
+
+                            slot_reserved = False
+                            if self.agent_status_service:
+                                slot_reserved = (
+                                    self.agent_status_service.try_reserve_voicebot_slot(
+                                        id_camp,
+                                        candidate.agent_id,
+                                        call_id,
+                                        max_qcalls,
+                                    )
+                                )
+                            else:
+                                # Fallback sin servicio: GET no atómico (solo degradación).
+                                voicebot_calls_key = RedisKeys.voicebot_calls(
+                                    id_camp, candidate.agent_id
+                                )
+                                try:
+                                    current_vb = int(
+                                        self.redis_client.get(voicebot_calls_key) or 0
+                                    )
+                                except Exception:
+                                    current_vb = 0
+                                slot_reserved = not (
+                                    max_qcalls > 0 and current_vb >= max_qcalls
+                                )
+
+                            if not slot_reserved:
+                                logger.info(
+                                    "VoicebotLoop: voicebot %s en tope MAXQCALLS=%s, "
+                                    "se reintenta voicebot call_id=%s",
+                                    candidate.agent_id,
+                                    max_qcalls,
+                                    call_id,
+                                )
+                                self._release_agent_reservation(
+                                    candidate.agent_id, call_id, lock_key
+                                )
+                                continue
+
                             agent_hash_key = RedisKeys.agent_hash(str(candidate.agent_id))
                             voicebot_transport = "sip"
                             voicebot_addr: Optional[str] = None
@@ -1311,6 +1372,9 @@ class DistributionService:
                                         call_id,
                                         candidate.agent_id,
                                     )
+                                    self._release_voicebot_pending_slot(
+                                        id_camp, candidate.agent_id, call_id
+                                    )
                                     self._release_agent_reservation(
                                         candidate.agent_id, call_id, lock_key
                                     )
@@ -1322,6 +1386,9 @@ class DistributionService:
                                     call_id,
                                     candidate.agent_id,
                                 )
+                                self._release_voicebot_pending_slot(
+                                    id_camp, candidate.agent_id, call_id
+                                )
                                 self._release_agent_reservation(
                                     candidate.agent_id, call_id, lock_key
                                 )
@@ -1331,6 +1398,7 @@ class DistributionService:
                             with self._dialing_lock:
                                 self._active_attempts[call_id] = pre_generated_channel_id
                                 self._voicebot_attempt_agent_id[call_id] = candidate.agent_id
+                                self._active_attempt_loop_gens[call_id] = loop_gen
                             try:
                                 if voicebot_transport == "audiosocket":
                                     agent_channel_id = (
@@ -1360,21 +1428,33 @@ class DistributionService:
                                     e,
                                     exc_info=True,
                                 )
-                                with self._dialing_lock:
-                                    self._active_attempts.pop(call_id, None)
-                                    self._voicebot_attempt_agent_id.pop(call_id, None)
-                                self._release_agent_reservation(
-                                    candidate.agent_id, call_id, lock_key
+                                owned_ch, owned_agent = (
+                                    self._pop_voicebot_attempt_if_loop(
+                                        call_id, loop_gen
+                                    )
                                 )
+                                if owned_agent is not None:
+                                    self._release_voicebot_pending_slot(
+                                        id_camp, candidate.agent_id, call_id
+                                    )
+                                    self._release_agent_reservation(
+                                        candidate.agent_id, call_id, lock_key
+                                    )
                                 continue
 
                             if not agent_channel_id:
-                                with self._dialing_lock:
-                                    self._active_attempts.pop(call_id, None)
-                                    self._voicebot_attempt_agent_id.pop(call_id, None)
-                                self._release_agent_reservation(
-                                    candidate.agent_id, call_id, lock_key
+                                owned_ch, owned_agent = (
+                                    self._pop_voicebot_attempt_if_loop(
+                                        call_id, loop_gen
+                                    )
                                 )
+                                if owned_agent is not None:
+                                    self._release_voicebot_pending_slot(
+                                        id_camp, candidate.agent_id, call_id
+                                    )
+                                    self._release_agent_reservation(
+                                        candidate.agent_id, call_id, lock_key
+                                    )
                                 continue
 
                             with self.state_store.lock(call_id):
@@ -1385,18 +1465,22 @@ class DistributionService:
                                     ctx.agent_id = candidate.agent_id
                                     self.state_store.register_unsafe(call_id, ctx)
 
-                            # El lock del voicebot solo serializa la CREACIÓN del originate:
-                            # se libera ni bien el canal queda en vuelo. Liberarlo al answer
-                            # serializaba el ingreso al bot (~1 llamada por ciclo de answer)
-                            # y bajo ráfaga las llamadas expiraban en cola sin ser intentadas.
-                            # La concurrencia real la gobierna MAXQCALLS (activas al answer).
+                            # Lock solo serializa la CREACIÓN del originate; el cupo
+                            # MAXQCALLS ya quedó reservado (pending) hasta answer o fail.
                             self._release_agent_reservation(
                                 candidate.agent_id, call_id, lock_key
                             )
 
                             answered_or_failed = attempt_finished.wait(timeout=ring_timeout)
 
-                            if stop_event.is_set():
+                            if stop_event.is_set() or not self._is_current_loop(
+                                call_id, loop_gen
+                            ):
+                                if not self._is_current_loop(call_id, loop_gen):
+                                    return
+                                self._release_voicebot_pending_slot(
+                                    id_camp, candidate.agent_id, call_id
+                                )
                                 self._release_agent_reservation(
                                     candidate.agent_id, call_id, lock_key
                                 )
@@ -1406,23 +1490,32 @@ class DistributionService:
                                 if self._recover_answer_if_channel_up(
                                     call_id, agent_channel_id
                                 ):
+                                    # Answer en vuelo: register consumirá el pending.
                                     return
                                 try:
                                     self.ari_client.hangup_channel(agent_channel_id)
                                 except Exception:
                                     pass
-                                with self._dialing_lock:
-                                    self._active_attempts.pop(call_id, None)
-                                    self._voicebot_attempt_agent_id.pop(call_id, None)
-                                with self.state_store.lock(call_id):
-                                    ctx = self.state_store.get(call_id)
-                                    if ctx:
-                                        ctx.agent_attempt_channel = None
-                                        ctx.is_voicebot = False
-                                        self.state_store.register_unsafe(call_id, ctx)
-                                self._release_agent_reservation(
-                                    candidate.agent_id, call_id, lock_key
+                                owned_ch, owned_agent = (
+                                    self._pop_voicebot_attempt_if_loop(
+                                        call_id, loop_gen
+                                    )
                                 )
+                                if owned_agent is not None:
+                                    with self.state_store.lock(call_id):
+                                        ctx = self.state_store.get(call_id)
+                                        if ctx:
+                                            ctx.agent_attempt_channel = None
+                                            ctx.is_voicebot = False
+                                            self.state_store.register_unsafe(
+                                                call_id, ctx
+                                            )
+                                    self._release_voicebot_pending_slot(
+                                        id_camp, candidate.agent_id, call_id
+                                    )
+                                    self._release_agent_reservation(
+                                        candidate.agent_id, call_id, lock_key
+                                    )
                                 continue
 
                             logger.info(
@@ -1433,18 +1526,22 @@ class DistributionService:
                                 self.ari_client.hangup_channel(agent_channel_id)
                             except Exception:
                                 pass
-                            with self._dialing_lock:
-                                self._active_attempts.pop(call_id, None)
-                                self._voicebot_attempt_agent_id.pop(call_id, None)
-                            with self.state_store.lock(call_id):
-                                ctx = self.state_store.get(call_id)
-                                if ctx:
-                                    ctx.agent_attempt_channel = None
-                                    ctx.is_voicebot = False
-                                    self.state_store.register_unsafe(call_id, ctx)
-                            self._release_agent_reservation(
-                                candidate.agent_id, call_id, lock_key
+                            owned_ch, owned_agent = self._pop_voicebot_attempt_if_loop(
+                                call_id, loop_gen
                             )
+                            if owned_agent is not None:
+                                with self.state_store.lock(call_id):
+                                    ctx = self.state_store.get(call_id)
+                                    if ctx:
+                                        ctx.agent_attempt_channel = None
+                                        ctx.is_voicebot = False
+                                        self.state_store.register_unsafe(call_id, ctx)
+                                self._release_voicebot_pending_slot(
+                                    id_camp, candidate.agent_id, call_id
+                                )
+                                self._release_agent_reservation(
+                                    candidate.agent_id, call_id, lock_key
+                                )
 
                         if stop_event.wait(1.0):
                             break
@@ -1458,21 +1555,22 @@ class DistributionService:
                         if stop_event.wait(1.0):
                             break
             finally:
-                with self._dialing_lock:
-                    agent_ch = self._active_attempts.pop(call_id, None)
-                    attempt_agent_id = self._voicebot_attempt_agent_id.pop(call_id, None)
+                agent_ch, attempt_agent_id = self._pop_voicebot_attempt_if_loop(
+                    call_id, loop_gen
+                )
                 if attempt_agent_id is not None:
+                    # Si quedó pending (originate sin answer/register), liberar cupo.
+                    self._release_voicebot_pending_slot(
+                        id_camp, attempt_agent_id, call_id
+                    )
                     self._release_agent_reservation(
                         attempt_agent_id,
                         call_id,
                         RedisKeys.agent_lock(str(attempt_agent_id)),
                     )
                 if agent_ch:
-                    # Canal de voicebot huérfano (originate en vuelo que nunca contestó):
-                    # no consumió cupo MAXQCALLS (el INCR ocurre al answer, en
-                    # register_voicebot_active_call), así que aquí solo se cuelga y se
-                    # limpia el contexto. La liberación de cupo de llamadas contestadas
-                    # ocurre en finalize/handoff vía release_voicebot_call.
+                    # Canal huérfano en vuelo: el pending se liberó arriba si aplica;
+                    # cupos ya contestados se liberan en finalize/handoff (release_voicebot_call).
                     try:
                         self.ari_client.hangup_channel(agent_ch)
                     except Exception:
@@ -1502,10 +1600,23 @@ class DistributionService:
             except Exception:
                 pass
         finally:
-            self._remove_call_events(call_id)
-            with self._on_queue_timeout_callbacks_lock:
-                self._on_queue_timeout_callbacks.pop(call_id, None)
-            logger.info("Voicebot distribution loop finalized for call_id=%s", call_id)
+            if self._is_current_loop(call_id, loop_gen):
+                self._remove_call_events(call_id)
+                self._clear_loop_generation_if_current(call_id, loop_gen)
+                with self._on_queue_timeout_callbacks_lock:
+                    self._on_queue_timeout_callbacks.pop(call_id, None)
+                logger.info(
+                    "Voicebot distribution loop finalized for call_id=%s gen=%s",
+                    call_id,
+                    loop_gen,
+                )
+            else:
+                logger.info(
+                    "Voicebot distribution loop finalized (obsoleto, skip cleanup) "
+                    "call_id=%s gen=%s",
+                    call_id,
+                    loop_gen,
+                )
 
     def stop_distribution(
         self,
@@ -2266,13 +2377,13 @@ class DistributionService:
                                         ) == agent_channel_id:
                                             ctx.agent_attempt_channel = None
                                             self.state_store.register_unsafe(call_id, ctx)
-                                self._release_agent_reservation(
-                                    candidate.agent_id,
-                                    call_id,
-                                    lock_key,
-                                    failure_cooldown=True,
-                                    use_status_reservation=True,
-                                )
+                                    self._release_agent_reservation(
+                                        candidate.agent_id,
+                                        call_id,
+                                        lock_key,
+                                        failure_cooldown=True,
+                                        use_status_reservation=True,
+                                    )
                                 return
 
                             if not answered_or_failed:

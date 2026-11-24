@@ -141,7 +141,7 @@ class TestRedisUpdates(unittest.TestCase):
         with patch.object(handler, '_parse_args_list', return_value=['channel_type:to_pstn', f'bridge_id:{bridge_id}']):
              handler.on_start(event)
              
-        mock_agent_status.set_oncall.assert_called_once_with(
+        mock_agent_status.try_set_oncall.assert_called_once_with(
             agent_id=int(agent_id),
             call_id=original_call_id,
             bridge_id=bridge_id,
@@ -215,7 +215,7 @@ class TestRedisUpdates(unittest.TestCase):
         self.assertIsNone(mock_ctx.consultation)
         self.assertEqual(mock_ctx.agent_id, target_agent_id)
         self.assertTrue(self.mock_state_store.register_unsafe.called)
-        mock_agent_status.set_oncall.assert_called_once_with(
+        mock_agent_status.try_set_oncall.assert_called_once_with(
             agent_id=target_agent_id,
             call_id=call_id,
             bridge_id=main_bridge,

@@ -40,6 +40,7 @@ from state_helpers import (
     active_agent_channel,
     call_transfer_routing_active,
     is_pstn_hangup_during_blind_transfer_ringing,
+    is_transfer_window_expired,
     locked_context_by_channel,
     is_channel_in_context,
     resolve_consult_initiator_channel,
@@ -895,6 +896,8 @@ class AcDRouter:
         should_update_agent_status = False
         call_type = None
         call_id: Optional[str] = None
+        reclaim_transfer_call_id: Optional[str] = None
+        block_transfer_return = False
 
         with locked_context_by_channel(
             self.state_store,
@@ -936,12 +939,40 @@ class AcDRouter:
                     )
                 return
 
+            if is_transfer_window_expired(fresh_context):
+                reclaim_transfer_call_id = call_id
+
             # Política estándar para transfer_in_progress
             if should_block_operation_for_transfer(
                 fresh_context,
                 log=self.logger,
                 operation="ChannelStateChange",
             ):
+                block_transfer_return = True
+
+        if reclaim_transfer_call_id and self.transfer_manager:
+            try:
+                self.transfer_manager.maybe_abort_expired_transfer(
+                    reclaim_transfer_call_id
+                )
+            except Exception:
+                self.logger.exception(
+                    "ChannelStateChange: error reclaiming expired transfer call_id=%s",
+                    reclaim_transfer_call_id,
+                )
+        if block_transfer_return:
+            return
+
+        with locked_context_by_channel(
+            self.state_store,
+            channel_id,
+            log=self.logger,
+            purpose="ChannelStateChange-cont",
+        ) as (locked_call_id, fresh_context):
+            if not locked_call_id or not fresh_context:
+                return
+            call_id = locked_call_id
+            if not is_channel_in_context(fresh_context, channel_id):
                 return
 
             # Verificar condiciones dentro del lock
@@ -986,13 +1017,20 @@ class AcDRouter:
                         pass
                 
                 if target_agent_id:
-                    self.agent_status_service.set_oncall(
+                    confirmed = self.agent_status_service.try_set_oncall(
                         agent_id=target_agent_id,
                         call_id=call_id,
                         bridge_id=bridge_id,
                         campaign_id=campaign_id,
-                        contact_number=phone_number
+                        contact_number=phone_number,
                     )
+                    if not confirmed:
+                        self.logger.warning(
+                            "try_set_oncall rechazado (blind transfer) agente=%s "
+                            "call_id=%s",
+                            target_agent_id,
+                            call_id,
+                        )
             except Exception as e:
                 self.logger.error(f"Error updating agent status on blind transfer: {e}")
 
@@ -1650,6 +1688,8 @@ class AcDRouter:
 
         call_type = None
         recover_blind_fail_call_id: Optional[str] = None
+        reclaim_transfer_call_id: Optional[str] = None
+        block_transfer_return = False
 
         with locked_context_by_channel(
             self.state_store,
@@ -1745,6 +1785,8 @@ class AcDRouter:
                     )
 
             if recover_blind_fail_call_id is None:
+                if is_transfer_window_expired(fresh_context):
+                    reclaim_transfer_call_id = call_id
                 # Excepción: PSTN cuelga durante transferencia ciega en Ringing →
                 # el handler DEBE procesar este evento para abortar la pierna B y reportar el cierre.
                 if should_block_operation_for_transfer(
@@ -1752,14 +1794,27 @@ class AcDRouter:
                     log=self.logger,
                     operation="ChannelDestroyed",
                 ) and not is_pstn_hangup_during_blind_transfer_ringing(fresh_context, channel_id):
-                    return
+                    block_transfer_return = True
+                else:
+                    # Leer tipo de llamada dentro del mismo contexto bloqueado
+                    call_type = (
+                        fresh_context.type.value
+                        if hasattr(fresh_context.type, "value")
+                        else fresh_context.type
+                    )
 
-                # Leer tipo de llamada dentro del mismo contexto bloqueado
-                call_type = (
-                    fresh_context.type.value
-                    if hasattr(fresh_context.type, "value")
-                    else fresh_context.type
+        if reclaim_transfer_call_id and self.transfer_manager:
+            try:
+                self.transfer_manager.maybe_abort_expired_transfer(
+                    reclaim_transfer_call_id
                 )
+            except Exception:
+                self.logger.exception(
+                    "ChannelDestroyed: error reclaiming expired transfer call_id=%s",
+                    reclaim_transfer_call_id,
+                )
+        if block_transfer_return:
+            return
 
         if recover_blind_fail_call_id and self.transfer_manager:
             try:
@@ -1810,6 +1865,8 @@ class AcDRouter:
         # Adquirir lock para leer el tipo de llamada desde contexto actualizado
         # Aunque solo es lectura, es mejor garantizar que leemos el tipo correcto
         call_type = None
+        reclaim_transfer_call_id: Optional[str] = None
+        block_transfer_return = False
 
         with locked_context_by_channel(
             self.state_store,
@@ -1830,6 +1887,8 @@ class AcDRouter:
                 )
                 call_type = None
             else:
+                if is_transfer_window_expired(fresh_context):
+                    reclaim_transfer_call_id = call_id
                 # Excepción: PSTN cuelga durante transferencia ciega en Ringing →
                 # el handler DEBE procesar este evento para abortar la pierna B y reportar el cierre.
                 # En todos los demás casos aplica la política estándar de bloqueo.
@@ -1838,13 +1897,26 @@ class AcDRouter:
                     log=self.logger,
                     operation="ChannelHangupRequest",
                 ) and not is_pstn_hangup_during_blind_transfer_ringing(fresh_context, channel_id):
-                    return
+                    block_transfer_return = True
+                else:
+                    call_type = (
+                        fresh_context.type.value
+                        if hasattr(fresh_context.type, "value")
+                        else fresh_context.type
+                    )
 
-                call_type = (
-                    fresh_context.type.value
-                    if hasattr(fresh_context.type, "value")
-                    else fresh_context.type
+        if reclaim_transfer_call_id and self.transfer_manager:
+            try:
+                self.transfer_manager.maybe_abort_expired_transfer(
+                    reclaim_transfer_call_id
                 )
+            except Exception:
+                self.logger.exception(
+                    "ChannelHangupRequest: error reclaiming expired transfer call_id=%s",
+                    reclaim_transfer_call_id,
+                )
+        if block_transfer_return:
+            return
 
         if not call_type:
             return
@@ -2354,13 +2426,20 @@ class AcDRouter:
         
         if self.agent_status_service and target_agent_id:
             try:
-                self.agent_status_service.set_oncall(
+                confirmed = self.agent_status_service.try_set_oncall(
                     agent_id=target_agent_id,
                     call_id=context.call_id,
                     bridge_id=context.bridge_id,
                     campaign_id=context.id_camp,
-                    contact_number=context.phone_number
+                    contact_number=context.phone_number,
                 )
+                if not confirmed:
+                    self.logger.warning(
+                        "try_set_oncall rechazado (blind transfer deprecated) "
+                        "agente=%s call_id=%s",
+                        target_agent_id,
+                        context.call_id,
+                    )
             except Exception as e:
                 self.logger.error(f"Error updating agent status on blind transfer: {e}")
 

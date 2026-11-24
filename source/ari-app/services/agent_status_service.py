@@ -31,11 +31,26 @@ return 0
 
 # KEYS[1]=agent KEYS[2]=lock KEYS[3]=lease KEYS[4]=cooldown
 # ARGV[1]=READY ARGV[2]=DIALING ARGV[3]=ts ARGV[4]=call_id ARGV[5]=ttl
+# ARGV[6]=outbound ("1"=click2call manual/preview: ignora cooldown wrapup y
+#           acepta READY|POSTCALL|PAUSE*)
+# ARGV[7]=POSTCALL (solo usado si ARGV[6]=="1")
 # Cooldown se setea al reservar (TTL=ring) para que un restore_ready ajenos
 # no permita re-reserve mientras el originate sigue en vuelo.
 _RESERVE_FOR_DISTRIBUTION_SCRIPT = """
+local function status_ok_for_reserve(status)
+    if ARGV[6] == '1' then
+        if status == ARGV[1] or status == ARGV[7] then
+            return true
+        end
+        if status and string.sub(status, 1, 5) == 'PAUSE' then
+            return true
+        end
+        return false
+    end
+    return status == ARGV[1]
+end
 local current = redis.call('HGET', KEYS[1], 'STATUS')
-if current ~= ARGV[1] then
+if not status_ok_for_reserve(current) then
     return 0
 end
 if redis.call('EXISTS', KEYS[2]) == 1 then
@@ -44,8 +59,10 @@ end
 if redis.call('EXISTS', KEYS[3]) == 1 then
     return 0
 end
-if redis.call('EXISTS', KEYS[4]) == 1 then
-    return 0
+if ARGV[6] ~= '1' then
+    if redis.call('EXISTS', KEYS[4]) == 1 then
+        return 0
+    end
 end
 local lock_ok = redis.call('SET', KEYS[2], ARGV[4], 'EX', ARGV[5], 'NX')
 if not lock_ok then
@@ -57,12 +74,13 @@ if not lease_ok then
     return 0
 end
 local current2 = redis.call('HGET', KEYS[1], 'STATUS')
-if current2 ~= ARGV[1] then
+if not status_ok_for_reserve(current2) then
     redis.call('DEL', KEYS[2])
     redis.call('DEL', KEYS[3])
     return 0
 end
 redis.call('HSET', KEYS[1], 'STATUS', ARGV[2], 'TIMESTAMP', ARGV[3], 'CALLID', ARGV[4])
+redis.call('HDEL', KEYS[1], 'PAUSE_ID')
 redis.call('SET', KEYS[4], ARGV[4], 'EX', tonumber(ARGV[5]))
 return 1
 """
@@ -101,20 +119,21 @@ end
 return 1
 """
 
-# Tras offer fallido: SET cooldown (KEYS[4]) siempre; libera lock; renueva lease;
-# deja DIALING. El cooldown bloquea re-reserve aunque otro path ponga READY.
+# Tras offer fallido: solo si lock/lease no son ajenos — SET cooldown, libera lock,
+# renueva lease, deja DIALING. El cooldown bloquea re-reserve aunque otro path ponga READY.
 # KEYS[1]=agent KEYS[2]=lock KEYS[3]=lease KEYS[4]=cooldown
 # ARGV[1]=call_id ARGV[2]=cooldown_ttl ARGV[3]=DIALING ARGV[4]=ts ARGV[5]=RINGING
+# Return 0 si la reserva pertenece a otra llamada (no tocar cooldown).
 _PENALIZE_FAILED_DISTRIBUTION_SCRIPT = """
-redis.call('SET', KEYS[4], ARGV[1], 'EX', tonumber(ARGV[2]))
 local lock_val = redis.call('GET', KEYS[2])
 local lease_val = redis.call('GET', KEYS[3])
 if lock_val and lock_val ~= ARGV[1] then
-    return 1
+    return 0
 end
 if lease_val and lease_val ~= ARGV[1] then
-    return 1
+    return 0
 end
+redis.call('SET', KEYS[4], ARGV[1], 'EX', tonumber(ARGV[2]))
 if lock_val == ARGV[1] then
     redis.call('DEL', KEYS[2])
 end
@@ -193,18 +212,104 @@ end
 return 1
 """
 
+# ONCALL con ownership de CALLID (manual / transfer / blind).
+# No exige DIALING/RINGING (a diferencia de _CONFIRM_DISTRIBUTION_ONCALL_SCRIPT).
+# KEYS[1]=agent KEYS[2]=lock KEYS[3]=lease KEYS[4]=cooldown
+# ARGV[1]=ONCALL ARGV[2]=call_id ARGV[3]=ts ARGV[4]=bridge
+# ARGV[5]=campaign ARGV[6]=contact ARGV[7]=node ARGV[8]=POSTCALL
+# Rechaza CALLID ajeno; rechaza POSTCALL sin CALLID (zombie post-hangup).
+# Libera lock/lease/cooldown de esta call_id (click2call dejó reserva en vuelo).
+_TRY_SET_ONCALL_SCRIPT = """
+local callid = redis.call('HGET', KEYS[1], 'CALLID')
+local status = redis.call('HGET', KEYS[1], 'STATUS')
+if callid and callid ~= '' and callid ~= ARGV[2] then
+    return 0
+end
+if status == ARGV[8] and (not callid or callid == '') then
+    return 0
+end
+redis.call('HSET', KEYS[1],
+    'STATUS', ARGV[1],
+    'TIMESTAMP', ARGV[3],
+    'CALLID', ARGV[2],
+    'BRIDGE_ID', ARGV[4],
+    'NODE_ID', ARGV[7]
+)
+if ARGV[5] ~= '' then
+    redis.call('HSET', KEYS[1], 'CAMPAIGN', ARGV[5])
+end
+if ARGV[6] ~= '' then
+    redis.call('HSET', KEYS[1], 'CONTACT_NUMBER', ARGV[6])
+end
+redis.call('HDEL', KEYS[1], 'AGENT_CHANNEL_ID', 'PSTN_CHANNEL_ID')
+if KEYS[2] ~= nil and KEYS[2] ~= '' then
+    local lock_val = redis.call('GET', KEYS[2])
+    if lock_val and lock_val == ARGV[2] then
+        redis.call('DEL', KEYS[2])
+    end
+end
+if KEYS[3] ~= nil and KEYS[3] ~= '' then
+    local lease_val = redis.call('GET', KEYS[3])
+    if lease_val and lease_val == ARGV[2] then
+        redis.call('DEL', KEYS[3])
+    end
+end
+if KEYS[4] ~= nil and KEYS[4] ~= '' then
+    local cool_val = redis.call('GET', KEYS[4])
+    if cool_val and cool_val == ARGV[2] then
+        redis.call('DEL', KEYS[4])
+    end
+end
+return 1
+"""
+
+# DIALING con ownership de CALLID (manual enrich post-reserve / compat).
+# KEYS[1]=agent hash
+# ARGV[1]=DIALING ARGV[2]=ts ARGV[3]=call_id (puede '')
+# ARGV[4]=bridge ARGV[5]=campaign ARGV[6]=contact ARGV[7]=node
+# ARGV[8]=READY ARGV[9]=RINGING
+# Rechaza CALLID ajeno. Solo READY|DIALING|RINGING.
+# READY→DIALING (claim) o enrich NODE/BRIDGE si ya reservado con mismo CALLID.
+_TRY_SET_DIAL_CALL_SCRIPT = """
+local status = redis.call('HGET', KEYS[1], 'STATUS')
+local callid = redis.call('HGET', KEYS[1], 'CALLID')
+local want = ARGV[3]
+if callid and callid ~= '' and want ~= '' and callid ~= want then
+    return 0
+end
+if status ~= ARGV[8] and status ~= ARGV[1] and status ~= ARGV[9] then
+    return 0
+end
+redis.call('HSET', KEYS[1], 'STATUS', ARGV[1], 'TIMESTAMP', ARGV[2], 'NODE_ID', ARGV[7])
+if want ~= '' then
+    redis.call('HSET', KEYS[1], 'CALLID', want)
+end
+if ARGV[4] ~= '' then
+    redis.call('HSET', KEYS[1], 'BRIDGE_ID', ARGV[4])
+end
+if ARGV[5] ~= '' then
+    redis.call('HSET', KEYS[1], 'CAMPAIGN', ARGV[5])
+end
+if ARGV[6] ~= '' then
+    redis.call('HSET', KEYS[1], 'CONTACT_NUMBER', ARGV[6])
+end
+return 1
+"""
+
 # Estado UI del softphone (Django api_make_ringing); no está en AgentStatus del ACD.
 _AGENT_STATUS_RINGING = "RINGING"
 
 # ONCALL→POSTCALL atómico + limpieza + wrapup cooldown (misma eval).
 # KEYS[1]=agent KEYS[2]=cooldown (puede ser "" si ttl=0)
+# KEYS[3]=lock KEYS[4]=lease (pueden ser "")
 # ARGV[1]=ONCALL ARGV[2]=POSTCALL ARGV[3]=timestamp ARGV[4]=expected_call_id
 # ARGV[5]=ttl_sec (0 = no SET cooldown) ARGV[6]=cooldown_value ("wrapup")
 # Retorna 1 si hubo cambio (STATUS o limpieza), 0 si no tocó campos.
 # No pisa STATUS si ya no es ONCALL (p. ej. consola ya puso PAUSE-ACW/READY).
 # No toca voicebots (VOICEBOT=1). Preserva CAMPAIGN para métricas ACW de Django.
-# Cooldown: se setea en la misma eval si ttl>0 y no hay otra CALLID activa
-# (cierra la ventana READY→reserve entre HSET y SET cooldown).
+# Cooldown: solo si changed==1 (transición o clear) y ttl>0 — evita renovar TTL
+# en hangups no-op concurrentes. Cierra la ventana READY→reserve en la misma eval.
+# Lock/lease de la call_id se liberan al limpiar (safety net si ONCALL no lo hizo).
 _SET_POSTCALL_AND_CLEAR_FIELDS_SCRIPT = """
 local voicebot = redis.call('HGET', KEYS[1], 'VOICEBOT')
 if voicebot == '1' then
@@ -236,13 +341,113 @@ if should_clear then
         'AGENT_CHANNEL_ID', 'PSTN_CHANNEL_ID'
     )
     changed = 1
+    local own = ARGV[4]
+    if own == '' then
+        own = callid
+    end
+    if own and own ~= '' then
+        if KEYS[3] ~= nil and KEYS[3] ~= '' then
+            local lock_val = redis.call('GET', KEYS[3])
+            if lock_val and lock_val == own then
+                redis.call('DEL', KEYS[3])
+            end
+        end
+        if KEYS[4] ~= nil and KEYS[4] ~= '' then
+            local lease_val = redis.call('GET', KEYS[4])
+            if lease_val and lease_val == own then
+                redis.call('DEL', KEYS[4])
+            end
+        end
+    end
 end
--- Wrapup cooldown atómico con la transición (también si STATUS ya era ACW/READY).
+-- Wrapup cooldown solo si hubo transición o clear (no renovar en hangup no-op).
 local ttl = tonumber(ARGV[5])
-if ttl and ttl > 0 and KEYS[2] ~= nil and KEYS[2] ~= '' then
+if changed == 1 and ttl and ttl > 0 and KEYS[2] ~= nil and KEYS[2] ~= '' then
     redis.call('SET', KEYS[2], ARGV[6], 'EX', ttl)
 end
 return changed
+"""
+
+# Liberación atómica de cupo voicebot: HDEL + DECR condicional + READY/clear.
+# KEYS[1]=VOICEBOT-ACTIVE-CALLS KEYS[2]=AGENT KEYS[3]=VOICEBOT-CALLS (noop si do_decr=0)
+# ARGV[1]=call_id ARGV[2]=READY ARGV[3]=timestamp ARGV[4]=do_decr ("1"|"0")
+# Retorna {deleted, went_ready, remaining_payload_or_empty}.
+# Solo el caller que logra HDEL==1 hace DECR; idempotente ante concurrencia handoff/hangup.
+_RELEASE_VOICEBOT_CALL_SCRIPT = """
+local deleted = redis.call('HDEL', KEYS[1], ARGV[1])
+if deleted == 0 then
+    return {0, 0, ''}
+end
+if ARGV[4] == '1' then
+    local n = redis.call('DECR', KEYS[3])
+    if n < 0 then
+        redis.call('SET', KEYS[3], '0')
+    end
+end
+local remaining = redis.call('HGETALL', KEYS[1])
+if #remaining == 0 then
+    redis.call('HSET', KEYS[2], 'STATUS', ARGV[2], 'TIMESTAMP', ARGV[3])
+    redis.call('HDEL', KEYS[2],
+        'CALLID', 'BRIDGE_ID', 'NODE_ID', 'CAMPAIGN', 'CONTACT_NUMBER',
+        'AGENT_CHANNEL_ID', 'PSTN_CHANNEL_ID'
+    )
+    return {1, 1, ''}
+end
+return {1, 0, remaining[2]}
+"""
+
+_VOICEBOT_CALLS_NOOP_KEY = "OML:CALLDATA:VOICEBOT-CALLS:noop"
+_VOICEBOT_PENDING_NOOP_KEY = "OML:VOICEBOT-PENDING:noop"
+
+# Reserva atómica de cupo MAXQCALLS (in-flight + activas).
+# KEYS[1]=pending KEYS[2]=VOICEBOT-CALLS
+# ARGV[1]=call_id ARGV[2]=max_qcalls (0 o menor = ilimitado)
+# Return 1 si reservó o ya tenía pending; 0 si en tope.
+_TRY_RESERVE_VOICEBOT_SLOT_SCRIPT = """
+if redis.call('HEXISTS', KEYS[1], ARGV[1]) == 1 then
+    return 1
+end
+local maxq = tonumber(ARGV[2])
+if maxq and maxq > 0 then
+    local cur = tonumber(redis.call('GET', KEYS[2]) or '0') or 0
+    if cur >= maxq then
+        return 0
+    end
+end
+redis.call('INCR', KEYS[2])
+redis.call('HSET', KEYS[1], ARGV[1], '1')
+return 1
+"""
+
+# Libera cupo pendiente si el originate muere sin answer.
+# KEYS[1]=pending KEYS[2]=VOICEBOT-CALLS  ARGV[1]=call_id
+# Return 1 si hizo DECR; 0 si no había pending.
+_RELEASE_VOICEBOT_PENDING_SLOT_SCRIPT = """
+local deleted = redis.call('HDEL', KEYS[1], ARGV[1])
+if deleted == 0 then
+    return 0
+end
+local n = redis.call('DECR', KEYS[2])
+if n < 0 then
+    redis.call('SET', KEYS[2], '0')
+end
+return 1
+"""
+
+# Registra llamada activa; consume pending (sin segundo INCR) o INCR si field nuevo sin pending.
+# KEYS[1]=active KEYS[2]=pending KEYS[3]=VOICEBOT-CALLS (noop si do_incr_fallback=0)
+# ARGV[1]=call_id ARGV[2]=payload_json ARGV[3]=do_incr_fallback ("1"|"0")
+# Return {ok, incr_done} incr_done=1 solo si hizo INCR de fallback.
+_REGISTER_VOICEBOT_ACTIVE_CALL_SCRIPT = """
+local existed = redis.call('HEXISTS', KEYS[1], ARGV[1])
+redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
+local had_pending = redis.call('HDEL', KEYS[2], ARGV[1])
+local incr_done = 0
+if ARGV[3] == '1' and existed == 0 and had_pending == 0 then
+    redis.call('INCR', KEYS[3])
+    incr_done = 1
+end
+return {1, incr_done}
 """
 
 
@@ -406,12 +611,22 @@ class AgentStatusService:
         agent_id: Any,
         call_id: str,
         ttl_sec: int,
+        *,
+        ignore_cooldown: bool = False,
     ) -> bool:
         """
-        Reserva atómica para distribución en cola: READY→DIALING + lock + lease con TTL.
+        Reserva atómica: STATUS→DIALING + lock + lease con TTL.
+
+        Por defecto (cola inbound): solo READY y sin cooldown.
+
+        ignore_cooldown=True (click2call manual/preview):
+        - ignora acd:cooldown:agent (wrapup)
+        - acepta READY | POSTCALL | cualquier STATUS que empiece por PAUSE
+        - limpia PAUSE_ID al pasar a DIALING
+        Sigue exigiendo lock/lease libres. Pisa cooldown con call_id (vuelo).
 
         Returns:
-            True si la reserva se aplicó, False si el agente no está READY o ya reservado.
+            True si la reserva se aplicó, False si STATUS no apto o ya reservado.
         """
         if not agent_id or not call_id:
             self.logger.warning("try_reserve_for_distribution: agent_id o call_id vacío")
@@ -442,6 +657,8 @@ class AgentStatusService:
                 current_timestamp,
                 str(call_id),
                 str(int(ttl_sec)),
+                "1" if ignore_cooldown else "0",
+                AgentStatus.POSTCALL.value,
             )
             if result:
                 publish_agent_to_streams(self.redis_client, agent_id)
@@ -669,20 +886,85 @@ class AgentStatusService:
         except Exception:
             return False
     
-    def set_dial_call(self, agent_id: Any) -> bool:
+    def set_dial_call(
+        self,
+        agent_id: Any,
+        call_id: Optional[str] = None,
+        bridge_id: Optional[str] = None,
+        campaign_id: Optional[Any] = None,
+        contact_number: Optional[str] = None,
+        node_id: Optional[str] = None,
+    ) -> bool:
         """
-        Establece el estado del agente a DIAL CALL.
-        
-        Este método se usa cuando el agente inicia una llamada manual
-        (cuando arranca el leg del agente, antes de originar hacia PSTN).
-        
-        Args:
-            agent_id: ID del agente
-            
-        Returns:
-            bool: True si la actualización fue exitosa, False en caso contrario
+        DIALING con CAS por ownership de CALLID (saliente manual/preview).
+
+        Tras try_reserve_for_distribution en dial_to_agent, enriquece NODE_ID/
+        BRIDGE sin pisar una reserva inbound ajena. Compat: READY→DIALING si
+        aún no hay CALLID propio.
+
+        NODE_ID en DIALING es obligatorio para Pub/Sub de transferencias
+        (Django usa OML:AGENT:{id}.NODE_ID; sin él cae a acd01 / Subscribers:0).
         """
-        return self.set_status(agent_id, AgentStatus.DIAL_CALL)
+        if not agent_id:
+            self.logger.warning("set_dial_call: agent_id vacío")
+            return False
+
+        if not self.redis_client:
+            self.logger.error(
+                "set_dial_call: redis_client no disponible para agente %s",
+                agent_id,
+            )
+            return False
+
+        if node_id is None:
+            node_id = getattr(settings, "NODE_ID", "acd-server01")
+
+        try:
+            agent_key = self._get_agent_key(agent_id)
+            current_timestamp = str(int(datetime.now().timestamp()))
+            campaign_str = "" if campaign_id is None else str(campaign_id)
+            contact_str = contact_number or ""
+            call_str = call_id or ""
+            bridge_str = bridge_id or ""
+            result = self.redis_client.eval(
+                _TRY_SET_DIAL_CALL_SCRIPT,
+                1,
+                agent_key,
+                AgentStatus.DIAL_CALL.value,
+                current_timestamp,
+                call_str,
+                bridge_str,
+                campaign_str,
+                contact_str,
+                str(node_id),
+                AgentStatus.READY.value,
+                _AGENT_STATUS_RINGING,
+            )
+            if result:
+                publish_agent_to_streams(self.redis_client, agent_id)
+                self.logger.info(
+                    "set_dial_call: agente %s → DIALING call_id=%s bridge=%s",
+                    agent_id,
+                    call_str or "(none)",
+                    bridge_str or "(none)",
+                )
+                return True
+            self.logger.warning(
+                "set_dial_call: rechazo para agente %s call_id=%s "
+                "(STATUS no es READY/DIALING/RINGING o CALLID ajeno)",
+                agent_id,
+                call_str or "(none)",
+            )
+            return False
+        except Exception as e:
+            self.logger.error(
+                "set_dial_call: error agente %s call_id=%s: %s",
+                agent_id,
+                call_id,
+                e,
+                exc_info=True,
+            )
+            return False
     
     def set_oncall(
         self,
@@ -694,39 +976,99 @@ class AgentStatusService:
         node_id: Optional[str] = None
     ) -> bool:
         """
-        Establece el estado del agente a ONCALL.
-        
-        Este método se usa cuando el leg PSTN se conecta y se agrega al bridge
-        (cuando la llamada está activa).
-        
-        Args:
-            agent_id: ID del agente
-            call_id: ID de la llamada
-            bridge_id: ID del bridge de la llamada
-            campaign_id: ID de la campaña (opcional)
-            contact_number: Número de contacto (opcional)
-            node_id: ID del nodo ACD (opcional, se usa settings.NODE_ID si no se proporciona)
-            
-        Returns:
-            bool: True si la actualización fue exitosa, False en caso contrario
+        Compat: delega a try_set_oncall (CAS por CALLID).
+        Preferir try_set_oncall en callers nuevos.
         """
-        # Obtener NODE_ID de settings si no se proporciona
+        return self.try_set_oncall(
+            agent_id=agent_id,
+            call_id=call_id,
+            bridge_id=bridge_id,
+            campaign_id=campaign_id,
+            contact_number=contact_number,
+            node_id=node_id,
+        )
+
+    def try_set_oncall(
+        self,
+        agent_id: Any,
+        call_id: str,
+        bridge_id: str,
+        campaign_id: Optional[Any] = None,
+        contact_number: Optional[str] = None,
+        node_id: Optional[str] = None,
+    ) -> bool:
+        """
+        ONCALL atómico con ownership de CALLID (manual / transfer / blind).
+
+        Rechaza si hay CALLID ajena, o si STATUS=POSTCALL sin CALLID (zombie).
+        No exige DIALING/RINGING. Libera lock/lease/cooldown de esta call_id
+        (reserva de click2call / dial_to_agent).
+        """
+        if not agent_id or not call_id or not bridge_id:
+            self.logger.warning(
+                "try_set_oncall: agent_id, call_id o bridge_id vacío"
+            )
+            return False
+
+        if not self.redis_client:
+            self.logger.error(
+                "try_set_oncall: redis_client no disponible para agente %s",
+                agent_id,
+            )
+            return False
+
         if node_id is None:
-            node_id = getattr(settings, 'NODE_ID', 'acd-server01')
-        
-        call_data = {
-            "call_id": call_id,
-            "bridge_id": bridge_id,
-            "node_id": node_id
-        }
-        
-        if campaign_id is not None:
-            call_data["campaign_id"] = campaign_id
-        
-        if contact_number:
-            call_data["contact_number"] = contact_number
-        
-        return self.set_status(agent_id, AgentStatus.ONCALL, call_data)
+            node_id = getattr(settings, "NODE_ID", "acd-server01")
+
+        try:
+            agent_key = self._get_agent_key(agent_id)
+            lock_key = RedisKeys.agent_lock(str(agent_id))
+            lease_key = RedisKeys.agent_reservation_lease(str(agent_id))
+            cooldown_key = RedisKeys.agent_offer_cooldown(str(agent_id))
+            current_timestamp = str(int(datetime.now().timestamp()))
+            campaign_str = "" if campaign_id is None else str(campaign_id)
+            contact_str = contact_number or ""
+            result = self.redis_client.eval(
+                _TRY_SET_ONCALL_SCRIPT,
+                4,
+                agent_key,
+                lock_key,
+                lease_key,
+                cooldown_key,
+                AgentStatus.ONCALL.value,
+                str(call_id),
+                current_timestamp,
+                str(bridge_id),
+                campaign_str,
+                contact_str,
+                str(node_id),
+                AgentStatus.POSTCALL.value,
+            )
+            if result:
+                self.logger.info(
+                    "try_set_oncall: agente %s → ONCALL call_id=%s bridge=%s",
+                    agent_id,
+                    call_id,
+                    bridge_id,
+                )
+                publish_agent_to_streams(self.redis_client, agent_id)
+            else:
+                self.logger.warning(
+                    "try_set_oncall: rechazo para agente %s call_id=%s "
+                    "(CALLID ajena o POSTCALL sin CALLID)",
+                    agent_id,
+                    call_id,
+                )
+            return bool(result)
+        except Exception as e:
+            self.logger.error(
+                "try_set_oncall: error agente %s call_id=%s: %s",
+                agent_id,
+                call_id,
+                e,
+                exc_info=True,
+            )
+            return False
 
     def try_confirm_distribution_oncall(
         self,
@@ -812,6 +1154,76 @@ class AgentStatusService:
             )
             return False
 
+    def try_reserve_voicebot_slot(
+        self,
+        campaign_id: Any,
+        agent_id: Any,
+        call_id: str,
+        max_qcalls: int,
+    ) -> bool:
+        """
+        Reserva cupo MAXQCALLS de forma atómica (INCR + pending por call_id).
+        max_qcalls <= 0 → ilimitado (siempre reserva).
+        """
+        if not agent_id or not call_id or campaign_id is None or not str(campaign_id).strip():
+            return False
+        if not self.redis_client:
+            self.logger.error(
+                "try_reserve_voicebot_slot: redis_client no disponible agente %s",
+                agent_id,
+            )
+            return False
+        try:
+            result = self.redis_client.eval(
+                _TRY_RESERVE_VOICEBOT_SLOT_SCRIPT,
+                2,
+                RedisKeys.voicebot_pending_slots(str(campaign_id), agent_id),
+                RedisKeys.voicebot_calls(str(campaign_id), agent_id),
+                str(call_id),
+                str(int(max_qcalls)),
+            )
+            return bool(int(result or 0))
+        except Exception as e:
+            self.logger.error(
+                "try_reserve_voicebot_slot: error campaña %s agente %s call_id=%s: %s",
+                campaign_id,
+                agent_id,
+                call_id,
+                e,
+                exc_info=True,
+            )
+            return False
+
+    def release_voicebot_pending_slot(
+        self,
+        campaign_id: Any,
+        agent_id: Any,
+        call_id: str,
+    ) -> bool:
+        """Libera cupo pendiente si el originate murió sin answer (HDEL pending + DECR)."""
+        if not agent_id or not call_id or campaign_id is None or not str(campaign_id).strip():
+            return False
+        if not self.redis_client:
+            return False
+        try:
+            result = self.redis_client.eval(
+                _RELEASE_VOICEBOT_PENDING_SLOT_SCRIPT,
+                2,
+                RedisKeys.voicebot_pending_slots(str(campaign_id), agent_id),
+                RedisKeys.voicebot_calls(str(campaign_id), agent_id),
+                str(call_id),
+            )
+            return bool(int(result or 0))
+        except Exception as e:
+            self.logger.warning(
+                "release_voicebot_pending_slot: error campaña %s agente %s call_id=%s: %s",
+                campaign_id,
+                agent_id,
+                call_id,
+                e,
+            )
+            return False
+
     def register_voicebot_active_call(
         self,
         agent_id: Any,
@@ -823,6 +1235,10 @@ class AgentStatusService:
     ) -> bool:
         """
         Registra una llamada voicebot activa en el hash por agente y mantiene STATUS=ONCALL.
+
+        El cupo MAXQCALLS suele haberse reservado en try_reserve_voicebot_slot (originate);
+        aquí se consume el pending sin segundo INCR. Si no hubo pending y el call_id es
+        nuevo, hace INCR de fallback (paths sin reserve previo).
         """
         if not agent_id or not call_id:
             self.logger.warning("register_voicebot_active_call: agent_id o call_id vacío")
@@ -851,25 +1267,26 @@ class AgentStatusService:
                 "node_id": str(node_id),
             }
             active_key = RedisKeys.voicebot_active_calls(agent_id)
-            already_registered = bool(self.redis_client.hexists(active_key, str(call_id)))
-            self.redis_client.hset(active_key, str(call_id), json.dumps(payload))
+            has_camp = campaign_id is not None and str(campaign_id).strip()
+            if has_camp:
+                pending_key = RedisKeys.voicebot_pending_slots(str(campaign_id), agent_id)
+                calls_key = RedisKeys.voicebot_calls(str(campaign_id), agent_id)
+                do_incr = "1"
+            else:
+                pending_key = _VOICEBOT_PENDING_NOOP_KEY
+                calls_key = _VOICEBOT_CALLS_NOOP_KEY
+                do_incr = "0"
 
-            # El cupo MAXQCALLS (contador VOICEBOT-CALLS) se incrementa aquí, cuando el
-            # voicebot ya contestó y la llamada queda registrada: así INCR+HSET quedan
-            # ligados y release_voicebot_call (DECR+HDEL) es exactamente simétrico.
-            # Incrementar al originar (antes del answer) fugaba cupo cuando la llamada
-            # moría con el originate en vuelo, ya que la liberación exige el registro.
-            if not already_registered and campaign_id is not None and str(campaign_id).strip():
-                try:
-                    self.redis_client.incr(RedisKeys.voicebot_calls(str(campaign_id), agent_id))
-                except Exception as e:
-                    self.logger.warning(
-                        "register_voicebot_active_call: error INCR VOICEBOT-CALLS campaña %s "
-                        "agente %s: %s",
-                        campaign_id,
-                        agent_id,
-                        e,
-                    )
+            self.redis_client.eval(
+                _REGISTER_VOICEBOT_ACTIVE_CALL_SCRIPT,
+                3,
+                active_key,
+                pending_key,
+                calls_key,
+                str(call_id),
+                json.dumps(payload),
+                do_incr,
+            )
 
             try:
                 agent_key = RedisKeys.agent_hash(str(agent_id))
@@ -907,58 +1324,117 @@ class AgentStatusService:
             )
             return False
 
-    def unregister_voicebot_active_call(self, agent_id: Any, call_id: str) -> bool:
+    def _eval_release_voicebot_call(
+        self,
+        agent_id: Any,
+        call_id: str,
+        *,
+        campaign_id: Any = None,
+        do_decr: bool = False,
+    ) -> bool:
         """
-        Elimina una llamada voicebot del hash por agente.
-        Si no quedan llamadas activas, transiciona el agente a READY.
+        Ejecuta HDEL (+ DECR opcional) + READY/clear o sync ONCALL en una sola eval Lua.
+        Retorna True solo si HDEL eliminó el call_id (primera liberación gana).
         """
         if not agent_id or not call_id:
-            self.logger.warning("unregister_voicebot_active_call: agent_id o call_id vacío")
             return False
-
         if not self.redis_client:
             self.logger.error(
-                "unregister_voicebot_active_call: redis_client no disponible para agente %s",
+                "_eval_release_voicebot_call: redis_client no disponible para agente %s",
                 agent_id,
             )
             return False
 
+        active_key = RedisKeys.voicebot_active_calls(agent_id)
+        agent_key = self._get_agent_key(agent_id)
+        if do_decr and campaign_id is not None and str(campaign_id).strip():
+            calls_key = RedisKeys.voicebot_calls(str(campaign_id), agent_id)
+            do_decr_flag = "1"
+        else:
+            calls_key = _VOICEBOT_CALLS_NOOP_KEY
+            do_decr_flag = "0"
+
+        current_timestamp = str(int(datetime.now().timestamp()))
         try:
-            active_key = RedisKeys.voicebot_active_calls(agent_id)
-            self.redis_client.hdel(active_key, str(call_id))
-            remaining = self.redis_client.hgetall(active_key) or {}
-
-            if not remaining:
-                agent_key = self._get_agent_key(agent_id)
-                current_timestamp = int(datetime.now().timestamp())
-                self.redis_client.hset(
-                    agent_key,
-                    mapping={
-                        "STATUS": AgentStatus.READY.value,
-                        "TIMESTAMP": str(current_timestamp),
-                    },
-                )
-                self.clear_call_fields(agent_id)
-            else:
-                self._sync_agent_legacy_from_active_calls(agent_id, remaining)
-
-            publish_voicebot_active_calls_change(self.redis_client, agent_id)
-            self.logger.info(
-                "unregister_voicebot_active_call: agente %s call_id=%s (restantes=%s)",
-                agent_id,
-                call_id,
-                len(remaining),
+            result = self.redis_client.eval(
+                _RELEASE_VOICEBOT_CALL_SCRIPT,
+                3,
+                active_key,
+                agent_key,
+                calls_key,
+                str(call_id),
+                AgentStatus.READY.value,
+                current_timestamp,
+                do_decr_flag,
             )
-            return True
         except Exception as e:
             self.logger.error(
-                "unregister_voicebot_active_call: error agente %s call_id=%s: %s",
+                "_eval_release_voicebot_call: error agente %s call_id=%s: %s",
                 agent_id,
                 call_id,
                 e,
                 exc_info=True,
             )
             return False
+
+        deleted = 0
+        went_ready = 0
+        remaining_payload = ""
+        if isinstance(result, (list, tuple)) and len(result) >= 2:
+            deleted = int(result[0] or 0)
+            went_ready = int(result[1] or 0)
+            if len(result) >= 3 and result[2] is not None:
+                remaining_payload = result[2]
+                if isinstance(remaining_payload, bytes):
+                    remaining_payload = remaining_payload.decode("utf-8")
+
+        if deleted == 0:
+            self.logger.debug(
+                "_eval_release_voicebot_call: call_id=%s no estaba en hash agente %s, omitiendo",
+                call_id,
+                agent_id,
+            )
+            return False
+
+        if went_ready == 0 and remaining_payload:
+            try:
+                fake_remaining = {str(call_id): remaining_payload}
+                self._sync_agent_legacy_from_active_calls(agent_id, fake_remaining)
+            except Exception as e:
+                self.logger.warning(
+                    "_eval_release_voicebot_call: sync ONCALL falló agente %s: %s",
+                    agent_id,
+                    e,
+                )
+        elif went_ready == 0:
+            self._sync_agent_legacy_from_active_calls(agent_id)
+
+        publish_voicebot_active_calls_change(self.redis_client, agent_id)
+        self.logger.info(
+            "_eval_release_voicebot_call: agente %s call_id=%s deleted=%s went_ready=%s do_decr=%s",
+            agent_id,
+            call_id,
+            deleted,
+            went_ready,
+            do_decr_flag,
+        )
+        return True
+
+    def unregister_voicebot_active_call(self, agent_id: Any, call_id: str) -> bool:
+        """
+        Elimina una llamada voicebot del hash por agente.
+        Si no quedan llamadas activas, transiciona el agente a READY.
+        Atómico vía Lua (sin DECR del contador de campaña).
+        """
+        if not agent_id or not call_id:
+            self.logger.warning("unregister_voicebot_active_call: agent_id o call_id vacío")
+            return False
+
+        return self._eval_release_voicebot_call(
+            agent_id,
+            call_id,
+            do_decr=False,
+        )
 
     def release_voicebot_call(
         self,
@@ -968,34 +1444,17 @@ class AgentStatusService:
     ) -> bool:
         """
         Libera cupo voicebot: DECR contador por campaña + unregister en hash de activas.
-        Idempotente: si call_id no está en el hash activo, no hace DECR ni HDEL.
+        Idempotente y atómico (Lua): si call_id no está en el hash, no hace DECR ni HDEL.
         """
         if not agent_id or not call_id:
             return False
 
-        if self.redis_client:
-            active_key = RedisKeys.voicebot_active_calls(agent_id)
-            if not self.redis_client.hexists(active_key, str(call_id)):
-                self.logger.debug(
-                    "release_voicebot_call: call_id=%s no está en hash activo agente %s, omitiendo",
-                    call_id,
-                    agent_id,
-                )
-                return False
-
-            if campaign_id is not None:
-                try:
-                    voicebot_calls_key = RedisKeys.voicebot_calls(str(campaign_id), agent_id)
-                    self.redis_client.decr(voicebot_calls_key)
-                except Exception as e:
-                    self.logger.warning(
-                        "release_voicebot_call: error DECR campaña %s agente %s: %s",
-                        campaign_id,
-                        agent_id,
-                        e,
-                    )
-
-        return self.unregister_voicebot_active_call(agent_id, call_id)
+        return self._eval_release_voicebot_call(
+            agent_id,
+            call_id,
+            campaign_id=campaign_id,
+            do_decr=True,
+        )
 
     def release_voicebot_from_context(
         self,
@@ -1163,7 +1622,9 @@ class AgentStatusService:
         Si el agente ya está en PAUSE-ACW/READY (consola más rápida), no pisa
         STATUS pero limpia CALLID/NODE_ID/BRIDGE_ID cuando coinciden con call_id.
         No toca voicebots (VOICEBOT=1). Preserva CAMPAIGN para métricas ACW.
-        El cooldown wrapup se setea en la misma eval Redis (sin ventana vs READY).
+        El cooldown wrapup se setea en la misma eval Redis solo si hubo cambio
+        (sin ventana vs READY; hangups no-op no renuevan el TTL).
+        Libera lock/lease residuales de esta call_id (safety net post-hangup).
 
         Args:
             agent_id: ID del agente
@@ -1197,11 +1658,15 @@ class AgentStatusService:
             cooldown_key = (
                 RedisKeys.agent_offer_cooldown(str(agent_id)) if ttl > 0 else ""
             )
+            lock_key = RedisKeys.agent_lock(str(agent_id))
+            lease_key = RedisKeys.agent_reservation_lease(str(agent_id))
             result = self.redis_client.eval(
                 _SET_POSTCALL_AND_CLEAR_FIELDS_SCRIPT,
-                2,
+                4,
                 agent_key,
                 cooldown_key,
+                lock_key,
+                lease_key,
                 AgentStatus.ONCALL.value,
                 AgentStatus.POSTCALL.value,
                 current_timestamp,
@@ -1209,15 +1674,15 @@ class AgentStatusService:
                 str(int(ttl)),
                 "wrapup",
             )
-            if ttl > 0:
-                self.logger.info(
-                    "set_postcall_and_clear_fields: wrapup cooldown agente %s "
-                    "ttl=%ss campaign=%s (atómico con postcall)",
-                    agent_id,
-                    ttl,
-                    campaign_id,
-                )
             if result:
+                if ttl > 0:
+                    self.logger.info(
+                        "set_postcall_and_clear_fields: wrapup cooldown agente %s "
+                        "ttl=%ss campaign=%s (atómico con postcall)",
+                        agent_id,
+                        ttl,
+                        campaign_id,
+                    )
                 self.logger.info(
                     "set_postcall_and_clear_fields: agente %s → POSTCALL "
                     "(o limpieza de campos) call_id=%s",

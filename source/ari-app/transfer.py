@@ -2,13 +2,15 @@ import logging
 import time
 import threading
 from datetime import datetime
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from ari_manager import ARI
 from state import (
     CallRegistry,
     CallContext,
     ConsultationData,
+    CONSULT_SETTLE_CANCELLING,
+    CONSULT_SETTLE_COMPLETING,
     TRANSFER_PHASE_ANSWERED,
     TRANSFER_PHASE_NONE,
     TRANSFER_PHASE_REQUESTED,
@@ -20,6 +22,9 @@ from state_helpers import (
     active_agent_channel,
     finalize_current_agent_segment,
     is_channel_in_context,
+    pending_blind_transfer_abort_legs,
+    pending_consult_abort_bridges,
+    pending_consult_abort_legs,
     resolve_consult_initiator_channel,
 )
 from utils import build_oml_sip_headers
@@ -110,6 +115,7 @@ class TransferManager:
         get_campaign_config: Optional[Callable[[str], Dict[str, Any]]] = None,
         queue_event_manager: Any = None,
         inbound_handler: Any = None,
+        recording_service: Any = None,
     ):
         self.state_store = state_store
         self.ari = ari_client
@@ -119,6 +125,7 @@ class TransferManager:
         self.get_campaign_config = get_campaign_config
         self.queue_event_manager = queue_event_manager
         self.inbound_handler = inbound_handler
+        self.recording_service = recording_service
         # Logger estandarizado por módulo
         self.logger = logging.getLogger(__name__)
         self.asterisk_app = settings.ARI_APP
@@ -126,10 +133,284 @@ class TransferManager:
         self.node_id = settings.NODE_ID
         self._welcome_deferred: Dict[str, Dict[str, Any]] = {}
         self._welcome_deferred_lock = threading.Lock()
+        self._transfer_deadline_timers: Dict[str, threading.Timer] = {}
+        self._transfer_deadline_lock = threading.Lock()
         if distribution_service is not None and hasattr(
             distribution_service, "set_overflow_to_campaign"
         ):
             distribution_service.set_overflow_to_campaign(self.overflow_to_campaign)
+
+    def _transfer_deadline_margin_sec(self) -> int:
+        return int(getattr(settings, "AGENT_RESERVATION_MARGIN_SEC", 10))
+
+    def _transfer_window_delay_sec(self, base_timeout: int) -> float:
+        return float(max(1, int(base_timeout) + self._transfer_deadline_margin_sec()))
+
+    def _arm_transfer_window_fields(self, ctx: CallContext, *, delay_sec: float) -> None:
+        """Marca ventana abierta (bajo lock). El Timer se agenda fuera del lock."""
+        ctx.transfer_in_progress = True
+        ctx.transfer_deadline_ts = time.time() + float(delay_sec)
+
+    def _disarm_transfer_window_fields(self, ctx: CallContext) -> None:
+        ctx.transfer_in_progress = False
+        ctx.transfer_phase = TRANSFER_PHASE_NONE
+        ctx.transfer_deadline_ts = None
+
+    def _cancel_transfer_deadline_timer(self, call_id: Optional[str]) -> None:
+        if not call_id:
+            return
+        with self._transfer_deadline_lock:
+            timer = self._transfer_deadline_timers.pop(call_id, None)
+        if timer is not None:
+            try:
+                timer.cancel()
+            except Exception:
+                pass
+
+    def _schedule_transfer_deadline_timer(self, call_id: str, delay_sec: float) -> None:
+        if not call_id:
+            return
+        self._cancel_transfer_deadline_timer(call_id)
+        timer = threading.Timer(
+            float(delay_sec),
+            self._on_transfer_deadline_fired,
+            args=(call_id,),
+        )
+        timer.daemon = True
+        with self._transfer_deadline_lock:
+            self._transfer_deadline_timers[call_id] = timer
+        timer.start()
+
+    def _on_transfer_deadline_fired(self, call_id: str) -> None:
+        with self._transfer_deadline_lock:
+            self._transfer_deadline_timers.pop(call_id, None)
+        try:
+            aborted = self.abort_transfer_window(
+                call_id, reason="deadline_expired"
+            )
+            if aborted:
+                self.logger.warning(
+                    "Transfer window deadline expired; aborted call_id=%s",
+                    call_id,
+                )
+        except Exception:
+            self.logger.exception(
+                "Error aborting transfer window on deadline call_id=%s",
+                call_id,
+            )
+
+    def maybe_abort_expired_transfer(self, call_id: Optional[str]) -> bool:
+        """Lazy reclaim: si transfer_deadline_ts venció, aborta la ventana."""
+        if not call_id:
+            return False
+        with self.state_store.lock(call_id):
+            ctx = self.state_store.get(call_id)
+            if not ctx or not getattr(ctx, "transfer_in_progress", False):
+                return False
+            deadline = getattr(ctx, "transfer_deadline_ts", None)
+            if deadline is None:
+                return False
+            try:
+                if time.time() < float(deadline):
+                    return False
+            except (TypeError, ValueError):
+                return False
+        return self.abort_transfer_window(call_id, reason="deadline_lazy_reclaim")
+
+    def abort_transfer_window(
+        self,
+        call_id: str,
+        *,
+        reason: str = "",
+        hangup_channels: Optional[List[str]] = None,
+        stop_moh: bool = True,
+        clear_consultation: bool = True,
+    ) -> bool:
+        """
+        Idempotente: limpia transfer_in_progress stuck y cuelga piernas pendientes.
+
+        Usado en verify-fail, early TransferLegStart, consult fail y deadline.
+        """
+        if not call_id:
+            return False
+
+        channels: List[str] = []
+        consult_bridges: List[str] = []
+        bridge_id: Optional[str] = None
+        did_abort = False
+
+        with self.state_store.lock(call_id):
+            ctx = self.state_store.get(call_id)
+            if not ctx or not getattr(ctx, "transfer_in_progress", False):
+                self._cancel_transfer_deadline_timer(call_id)
+                return False
+
+            did_abort = True
+            bridge_id = getattr(ctx, "bridge_id", None)
+
+            seen = set()
+            for ch in list(hangup_channels or []):
+                if isinstance(ch, str) and ch.strip() and ch not in seen:
+                    seen.add(ch)
+                    channels.append(ch.strip())
+            for ch in pending_blind_transfer_abort_legs(ctx):
+                if ch not in seen:
+                    seen.add(ch)
+                    channels.append(ch)
+            for ch in pending_consult_abort_legs(ctx):
+                if ch not in seen:
+                    seen.add(ch)
+                    channels.append(ch)
+            attempt = getattr(ctx, "agent_attempt_channel", None)
+            if isinstance(attempt, str) and attempt.strip() and attempt not in seen:
+                seen.add(attempt)
+                channels.append(attempt.strip())
+
+            if clear_consultation:
+                for br in pending_consult_abort_bridges(ctx):
+                    consult_bridges.append(br)
+                if getattr(ctx, "consultation", None) is not None:
+                    ctx.consultation = None
+
+            ctx.agent_attempt_channel = None
+            if (
+                getattr(ctx, "blind_transfer_report_state", None) == _BLIND_TF_REQUESTED
+                or getattr(ctx, "blind_transfer_leg_id", None)
+            ):
+                self._reset_blind_transfer_tracking_fields(ctx)
+            self._disarm_transfer_window_fields(ctx)
+            self.state_store.register_unsafe(call_id, ctx)
+            self.logger.info(
+                "abort_transfer_window: call_id=%s reason=%s hangup=%s",
+                call_id,
+                reason or "(none)",
+                channels,
+            )
+
+        self._cancel_transfer_deadline_timer(call_id)
+
+        if stop_moh and bridge_id:
+            try:
+                self.ari.delete(f"bridges/{bridge_id}/moh")
+            except Exception:
+                self.logger.debug(
+                    "abort_transfer_window: MOH stop failed bridge=%s",
+                    bridge_id,
+                    exc_info=True,
+                )
+
+        for ch in channels:
+            try:
+                self.ari.hangup_channel(ch)
+            except Exception:
+                self.logger.debug(
+                    "abort_transfer_window: hangup failed channel=%s",
+                    ch,
+                    exc_info=True,
+                )
+
+        for br in consult_bridges:
+            try:
+                self.ari.destroy_bridge(br)
+            except Exception:
+                self.logger.debug(
+                    "abort_transfer_window: destroy consult bridge failed %s",
+                    br,
+                    exc_info=True,
+                )
+
+        return did_abort
+
+    @staticmethod
+    def _try_claim_consult_settle(ctx: CallContext, op: str) -> bool:
+        """
+        Claim atómico de asentamiento consultiva (bajo lock del caller).
+        Exige consultation.active y settle_op vacío (solo str real cuenta como claim).
+        """
+        cons = getattr(ctx, "consultation", None)
+        if cons is None or getattr(cons, "active", False) is not True:
+            return False
+        current = getattr(cons, "settle_op", None)
+        if isinstance(current, str) and current:
+            return False
+        cons.settle_op = op
+        return True
+
+    @staticmethod
+    def _consult_settle_allows(ctx: CallContext, op: str) -> bool:
+        """True si la consulta sigue activa y el claim coincide con op."""
+        if ctx is None:
+            return False
+        cons = getattr(ctx, "consultation", None)
+        if cons is None or getattr(cons, "active", False) is not True:
+            return False
+        return getattr(cons, "settle_op", None) == op
+
+    def _release_consult_settle_claim(self, unique_id: str, expected_op: str) -> None:
+        """Libera settle_op si aún coincide (rollback pre-consolidación)."""
+        with self.state_store.lock(unique_id):
+            ctx = self.state_store.get(unique_id)
+            if not ctx or not ctx.consultation:
+                return
+            if getattr(ctx.consultation, "settle_op", None) == expected_op:
+                ctx.consultation.settle_op = None
+                self.state_store.register_unsafe(unique_id, ctx)
+
+    def _stop_active_recording(
+        self,
+        call_id: Optional[str],
+        bridge_id: str,
+        recording_id: Optional[str] = None,
+    ) -> None:
+        """
+        Detiene la grabación live del bridge principal antes de destroy_bridge.
+
+        TransferTargetHangup (y otros cleanups) destruían el bridge sin stop;
+        Asterisk a veces deja el WAV en spool sin RecordingFinished → sin upload.
+        """
+        if not bridge_id or not bridge_id.strip():
+            return
+        rid = recording_id
+        if not rid and self.recording_service:
+            try:
+                rid = self.recording_service.get_active_recording(bridge_id)
+            except Exception:
+                self.logger.debug(
+                    "TransferManager._stop_active_recording: get_active_recording "
+                    "falló bridge=%s",
+                    bridge_id,
+                    exc_info=True,
+                )
+        if not rid:
+            # Convention: POST .../record usa name=call_id
+            rid = call_id
+        if not rid:
+            return
+        try:
+            result = self.ari.stop_recording(str(rid))
+            if result:
+                self.logger.info(
+                    "TransferManager: grabación %s detenida antes de destruir "
+                    "bridge %s (call_id=%s)",
+                    rid,
+                    bridge_id,
+                    call_id,
+                )
+            else:
+                self.logger.debug(
+                    "TransferManager: stop_recording retornó False para %s "
+                    "(puede que ya haya terminado) bridge=%s",
+                    rid,
+                    bridge_id,
+                )
+        except Exception as e:
+            self.logger.warning(
+                "TransferManager: error deteniendo grabación %s bridge=%s: %s",
+                rid,
+                bridge_id,
+                e,
+                exc_info=True,
+            )
 
     # ----------------- Helpers -----------------
     def _get_context(self, call_id: str) -> Optional[CallContext]:
@@ -224,6 +505,15 @@ class TransferManager:
             _call_type = call_type
             _uniqueid_pstn = uniqueid_pstn
         
+        # Nombre de campaña para popup softphone (header X-OML-CampName)
+        camp_name = ""
+        if _id_camp and self.get_campaign_config:
+            try:
+                camp_cfg = self.get_campaign_config(str(_id_camp)) or {}
+                camp_name = str(camp_cfg.get("showcampname") or "").strip()
+            except Exception:
+                camp_name = ""
+
         # Reutilizar helper centralizado para construir headers y variables legacy.
         # Para transferencias usamos:
         # - origin="transfer"
@@ -240,6 +530,7 @@ class TransferManager:
             asterisk_id=_uniqueid_pstn,
             include_legacy_vars=True,
             include_branch_id=True,
+            camp_name=camp_name or None,
         )
 
         return headers
@@ -549,10 +840,10 @@ class TransferManager:
         uid_agent = getattr(ctx, "uniqueid_agent", None)
         if uid_agent and uid_agent == saved_connected:
             ctx.uniqueid_agent = None
-        ctx.transfer_in_progress = False
-        ctx.transfer_phase = TRANSFER_PHASE_NONE
+        self._disarm_transfer_window_fields(ctx)
         self._reset_blind_transfer_tracking_fields(ctx)
         self.state_store.register_unsafe(call_id, ctx)
+        self._cancel_transfer_deadline_timer(call_id)
         return True
 
     def on_blind_transfer_leg_destroyed(
@@ -736,10 +1027,10 @@ class TransferManager:
                 call_type=ctx.call_type,
                 agent_id=origin_id,
             )
-            ctx.transfer_in_progress = False
-            ctx.transfer_phase = TRANSFER_PHASE_NONE
+            self._disarm_transfer_window_fields(ctx)
             self._reset_blind_transfer_tracking_fields(ctx)
             self.state_store.register_unsafe(call_id, ctx)
+        self._cancel_transfer_deadline_timer(call_id)
 
     def _get_target_agent_id_with_fallback(self, channel_id: str, target_agent_id: Optional[int] = None) -> Optional[int]:
         """
@@ -864,17 +1155,23 @@ class TransferManager:
             return
         
         try:
-            self.agent_status_service.set_oncall(
+            confirmed = self.agent_status_service.try_set_oncall(
                 agent_id=agent_id,
                 call_id=call_id,
                 bridge_id=bridge_id,
                 campaign_id=campaign_id,
-                contact_number=contact_number
+                contact_number=contact_number,
             )
-            self.logger.info(
-                f"✅ Estado del agente {agent_id} actualizado a ONCALL "
-                f"para llamada {call_id}"
-            )
+            if confirmed:
+                self.logger.info(
+                    f"✅ Estado del agente {agent_id} actualizado a ONCALL "
+                    f"para llamada {call_id}"
+                )
+            else:
+                self.logger.warning(
+                    f"try_set_oncall rechazado para agente {agent_id} "
+                    f"call_id={call_id}"
+                )
         except Exception as e:
             self.logger.error(
                 f"❌ Error actualizando estado del agente {agent_id} a ONCALL: {e}",
@@ -966,6 +1263,7 @@ class TransferManager:
         """
         
         inicio_ts = time.monotonic()
+        blind_delay = self._transfer_window_delay_sec(settings.TRANSFER_TIMEOUT)
 
         # 1. BLOQUEO DISTRIBUIDO (Race Condition Protection)
         # Adquirir lock y mantener estado consistente dentro del lock.
@@ -1003,12 +1301,14 @@ class TransferManager:
                     )
             
             # Marcar inicio de transferencia
-            ctx.transfer_in_progress = True
+            self._arm_transfer_window_fields(ctx, delay_sec=blind_delay)
             ctx.blind_transfer_attempted = True
             # Guardar target_agent_id en el contexto para recuperarlo en on_transfer_leg_start()
             if target_agent_id is not None:
                 ctx.target_agent_id = target_agent_id
             self.state_store.register_unsafe(unique_id, ctx)
+
+        self._schedule_transfer_deadline_timer(unique_id, blind_delay)
 
         try:
             # 2. Verificar estado nuevamente dentro del lock ANTES de ejecutar operaciones ARI.
@@ -1021,8 +1321,9 @@ class TransferManager:
                     self.logger.warning(f"⛔ Transferencia cancelada antes de ejecutar operaciones ARI para {unique_id}")
                     # Limpiar flag si aún está marcado
                     if ctx and ctx.transfer_in_progress:
-                        ctx.transfer_in_progress = False
+                        self._disarm_transfer_window_fields(ctx)
                         self.state_store.register_unsafe(unique_id, ctx)
+                    self._cancel_transfer_deadline_timer(unique_id)
                     return False
                 # Copiar todos los valores necesarios dentro del lock para garantizar consistencia.
                 # No mantener referencia al objeto ctx fuera del lock.
@@ -1084,6 +1385,8 @@ class TransferManager:
             )
 
             # SAFETY CHECK: Re-verificar estado tras I/O (cliente pudo colgar, bridge cambiar, etc.)
+            integrity_failed = False
+            hangup_legs: Optional[List[str]] = None
             with self.state_store.lock(unique_id):
                 ctx = self.state_store.get(unique_id)
                 if not self._verify_state_integrity(
@@ -1094,21 +1397,26 @@ class TransferManager:
                     self.logger.warning(
                         f"Transfer abortada: Estado inestable tras I/O en {unique_id}"
                     )
-                    if leg_id:
-                        try:
-                            self.ari.hangup_channel(leg_id)
-                        except Exception:
-                            pass
-                    return False
-                # Seguimiento para reporting: originate aceptado ≠ éxito conversacional
-                ctx.blind_transfer_leg_id = leg_id
-                ctx.blind_transfer_report_state = _BLIND_TF_REQUESTED
-                ctx.blind_transfer_pending_up_report = False
-                ctx.blind_transfer_numero_extra = endpoint if not target_agent_id else ""
-                ctx.blind_transfer_agente_origen_id = agent_id
-                ctx.blind_transfer_initiated_by = "VOICEBOT" if ctx.is_voicebot else "AGENTE"
-                ctx.transfer_phase = TRANSFER_PHASE_REQUESTED
-                self.state_store.register_unsafe(unique_id, ctx)
+                    hangup_legs = [leg_id] if leg_id else None
+                    integrity_failed = True
+                else:
+                    # Seguimiento para reporting: originate aceptado ≠ éxito conversacional
+                    ctx.blind_transfer_leg_id = leg_id
+                    ctx.blind_transfer_report_state = _BLIND_TF_REQUESTED
+                    ctx.blind_transfer_pending_up_report = False
+                    ctx.blind_transfer_numero_extra = endpoint if not target_agent_id else ""
+                    ctx.blind_transfer_agente_origen_id = agent_id
+                    ctx.blind_transfer_initiated_by = "VOICEBOT" if ctx.is_voicebot else "AGENTE"
+                    ctx.transfer_phase = TRANSFER_PHASE_REQUESTED
+                    self.state_store.register_unsafe(unique_id, ctx)
+
+            if integrity_failed:
+                self.abort_transfer_window(
+                    unique_id,
+                    reason="blind_endpoint_integrity_fail",
+                    hangup_channels=hangup_legs,
+                )
+                return False
 
             # Reportar fase solicitada (OK final solo tras answer/consolidación en on_transfer_leg_start / router)
             destination_type = "AGENT" if target_agent_id else "EXTERNAL"
@@ -1131,13 +1439,8 @@ class TransferManager:
 
         except Exception as e:
             self.logger.error(f"❌ Falló Blind Transfer: {e}")
-            # Rollback del flag
-            with self.state_store.lock(unique_id):
-                ctx = self.state_store.get(unique_id)
-                if ctx:
-                    ctx.transfer_in_progress = False
-                    self.state_store.register_unsafe(unique_id, ctx)
-            
+            self.abort_transfer_window(unique_id, reason="blind_endpoint_exception")
+
             # Reportar Error
             # Recargar valores dentro del lock para el reporte de error
             with self.state_store.lock(unique_id):
@@ -1555,6 +1858,7 @@ class TransferManager:
         """
         # 1. Primer bloque protegido: validar y marcar que hay una transferencia en curso,
         #    pero sin desmontar todavía el estado lógico de la llamada.
+        campaign_delay = self._transfer_window_delay_sec(settings.TRANSFER_TIMEOUT)
         with self.state_store.lock(unique_id):
             ctx = self.state_store.get(unique_id)
             if not ctx or ctx.transfer_in_progress:
@@ -1565,7 +1869,7 @@ class TransferManager:
 
             # Marcar transferencia en curso solo durante la ventana hasta consolidar (segundo bloque);
             # allí se limpia el flag para no bloquear el procesamiento de hangup del PSTN en cola.
-            ctx.transfer_in_progress = True
+            self._arm_transfer_window_fields(ctx, delay_sec=campaign_delay)
             ctx.transfer_phase = TRANSFER_PHASE_REQUESTED
 
             # Guardar headers extra si vienen en la petición
@@ -1591,6 +1895,8 @@ class TransferManager:
             call_type = ctx.call_type
             source_agent_id = ctx.agent_id
             is_voicebot_source = bool(getattr(ctx, "is_voicebot", False))
+
+        self._schedule_transfer_deadline_timer(unique_id, campaign_delay)
         
         # 2. Ejecución física fuera del lock (no modifica estado compartido)
         # MOH / WELCOMEPLAY destino: _start_redistribution_after_blind_to_campaign
@@ -1606,6 +1912,7 @@ class TransferManager:
         
         # 3. Segundo bloque protegido: consolidar cambios lógicos solo si la transferencia
         #    sigue activa después de las operaciones físicas.
+        campaign_integrity_failed = False
         with self.state_store.lock(unique_id):
             ctx = self.state_store.get(unique_id)
 
@@ -1618,22 +1925,29 @@ class TransferManager:
                 self.logger.warning(
                     f"Transfer abortada: Estado inestable tras I/O en {unique_id}"
                 )
-                return False
+                campaign_integrity_failed = True
+            else:
+                finalize_current_agent_segment(ctx)
 
-            finalize_current_agent_segment(ctx)
+                # id_camp se mantiene como campaña de atribución (CDR/BI); la cola operativa es distribution_campaign_id
+                ctx.distribution_campaign_id = int(target_camp_id)
+                ctx.agent_id = None
+                # En cola destino no hay pierna de agente aún; el historial vive en agent_segments / transfer_count.
+                ctx.agent_attempt_channel = None
+                ctx.agent_connected_channel = None
+                self._disarm_transfer_window_fields(ctx)
+                ctx.transfer_count += 1
+                ctx.is_transferred = True
 
-            # id_camp se mantiene como campaña de atribución (CDR/BI); la cola operativa es distribution_campaign_id
-            ctx.distribution_campaign_id = int(target_camp_id)
-            ctx.agent_id = None
-            # En cola destino no hay pierna de agente aún; el historial vive en agent_segments / transfer_count.
-            ctx.agent_attempt_channel = None
-            ctx.agent_connected_channel = None
-            ctx.transfer_in_progress = False
-            ctx.transfer_count += 1
-            ctx.is_transferred = True
-            ctx.transfer_phase = TRANSFER_PHASE_NONE
+                self.state_store.register_unsafe(unique_id, ctx)
 
-            self.state_store.register_unsafe(unique_id, ctx)
+        if campaign_integrity_failed:
+            self.abort_transfer_window(
+                unique_id, reason="blind_campaign_integrity_fail"
+            )
+            return False
+
+        self._cancel_transfer_deadline_timer(unique_id)
 
         # Liberar presencia del agente origen humano (ONCALL→POSTCALL)
         if (
@@ -1730,6 +2044,7 @@ class TransferManager:
         """
         
         # 1. Inicializar consulta dentro del lock para mantener estado consistente
+        consult_delay = self._transfer_window_delay_sec(settings.CONSULT_TIMEOUT)
         with self.state_store.lock(unique_id):
             ctx = self.state_store.get(unique_id)
             if not ctx or not ctx.bridge_id:
@@ -1738,7 +2053,7 @@ class TransferManager:
             if not initiator_ch:
                 return False
             
-            ctx.transfer_in_progress = True
+            self._arm_transfer_window_fields(ctx, delay_sec=consult_delay)
             ctx.transfer_phase = TRANSFER_PHASE_REQUESTED
 
             # Inicializar estructura de consulta en Pydantic
@@ -1754,6 +2069,8 @@ class TransferManager:
             main_bridge_id = ctx.bridge_id
             agent_channel = initiator_ch
 
+        self._schedule_transfer_deadline_timer(unique_id, consult_delay)
+
         try:
             # 2. Crear Bridge Consulta (operación ARI fuera del lock)
             consult_bridge = self.ari.create_bridge(bridge_type="mixing")
@@ -1768,12 +2085,20 @@ class TransferManager:
                         self.ari.destroy_bridge(consult_bridge_id)
                     except Exception:
                         pass
-                    return False
-                ctx.consultation.consult_bridge = consult_bridge_id
-                self.state_store.register_unsafe(unique_id, ctx)
-                # Recargar valores dentro del lock para garantizar consistencia
-                main_bridge_id = ctx.bridge_id
-                agent_channel = active_agent_channel(ctx) or initiator_ch
+                    consult_mid_abort = True
+                else:
+                    consult_mid_abort = False
+                    ctx.consultation.consult_bridge = consult_bridge_id
+                    self.state_store.register_unsafe(unique_id, ctx)
+                    # Recargar valores dentro del lock para garantizar consistencia
+                    main_bridge_id = ctx.bridge_id
+                    agent_channel = active_agent_channel(ctx) or initiator_ch
+
+            if consult_mid_abort:
+                self.abort_transfer_window(
+                    unique_id, reason="consult_start_cancelled_mid_bridge"
+                )
+                return False
 
             # 4. Operaciones ARI fuera del lock (no modifican estado compartido)
             self._start_moh(main_bridge_id)
@@ -1790,15 +2115,23 @@ class TransferManager:
                         self.ari.destroy_bridge(consult_bridge_id)
                     except Exception:
                         pass
-                    return False
-                # Recargar valores dentro del lock para garantizar consistencia antes de originate
-                # Copiar todos los valores necesarios dentro del lock - no mantener referencia al objeto ctx
-                phone_number = ctx.phone_number
-                uniqueid_pstn = ctx.uniqueid_pstn
-                call_id = ctx.call_id
-                id_customer = ctx.id_customer
-                id_camp = ctx.id_camp
-                call_type = ctx.call_type
+                    consult_pre_originate_abort = True
+                else:
+                    consult_pre_originate_abort = False
+                    # Recargar valores dentro del lock para garantizar consistencia antes de originate
+                    # Copiar todos los valores necesarios dentro del lock - no mantener referencia al objeto ctx
+                    phone_number = ctx.phone_number
+                    uniqueid_pstn = ctx.uniqueid_pstn
+                    call_id = ctx.call_id
+                    id_customer = ctx.id_customer
+                    id_camp = ctx.id_camp
+                    call_type = ctx.call_type
+
+            if consult_pre_originate_abort:
+                self.abort_transfer_window(
+                    unique_id, reason="consult_start_cancelled_pre_originate"
+                )
+                return False
 
             # 6. Llamar al Agente B (Target) - operación crítica irreversible
             # NOTA: originate se ejecuta fuera del lock para no bloquear, pero ya verificamos
@@ -1831,6 +2164,12 @@ class TransferManager:
                     f"❌ Error crítico al originar pierna de consulta hacia {target_endpoint} "
                     f"después de reintentos para {unique_id}: {result.get('error')}"
                 )
+                try:
+                    self.consult_cancel(unique_id)
+                except Exception:
+                    self.abort_transfer_window(
+                        unique_id, reason="consult_originate_fail"
+                    )
                 return False
             
             data = result.get("data") or {}
@@ -1840,6 +2179,12 @@ class TransferManager:
                     f"❌ Respuesta de ARI sin 'id' al originar pierna de consulta hacia {target_endpoint} "
                     f"para {unique_id}: {data}"
                 )
+                try:
+                    self.consult_cancel(unique_id)
+                except Exception:
+                    self.abort_transfer_window(
+                        unique_id, reason="consult_originate_no_id"
+                    )
                 return False
             
             # 7. Guardar el canal de la pierna de consulta dentro del lock
@@ -1856,7 +2201,9 @@ class TransferManager:
             try:
                 self.consult_cancel(unique_id)
             except Exception:
-                pass
+                self.abort_transfer_window(
+                    unique_id, reason="consult_start_exception"
+                )
             return False
 
     def three_way_add(self, call_id: str, bridge_id: str, target_agent_id: int) -> bool:
@@ -1939,18 +2286,15 @@ class TransferManager:
         Garantía: no consolida la consultiva sin evidencia de que la pierna consultada está realmente
         contestada (`consult_leg_answered_ts` desde ChannelStateChange Up, o estado Up vía ARI).
 
-        VENTANAS DE TIEMPO CRÍTICAS:
-        1. Entre validación de Up / ts y operaciones ARI: otro thread puede cancelar la consulta.
-           Mitigación: revalidación bajo lock antes de marcar ignore_next_agent_hangup y antes del
-           update final de estado (comportamiento previo).
-
-        2. Entre operaciones ARI y actualizar el estado final: idem flujo previo.
+        Claim `settle_op=completing` bajo lock antes de ARI: excluye consult_cancel concurrente.
         """
         consult_leg_ch: Optional[str] = None
         main_bridge: Optional[str] = None
         initiator_agent_ch: Optional[str] = None
         consult_bridge: Optional[str] = None
         target_agent_id: Optional[int] = None
+        claimed = False
+        ari_started = False
 
         # 1a. Leer consulta y exigir pierna consultada identificada
         with self.state_store.lock(unique_id):
@@ -1983,7 +2327,7 @@ class TransferManager:
                 )
                 return False
 
-        # 1c. Revalidar y solo entonces marcar ignore_next_agent_hangup (evita flag si abortamos)
+        # 1c. Revalidar + claim completing (excluye cancel) + ignore_next
         with self.state_store.lock(unique_id):
             ctx = self.state_store.get(unique_id)
             if not ctx or not ctx.consultation or not ctx.consultation.active:
@@ -2003,6 +2347,16 @@ class TransferManager:
                 )
                 return False
 
+            if not self._try_claim_consult_settle(ctx, CONSULT_SETTLE_COMPLETING):
+                self.logger.warning(
+                    "ConsultComplete: no se pudo claim settle_op=completing "
+                    "(cancel u otro complete en curso) call_id=%s settle_op=%s",
+                    unique_id,
+                    getattr(cons, "settle_op", None),
+                )
+                return False
+            claimed = True
+
             try:
                 ctx.ignore_next_agent_hangup = True
             except AttributeError:
@@ -2015,7 +2369,8 @@ class TransferManager:
                     f"ConsultComplete: Marcando ignore_next_agent_hangup=True para call_id={unique_id} "
                     f"(iniciador={initiator_agent_ch})"
                 )
-                self.state_store.register_unsafe(unique_id, ctx)
+
+            self.state_store.register_unsafe(unique_id, ctx)
 
             cons = ctx.consultation
             if not cons:
@@ -2028,6 +2383,7 @@ class TransferManager:
 
         try:
             # 2. Operaciones ARI fuera del lock (no modifican estado compartido)
+            ari_started = True
             # Mover Agente B al Main Bridge
             if consult_leg_ch:
                 self.ari.add_channel_to_bridge(main_bridge, consult_leg_ch)
@@ -2052,13 +2408,14 @@ class TransferManager:
                     self.ari.destroy_bridge(consult_bridge)
                 except Exception: pass
 
-            # 3. Actualizar Estado Final en Redis dentro del lock
-            # Verificar que la consulta sigue activa antes de actualizar estado final
+            # 3. Actualizar Estado Final: exige claim completing
             with self.state_store.lock(unique_id):
                 ctx = self.state_store.get(unique_id)
-                if not ctx or not ctx.consultation or not ctx.consultation.active:
-                    # La consulta fue cancelada, no actualizar estado
-                    self.logger.warning(f"ConsultComplete: Consulta ya no está activa para {unique_id}")
+                if not self._consult_settle_allows(ctx, CONSULT_SETTLE_COMPLETING):
+                    self.logger.warning(
+                        "ConsultComplete: settle claim perdido post-ARI call_id=%s",
+                        unique_id,
+                    )
                     return False
                 
                 # Obtener TODOS los valores necesarios del contexto dentro del lock antes de actualizarlo
@@ -2085,11 +2442,12 @@ class TransferManager:
                 ctx.agent_attempt_channel = None
                 ctx.agent_id = target_agent_id
                 ctx.consultation = None # Limpiar objeto consulta
-                ctx.transfer_in_progress = False
+                self._disarm_transfer_window_fields(ctx)
                 ctx.is_transferred = True
                 ctx.transfer_count += 1
-                ctx.transfer_phase = TRANSFER_PHASE_NONE
                 self.state_store.register_unsafe(unique_id, ctx)
+
+            self._cancel_transfer_deadline_timer(unique_id)
 
             # Actualizar estado ONCALL del agente destino (B) fuera del lock
             if target_agent_id:
@@ -2144,42 +2502,47 @@ class TransferManager:
             return True
 
         except Exception as e:
-            self.logger.error(f"❌ Error ConsultComplete: {e}")
+            self.logger.error(f"❌ Error ConsultComplete: {e}", exc_info=True)
+            if claimed and not ari_started:
+                self._release_consult_settle_claim(
+                    unique_id, CONSULT_SETTLE_COMPLETING
+                )
+            elif claimed and ari_started:
+                # ARI parcial: no reabrir cancel; fail-closed de la ventana.
+                self.abort_transfer_window(
+                    unique_id, reason="consult_complete_ari_exception"
+                )
             return False
 
     def consult_cancel(self, unique_id: str) -> bool:
         """
         Fase 3: Cancelar consulta. Revierte cambios y restaura estado inicial.
-        
-        VENTANAS DE TIEMPO CRÍTICAS:
-        1. Líneas 982-1014: Entre leer el estado y ejecutar operaciones ARI de rollback.
-           - Riesgo: El estado puede cambiar durante las operaciones ARI. Por ejemplo, otro thread podría
-             completar la consulta (consult_complete) mientras se ejecutan las operaciones de rollback.
-           - Mitigación: Se verifica el estado nuevamente dentro del lock antes de limpiar (línea 1016),
-             pero las operaciones ARI ya se ejecutaron.
-           - Impacto: MEDIO - Si se completa concurrentemente, las operaciones de rollback (mover canal,
-             hangup, destruir bridge) pueden ejecutarse incluso si la consulta ya se completó, causando
-             conflictos con las operaciones de consult_complete.
-        
-        2. Líneas 1014-1024: Entre completar operaciones ARI y limpiar el estado.
-           - Riesgo: Las operaciones físicas de rollback se completaron pero el estado aún no se limpió.
-             Otros threads pueden leer un estado donde la consulta sigue activa pero físicamente ya se canceló.
-           - Mitigación: Se verifica que la consulta sigue activa antes de limpiar (línea 1021).
-           - Impacto: MEDIO - Puede causar inconsistencias si otro thread intenta completar durante esta ventana.
+
+        Claim `settle_op=cancelling` bajo lock antes de ARI: excluye consult_complete concurrente.
         """
-        # 1. Leer estado inicial dentro del lock
+        claimed = False
+        # 1. Claim cancelling + copiar canales
         with self.state_store.lock(unique_id):
             ctx = self.state_store.get(unique_id)
             if not ctx or not ctx.consultation or not ctx.consultation.active:
                 self.logger.warning(f"ConsultCancel: No hay consulta activa para {unique_id}")
                 return False
-            
+
+            if not self._try_claim_consult_settle(ctx, CONSULT_SETTLE_CANCELLING):
+                self.logger.warning(
+                    "ConsultCancel: no se pudo claim settle_op=cancelling "
+                    "(complete u otro cancel en curso) call_id=%s settle_op=%s",
+                    unique_id,
+                    getattr(ctx.consultation, "settle_op", None),
+                )
+                return False
+            claimed = True
             cons = ctx.consultation
-            # Leer todos los valores necesarios dentro del lock para mantener consistencia
             initiator_agent_ch = cons.initiator_agent_ch
             main_bridge = cons.main_bridge
             consult_leg_ch = cons.consult_leg_ch
             consult_bridge = cons.consult_bridge
+            self.state_store.register_unsafe(unique_id, ctx)
             
         try:
             # 2. Operaciones ARI fuera del lock (no modifican estado compartido)
@@ -2214,23 +2577,29 @@ class TransferManager:
                 except Exception as e:
                     self.logger.error(f"Error destruyendo bridge de consulta: {e}")
             
-            # 3. Limpiar estado dentro del lock
+            # 3. Limpiar estado: exige claim cancelling
             with self.state_store.lock(unique_id):
                 ctx = self.state_store.get(unique_id)
-                if ctx and ctx.consultation:
-                    # Verificar que la consulta sigue activa antes de limpiar
-                    # Recargar dentro del lock para garantizar consistencia
-                    if ctx.consultation.active:
-                        ctx.consultation = None
-                        ctx.transfer_in_progress = False
-                        ctx.transfer_phase = TRANSFER_PHASE_NONE
-                        self.state_store.register_unsafe(unique_id, ctx)
+                if self._consult_settle_allows(ctx, CONSULT_SETTLE_CANCELLING):
+                    ctx.consultation = None
+                    self._disarm_transfer_window_fields(ctx)
+                    self.state_store.register_unsafe(unique_id, ctx)
+                else:
+                    self.logger.warning(
+                        "ConsultCancel: settle claim perdido post-ARI call_id=%s",
+                        unique_id,
+                    )
+                    return False
+
+            self._cancel_transfer_deadline_timer(unique_id)
             
             self.logger.info(f"✅ Consulta cancelada para {unique_id}")
             return True
 
         except Exception as e:
             self.logger.error(f"❌ Error ConsultCancel: {e}")
+            if claimed:
+                self.abort_transfer_window(unique_id, reason="consult_cancel_exception")
             return False
 
     # -------------------------------------------------------------------------
@@ -2278,6 +2647,7 @@ class TransferManager:
             is_current_agent_channel = False
             pstn_channel = None
             bridge_id = None
+            recording_id = None
 
             with self.state_store.lock(call_id):
                 fresh_ctx = self.state_store.get(call_id)
@@ -2333,6 +2703,7 @@ class TransferManager:
                 if is_transferred and is_current_agent_channel:
                     pstn_channel = fresh_ctx.pstn_channel or fresh_ctx.uniqueid_pstn
                     bridge_id = fresh_ctx.bridge_id
+                    recording_id = getattr(fresh_ctx, "recording_id", None)
                     self.logger.info(
                         f"📞 TransferTargetHangup: Detectado hangup de agente destino "
                         f"para call_id={fresh_ctx.call_id}, channel_id={channel_id}. "
@@ -2373,7 +2744,15 @@ class TransferManager:
                         exc_info=True,
                     )
 
-            # 3.2 Destruir bridge si hay identificador disponible
+            # 3.2 Stop recording ANTES de destroy (fuerza RecordingFinished → upload)
+            if bridge_id and bridge_id.strip():
+                self._stop_active_recording(
+                    call_id=call_id,
+                    bridge_id=bridge_id,
+                    recording_id=recording_id,
+                )
+
+            # 3.3 Destruir bridge si hay identificador disponible
             if bridge_id and bridge_id.strip():
                 try:
                     destroy_result = self.ari.destroy_bridge(bridge_id)
@@ -2518,6 +2897,7 @@ class TransferManager:
 
         # Adquirir lock usando el call_id extraído inmediatamente después de la búsqueda
         # para minimizar la ventana de tiempo donde el contexto puede cambiar
+        early_abort_reason: Optional[str] = None
         with self.state_store.lock(call_id):
             # Recargar contexto dentro del lock para evitar usar datos obsoletos
             ctx = self.state_store.get(call_id)
@@ -2536,11 +2916,14 @@ class TransferManager:
                     f"call_id={ctx.call_id}. Ignorando pierna de transferencia tardía "
                     f"channel_id={channel_id}"
                 )
-                return
+                if getattr(ctx, "transfer_in_progress", False):
+                    early_abort_reason = "transfer_leg_after_call_ended"
+                else:
+                    return
 
             # Para llamadas manuales, si no hay ningún identificador de leg PSTN asociado
             # consideramos que el PSTN ya no existe y no debemos completar la transferencia.
-            if (
+            elif (
                 ctx.type == CallType.MANUAL
                 and not (ctx.pstn_channel or ctx.uniqueid_pstn)
             ):
@@ -2549,32 +2932,46 @@ class TransferManager:
                     f"call_id={ctx.call_id}. Ignorando pierna de transferencia tardía "
                     f"channel_id={channel_id}"
                 )
-                return
+                if getattr(ctx, "transfer_in_progress", False):
+                    early_abort_reason = "transfer_leg_manual_without_pstn"
+                else:
+                    return
 
             # Verificar que la transferencia sigue en progreso
-            if not ctx.transfer_in_progress:
+            elif not ctx.transfer_in_progress:
                 self.logger.warning(f"TransferLegStart: Transferencia ya no está en progreso para {ctx.call_id}")
                 return
 
-            # 3. Actualizar Estado (dentro del lock para atomicidad)
-            # IMPORTANTE: Mantener transfer_in_progress = True hasta que la operación ARI
-            # sea exitosa para reducir la ventana de inconsistencia. Esto previene que
-            # otros threads lean un estado inconsistente antes de que la operación ARI se complete.
-            old_agent = active_agent_channel(ctx)
-            old_agent_id = ctx.agent_id
-            # Nuevo leg entra como intento; el agente previo sigue en agent_connected_channel hasta el bridge OK.
-            ctx.agent_attempt_channel = channel_id
-            # NO marcar transfer_in_progress = False todavía - se marcará después de operación ARI exitosa
-            # finalize_current_agent_segment / is_transferred / transfer_count solo tras add_channel_to_bridge OK
+            if early_abort_reason:
+                pass  # abort fuera del lock
+            else:
+                # 3. Actualizar Estado (dentro del lock para atomicidad)
+                # IMPORTANTE: Mantener transfer_in_progress = True hasta que la operación ARI
+                # sea exitosa para reducir la ventana de inconsistencia. Esto previene que
+                # otros threads lean un estado inconsistente antes de que la operación ARI se complete.
+                old_agent = active_agent_channel(ctx)
+                old_agent_id = ctx.agent_id
+                # Nuevo leg entra como intento; el agente previo sigue en agent_connected_channel hasta el bridge OK.
+                ctx.agent_attempt_channel = channel_id
+                # NO marcar transfer_in_progress = False todavía - se marcará después de operación ARI exitosa
+                # finalize_current_agent_segment / is_transferred / transfer_count solo tras add_channel_to_bridge OK
 
-            # Guardar valores necesarios para usar fuera del lock
-            bridge_id = ctx.bridge_id
-            call_id = ctx.call_id
-            campaign_id = ctx.id_camp
-            phone_number = ctx.phone_number
-            target_agent_id = ctx.target_agent_id  # Copiar target_agent_id dentro del lock
-            
-            self.state_store.register_unsafe(call_id, ctx)
+                # Guardar valores necesarios para usar fuera del lock
+                bridge_id = ctx.bridge_id
+                call_id = ctx.call_id
+                campaign_id = ctx.id_camp
+                phone_number = ctx.phone_number
+                target_agent_id = ctx.target_agent_id  # Copiar target_agent_id dentro del lock
+                
+                self.state_store.register_unsafe(call_id, ctx)
+
+        if early_abort_reason:
+            self.abort_transfer_window(
+                call_id,
+                reason=early_abort_reason,
+                hangup_channels=[channel_id] if channel_id else None,
+            )
+            return
 
         # Operaciones ARI fuera del lock para minimizar tiempo de bloqueo
         try:
@@ -2600,10 +2997,9 @@ class TransferManager:
                         ctx.agent_attempt_channel = None
                         if ctx.target_agent_id is not None:
                             ctx.agent_id = ctx.target_agent_id
-                        ctx.transfer_in_progress = False
+                        self._disarm_transfer_window_fields(ctx)
                         ctx.transfer_count += 1
                         ctx.is_transferred = True
-                        ctx.transfer_phase = TRANSFER_PHASE_NONE
                         self.state_store.register_unsafe(call_id, ctx)
                         bridge_committed = True
                     else:
@@ -2643,6 +3039,7 @@ class TransferManager:
             return
 
         if bridge_committed:
+            self._cancel_transfer_deadline_timer(call_id)
             self._blind_transfer_maybe_report_ok_after_bridge(call_id, channel_id)
 
         # 4. Actualizar estado del agente a ONCALL si el canal está "Up"

@@ -286,6 +286,16 @@ class RedisKeys:
         return f"OML:VOICEBOT-ACTIVE-CALLS:{aid}"
 
     @staticmethod
+    def voicebot_pending_slots(campaign_id: str, agent_id) -> str:
+        """
+        Hash de cupos MAXQCALLS reservados en vuelo (antes del answer).
+        Clave: OML:VOICEBOT-PENDING:{campaign_id}:{agent_id}.
+        Campo: call_id → "1".
+        """
+        aid = agent_id if isinstance(agent_id, str) else str(agent_id)
+        return f"OML:VOICEBOT-PENDING:{campaign_id}:{aid}"
+
+    @staticmethod
     def campaign_amd(campaign_id: str) -> str:
         """Clave opcional AMD por campaña (OML:CAMP:{id_camp}:AMD=True)."""
         return f"OML:CAMP:{campaign_id}:AMD"

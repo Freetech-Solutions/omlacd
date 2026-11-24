@@ -478,6 +478,18 @@ class LegacyEventForwarder:
         if channel_type not in ("to_pstn", ChannelType.TO_PSTN.value):
             return
 
+        # Solo dialer (call_type=2) hacia process-event. Manual/preview/etc. usan el
+        # mismo pending_dial_store vía dial_pstn; el pop ya limpió la entrada.
+        call_type_raw = metadata.get("call_type")
+        if call_type_raw not in (2, "2", CallType.DIALER_ID):
+            self.logger.debug(
+                "LegacyEventForwarder.handle_channel_destroyed: skip process-event "
+                "(non-dialer call_type=%r) channel_id=%s",
+                call_type_raw,
+                channel_id,
+            )
+            return
+
         id_camp = metadata.get("id_camp", metadata.get("campaign_id", ""))
         id_customer = metadata.get("id_customer", metadata.get("contact_id", ""))
         tel_customer = metadata.get("tel_customer", metadata.get("phone_number", ""))

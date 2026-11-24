@@ -94,11 +94,14 @@ class DialingService:
         """
         Marca manual hacia un agente (click-to-call).
 
-        Incluye: idempotencia ligera, validación de ruta, búsqueda de SIP del agente,
-        construcción de metadata y llamada a call_service.dial_agent_with_headers.
+        Incluye: idempotencia ligera, validación de ruta, reserva atómica
+        READY→DIALING (misma primitiva que distribución inbound), búsqueda de SIP,
+        construcción de metadata y call_service.dial_agent_with_headers.
+        Si la reserva o el originate fallan, libera la reserva y permite reintento.
 
         Returns:
-            ID del canal creado o None si no se originó (validación fallida, duplicado, error).
+            ID del canal creado o None si no se originó (validación fallida, duplicado,
+            agente no reservable, error).
         """
         number = data.get("number")
         campaign_id = data.get("campaign_id")
@@ -114,6 +117,7 @@ class DialingService:
             return None
 
         # Idempotencia ligera para comandos manuales
+        command_key = None
         if self.redis_client:
             try:
                 command_hash = _calculate_command_hash(data)
@@ -135,6 +139,7 @@ class DialingService:
                     )
                     return None
             except Exception as e:
+                command_key = None
                 self.logger.warning(
                     "Error applying idempotency for dial_to_agent: %s",
                     e,
@@ -261,6 +266,35 @@ class DialingService:
             else settings.DEFAULT_ORIGINATE_TIMEOUT
         )
 
+        # Reserva atómica READY→DIALING antes del originate: cierra la ventana
+        # en la que la cola inbound podía ofrecer al mismo agente (Critical).
+        # ignore_cooldown: click2call ignora wrapup y acepta PAUSE*/POSTCALL→DIALING
+        # (comportamiento histórico). La cola inbound sigue exigiendo solo READY.
+        reserve_ttl = int(timeout) + int(
+            getattr(settings, "AGENT_RESERVATION_MARGIN_SEC", 10)
+        )
+        reserved = self.agent_status_service.try_reserve_for_distribution(
+            agent_id, callid, reserve_ttl, ignore_cooldown=True
+        )
+        if not reserved:
+            self.logger.warning(
+                "dial_to_agent: no se pudo reservar agente %s (callid=%s); "
+                "STATUS no apto (ONCALL/DIALING u otro) o ya reservado — no se origina",
+                agent_id,
+                callid,
+            )
+            if command_key and self.redis_client:
+                try:
+                    self.redis_client.delete(command_key)
+                except Exception:
+                    self.logger.debug(
+                        "dial_to_agent: no se pudo borrar idempotency key tras "
+                        "fallo de reserva (agent=%s)",
+                        agent_id,
+                        exc_info=True,
+                    )
+            return None
+
         try:
             agent_channel_id = self.call_service.dial_agent_with_headers(
                 agent_sip=sip_agente,
@@ -276,14 +310,39 @@ class DialingService:
                     agent_channel_id,
                     caller_id_for_log,
                 )
-            else:
-                self.logger.error(
-                    "Error originating to agent %s: no channel_id returned",
-                    agent_id,
-                )
-            return agent_channel_id
+                return agent_channel_id
+
+            self.logger.error(
+                "Error originating to agent %s: no channel_id returned",
+                agent_id,
+            )
+            self.agent_status_service.release_distribution_reservation(
+                agent_id, callid, restore_ready=True
+            )
+            if command_key and self.redis_client:
+                try:
+                    self.redis_client.delete(command_key)
+                except Exception:
+                    pass
+            return None
         except Exception as e:
             self.logger.error("Error originating to agent: %s", e, exc_info=True)
+            try:
+                self.agent_status_service.release_distribution_reservation(
+                    agent_id, callid, restore_ready=True
+                )
+            except Exception:
+                self.logger.exception(
+                    "dial_to_agent: error liberando reserva tras fallo de "
+                    "originate (agent=%s callid=%s)",
+                    agent_id,
+                    callid,
+                )
+            if command_key and self.redis_client:
+                try:
+                    self.redis_client.delete(command_key)
+                except Exception:
+                    pass
             return None
 
     def dial_to_pstn(self, data: Dict[str, Any]) -> Optional[str]:

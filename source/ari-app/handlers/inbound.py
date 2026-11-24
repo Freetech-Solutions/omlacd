@@ -74,6 +74,7 @@ class InboundCallHandler(BaseHandler):
         queue_event_manager: Optional[QueueEventManager] = None,
         distribution_service: Optional[DistributionService] = None,
         agent_status_service: Optional[AgentStatusService] = None,
+        recording_service: Optional[Any] = None,
     ):
         super().__init__(ari_client, state_store, reporter)
         self.call_service = call_service
@@ -82,10 +83,8 @@ class InboundCallHandler(BaseHandler):
         self.queue_event_manager = queue_event_manager
         self.distribution_service = distribution_service
         self.agent_status_service = agent_status_service
+        self.recording_service = recording_service
 
-        # pstn_channel_id mantiene el identificador del canal PSTN asociado a la llamada
-        # inbound actual manejada por esta instancia del handler.
-        self.pstn_channel_id: Optional[str] = None
         # Params diferidos tras WELCOMEPLAY (call_id -> dict)
         self._welcome_deferred: Dict[str, Dict[str, Any]] = {}
         self._welcome_deferred_lock = threading.Lock()
@@ -101,12 +100,12 @@ class InboundCallHandler(BaseHandler):
             self._pstn_hangup_initiated_by_app.add(channel_id)
 
     def _is_pstn_leg_channel(self, channel_id: str, context: CallContext) -> bool:
-        """True si channel_id es la pierna PSTN de la llamada inbound."""
+        """True si channel_id es la pierna PSTN de este CallContext (sin estado global)."""
         pstn_channel = getattr(context, "pstn_channel", None)
         uniqueid_pstn = getattr(context, "uniqueid_pstn", None)
-        if pstn_channel is not None or uniqueid_pstn is not None:
-            return channel_id == pstn_channel or channel_id == uniqueid_pstn
-        return self.pstn_channel_id is not None and channel_id == self.pstn_channel_id
+        if pstn_channel is None and uniqueid_pstn is None:
+            return False
+        return channel_id == pstn_channel or channel_id == uniqueid_pstn
 
     def _discard_duplicate_setup_bridge(
         self,
@@ -172,6 +171,7 @@ class InboundCallHandler(BaseHandler):
                 dirty = False
                 if extra_legs and getattr(fresh_ctx, "transfer_in_progress", False) is True:
                     fresh_ctx.transfer_in_progress = False
+                    fresh_ctx.transfer_deadline_ts = None
                     dirty = True
                 cons = getattr(fresh_ctx, "consultation", None)
                 if cons is not None and getattr(cons, "active", False) is True:
@@ -205,6 +205,9 @@ class InboundCallHandler(BaseHandler):
                 bridge_id,
                 call_id,
             )
+            # stop_recording antes de destroy: fuerza RecordingFinished → upload Gearman/S3.
+            if bridge_id == getattr(fresh_ctx, "bridge_id", None):
+                self._stop_active_recording(fresh_ctx, bridge_id)
             try:
                 self.ari_client.destroy_bridge(bridge_id)
             except Exception:
@@ -231,6 +234,42 @@ class InboundCallHandler(BaseHandler):
 
         if self.distribution_service:
             self.distribution_service.stop_distribution(call_id)
+
+    def _stop_active_recording(self, context: Any, bridge_id: str) -> None:
+        """
+        Detiene la grabación live del bridge antes de destroy_bridge.
+
+        Sin esto Asterisk a veces deja el WAV en spool pero no emite
+        RecordingFinished → no hay upload a Gearman/S3.
+        """
+        recording_id = getattr(context, "recording_id", None)
+        if not recording_id and self.recording_service:
+            recording_id = self.recording_service.get_active_recording(bridge_id)
+        if not recording_id:
+            # Convention: POST .../record usa name=call_id
+            recording_id = getattr(context, "call_id", None)
+        if not recording_id:
+            return
+        try:
+            result = self.ari_client.stop_recording(str(recording_id))
+            if result:
+                logger.info(
+                    "InboundCallHandler: grabación %s detenida antes de destruir bridge %s",
+                    recording_id,
+                    bridge_id,
+                )
+            else:
+                logger.debug(
+                    "InboundCallHandler: stop_recording retornó False para %s "
+                    "(puede que ya haya terminado)",
+                    recording_id,
+                )
+        except Exception as e:
+            logger.warning(
+                "InboundCallHandler: error al detener grabación %s: %s",
+                recording_id,
+                e,
+            )
 
     def _report_inbound_pstn_end(
         self,
@@ -901,9 +940,6 @@ class InboundCallHandler(BaseHandler):
             channel_id, channel_name = self._extract_channel_info_from_event(event)
             if not channel_id:
                 return
-
-            # Guardar el canal PSTN asociado a esta llamada inbound para uso posterior
-            self.pstn_channel_id = channel_id
 
             if args_dict is None:
                 args = self._parse_args_list(event)
@@ -1778,12 +1814,11 @@ class InboundCallHandler(BaseHandler):
             if not self._is_pstn_leg_channel(channel_id, context):
                 logger.debug(
                     "InboundCallHandler.on_failure: destrucción de canal %s que no corresponde al "
-                    "leg PSTN de la llamada (pstn_channel=%s, uniqueid_pstn=%s, handler_pstn_channel_id=%s), "
+                    "leg PSTN de la llamada (pstn_channel=%s, uniqueid_pstn=%s), "
                     "ignorando",
                     channel_id,
                     pstn_channel,
                     uniqueid_pstn,
-                    self.pstn_channel_id,
                 )
                 return
 
@@ -1970,6 +2005,7 @@ class InboundCallHandler(BaseHandler):
                     exc_info=True,
                 )
         if bridge_id.strip():
+            self._stop_active_recording(context, bridge_id)
             try:
                 destroy_result = self.ari_client.destroy_bridge(bridge_id)
                 if destroy_result:
@@ -2022,12 +2058,10 @@ class InboundCallHandler(BaseHandler):
                 uniqueid_pstn = getattr(context, "uniqueid_pstn", None)
                 logger.debug(
                     "InboundCallHandler.on_pstn_stasis_end: StasisEnd de canal %s que no corresponde "
-                    "al leg PSTN de la llamada (pstn_channel=%s, uniqueid_pstn=%s, "
-                    "handler_pstn_channel_id=%s), ignorando",
+                    "al leg PSTN de la llamada (pstn_channel=%s, uniqueid_pstn=%s), ignorando",
                     channel_id,
                     pstn_channel,
                     uniqueid_pstn,
-                    self.pstn_channel_id,
                 )
                 return
 

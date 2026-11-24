@@ -269,6 +269,7 @@ class ACDContainer(containers.DeclarativeContainer):
         queue_event_manager=queue_event_manager,
         distribution_service=distribution_service,
         agent_status_service=agent_status_service,
+        recording_service=recording_service,
     )
 
     transfer_manager = providers.Singleton(
@@ -281,6 +282,7 @@ class ACDContainer(containers.DeclarativeContainer):
         get_campaign_config=sip_refer_get_campaign_config,
         queue_event_manager=queue_event_manager,
         inbound_handler=inbound_handler,
+        recording_service=recording_service,
     )
 
     progressive_handler = providers.Singleton(

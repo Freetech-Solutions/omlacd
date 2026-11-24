@@ -94,7 +94,6 @@ class ProgressiveCampaignHandler(BaseHandler):
         self.legacy_forwarder = legacy_forwarder
         self.pstn_reported_store = pstn_reported_store
         self.recording_service = recording_service
-        self.pstn_channel_id: Optional[str] = None
         self._pstn_hangup_initiated_by_app: Set[str] = set()
         self._pstn_hangup_lock = threading.Lock()
         self._welcome_deferred: Dict[str, Dict[str, Any]] = {}
@@ -172,11 +171,12 @@ class ProgressiveCampaignHandler(BaseHandler):
             )
 
     def _is_pstn_leg_channel(self, channel_id: str, context: CallContext) -> bool:
+        """True si channel_id es la pierna PSTN de este CallContext (sin estado global)."""
         pstn_channel = getattr(context, "pstn_channel", None)
         uniqueid_pstn = getattr(context, "uniqueid_pstn", None)
-        if pstn_channel is not None or uniqueid_pstn is not None:
-            return channel_id == pstn_channel or channel_id == uniqueid_pstn
-        return self.pstn_channel_id is not None and channel_id == self.pstn_channel_id
+        if pstn_channel is None and uniqueid_pstn is None:
+            return False
+        return channel_id == pstn_channel or channel_id == uniqueid_pstn
 
     def _discard_duplicate_setup_bridge(
         self,
@@ -236,6 +236,7 @@ class ProgressiveCampaignHandler(BaseHandler):
                 dirty = False
                 if extra_legs and getattr(fresh_ctx, "transfer_in_progress", False) is True:
                     fresh_ctx.transfer_in_progress = False
+                    fresh_ctx.transfer_deadline_ts = None
                     dirty = True
                 cons = getattr(fresh_ctx, "consultation", None)
                 if cons is not None and getattr(cons, "active", False) is True:
@@ -962,7 +963,6 @@ class ProgressiveCampaignHandler(BaseHandler):
             channel_id, channel_name = self._extract_channel_info_from_event(event)
             if not channel_id:
                 return
-            self.pstn_channel_id = channel_id
             if args_dict is None:
                 args = self._parse_args_list(event)
                 args_dict = parse_ari_args(args)
@@ -1376,18 +1376,49 @@ class ProgressiveCampaignHandler(BaseHandler):
         if self.legacy_forwarder:
             try:
                 meta = self.legacy_forwarder.get_pending_dial_metadata(channel_id)
-                eff_camp = id_camp if id_camp is not None else (meta.get("campaign_id") if isinstance(meta, dict) else None)
-                eff_customer = id_customer if id_customer is not None else (meta.get("contact_id") if isinstance(meta, dict) else "")
-                eff_tel = tel_customer if tel_customer is not None else (meta.get("number") if isinstance(meta, dict) else "")
-                eff_callid = call_id or (meta.get("callid") if isinstance(meta, dict) else "") or channel_id
-                eff_attempt = (
-                    meta.get("attempt_id") if isinstance(meta, dict) else None
+
+                def _meta_first(*keys: str) -> Any:
+                    if not isinstance(meta, dict):
+                        return None
+                    for key in keys:
+                        value = meta.get(key)
+                        if value not in (None, ""):
+                            return value
+                    return None
+
+                # Prefer args; fallback a claves del pending store (dial_pstn:
+                # id_camp/campaign_id, id_customer, tel_customer).
+                eff_camp = id_camp if id_camp is not None else _meta_first(
+                    "id_camp", "campaign_id"
                 )
-                if eff_camp is not None:
+                if id_customer is not None and id_customer != "":
+                    eff_customer = id_customer
+                else:
+                    eff_customer = _meta_first("id_customer", "contact_id") or ""
+                if tel_customer is not None and tel_customer != "":
+                    eff_tel = tel_customer
+                else:
+                    eff_tel = _meta_first(
+                        "tel_customer", "phone_number", "number"
+                    ) or ""
+                eff_callid = (
+                    call_id
+                    or _meta_first("callid", "related_call_id", "uniqueid")
+                    or channel_id
+                )
+                eff_attempt = _meta_first("attempt_id")
+                # Solo acusar+cleanup si attach no fallaría por campos vacíos;
+                # si faltan datos, dejar pending para que ChannelDestroyed libere cupo.
+                if (
+                    eff_camp is not None
+                    and str(eff_camp).strip() != ""
+                    and str(eff_customer).strip() != ""
+                    and str(eff_tel).strip() != ""
+                ):
                     self.legacy_forwarder.submit_dial_chanunavail(
                         eff_camp,
-                        eff_customer or "",
-                        eff_tel or "",
+                        eff_customer,
+                        eff_tel,
                         callid=eff_callid,
                         channel_id=channel_id,
                         attempt_id=eff_attempt,
@@ -1395,6 +1426,17 @@ class ProgressiveCampaignHandler(BaseHandler):
                     self.legacy_forwarder.cleanup_pending_dial(channel_id)
                     if self.pstn_reported_store and channel_id:
                         self.pstn_reported_store.add(channel_id)
+                else:
+                    logger.warning(
+                        "ProgressiveCampaignHandler._abort_amd_before_answer: "
+                        "sin campos de negocio para CHANUNAVAIL "
+                        "(channel_id=%s camp=%r customer=%r tel=%r); "
+                        "pending dial intacto para ChannelDestroyed",
+                        channel_id,
+                        eff_camp,
+                        eff_customer,
+                        eff_tel,
+                    )
             except Exception:
                 logger.exception(
                     "ProgressiveCampaignHandler._abort_amd_before_answer: error notificando al dialer para %s",

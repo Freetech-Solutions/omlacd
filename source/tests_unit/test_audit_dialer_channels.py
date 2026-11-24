@@ -53,6 +53,62 @@ def test_count_dialer_channels_groups_by_omlcampid():
     assert ringing == {"4": 1}
 
 
+def test_count_excludes_transfer_consult_agent_and_webrtc():
+    """Piernas internas/agente con OMLCAMPID no deben inflar el audit dialer."""
+    channels = [
+        {
+            "name": "PJSIP/trunk-pstn-1",
+            "state": "Up",
+            "channelvars": {"OMLCAMPID": "4"},
+        },
+        {
+            "name": "PJSIP/agent-0001@kamailio-webrtc",
+            "state": "Up",
+            "channelvars": {"OMLCAMPID": "4"},
+            "dialplan": {
+                "app_name": "Stasis",
+                "app_data": "oml_acd,channel_type:to_agent,call_type:2",
+            },
+        },
+        {
+            "name": "PJSIP/xfer-0001@kamailio-webrtc",
+            "state": "Ringing",
+            "channelvars": {"OMLCAMPID": "4"},
+            "caller": {"name": "Transfer: 1155667788"},
+            "dialplan": {
+                "app_name": "Stasis",
+                "app_data": "oml_acd,bridge_id:b1,transfer_target:true",
+            },
+        },
+        {
+            "name": "PJSIP/consult-0001@kamailio-webrtc",
+            "state": "Up",
+            "channelvars": {"OMLCAMPID": "4"},
+            "dialplan": {
+                "app_name": "Stasis",
+                "app_data": "oml_acd,consult_leg:true,customer_id:c1",
+            },
+        },
+        {
+            "name": "Local/xfer@from-internal",
+            "state": "Up",
+            "channelvars": {"OMLCAMPID": "4"},
+        },
+        {
+            "name": "PJSIP/inbound-1",
+            "state": "Up",
+            "channelvars": {"OMLCAMPID": "8"},
+            "dialplan": {
+                "app_name": "Stasis",
+                "app_data": "oml_acd,call_type: 3,id_camp:8,channel_type: to_queue",
+            },
+        },
+    ]
+    counts, ringing = count_dialer_channels_by_campaign(channels, acd_app="oml_acd")
+    assert counts == {"4": 1}
+    assert ringing == {}
+
+
 def test_count_dialer_channels_ringing_by_state_and_caller_name():
     channels = [
         {

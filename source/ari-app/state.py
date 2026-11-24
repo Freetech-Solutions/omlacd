@@ -16,6 +16,11 @@ TRANSFER_PHASE_ANSWERED = "answered"
 TRANSFER_PHASE_FINALIZED = "finalized"
 
 
+# Claim de asentamiento consultiva (solo un camino ARI: complete vs cancel).
+CONSULT_SETTLE_COMPLETING = "completing"
+CONSULT_SETTLE_CANCELLING = "cancelling"
+
+
 class ConsultationData(BaseModel):
     active: bool = False
     initiator_agent_ch: Optional[str] = None
@@ -27,6 +32,8 @@ class ConsultationData(BaseModel):
     # ISO8601: pierna consultada pasó a Up (ChannelStateChange); habilita consult_complete de forma segura
     consult_leg_answered_ts: Optional[str] = None
     target_agent_uniqueid: Optional[str] = None
+    # None | completing | cancelling — claim atómico antes de I/O ARI (complete vs cancel).
+    settle_op: Optional[str] = None
 
 
 class CallContext(BaseModel):
@@ -98,6 +105,8 @@ class CallContext(BaseModel):
     transfer_count: int = 0
     transfer_phase: str = TRANSFER_PHASE_NONE
     transfer_in_progress: bool = False
+    # Epoch sec: deadline soft de la ventana transfer_in_progress (watchdog / lazy reclaim).
+    transfer_deadline_ts: Optional[float] = None
     # Desborde por timeout de cola (FAILOVER → campaña); distinto de is_transferred
     is_overflow: bool = False
     overflow_count: int = 0

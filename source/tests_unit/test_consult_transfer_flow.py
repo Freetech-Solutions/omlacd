@@ -14,7 +14,13 @@ mock_adapters = MagicMock()
 mock_adapters.HTTPAdapter = MagicMock
 mock_requests.adapters = mock_adapters
 
-sys.modules.setdefault("redis", MagicMock())
+import types
+_redis = types.ModuleType("redis")
+_redis.exceptions = types.ModuleType("redis.exceptions")
+_redis.exceptions.RedisError = Exception
+_redis.Redis = MagicMock
+sys.modules["redis"] = _redis
+sys.modules["redis.exceptions"] = _redis.exceptions
 sys.modules.setdefault("requests", mock_requests)
 sys.modules.setdefault("requests.exceptions", mock_exceptions)
 sys.modules.setdefault("requests.adapters", mock_adapters)
@@ -101,6 +107,7 @@ class TestConsultativeTransferFlow(unittest.TestCase):
         fresh_ctx.bridge_id = bridge_id
         fresh_ctx.is_transferred = True
         fresh_ctx.ignore_next_agent_hangup = True
+        fresh_ctx.recording_id = None
         # Evitar hijos MagicMock truthy en campos opcionales (is_channel_in_context / consulta).
         fresh_ctx.consultation = None
         fresh_ctx.snoop_channels = []
@@ -139,7 +146,14 @@ class TestConsultativeTransferFlow(unittest.TestCase):
 
         # Verificación 2: ahora sí debe colgarse PSTN y destruir el bridge principal
         self.mock_ari_client.hangup_channel.assert_called_once_with(pstn_channel)
+        # stop_recording (fallback name=call_id) antes de destroy
+        self.mock_ari_client.stop_recording.assert_called_once_with(call_id)
         self.mock_ari_client.destroy_bridge.assert_called_once_with(bridge_id)
+        ari_names = [c[0] for c in self.mock_ari_client.method_calls]
+        self.assertLess(
+            ari_names.index("stop_recording"),
+            ari_names.index("destroy_bridge"),
+        )
 
 
 if __name__ == "__main__":

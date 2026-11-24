@@ -8,7 +8,7 @@ el canal vía ARI. Así se distingue un CANCEL local de un SIP 480 real del peer
 import logging
 import threading
 from datetime import datetime
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Set, Tuple
 
 from constants import HangupCause, map_unanswered_hangup_to_event
 
@@ -86,6 +86,15 @@ def classify_pstn_early_fail(
     return event, False
 
 
+def _channel_state_is_up(details: Any) -> bool:
+    if not details or not isinstance(details, dict):
+        return False
+    state = details.get("state")
+    if state is None:
+        return False
+    return str(state).strip().lower() == "up"
+
+
 class PstnRingTimerService:
     """Programa timers de RINGTIME por canal PSTN originado."""
 
@@ -93,6 +102,7 @@ class PstnRingTimerService:
         self._ari = ari_client
         self._store = pending_dial_store
         self._timers: Dict[str, threading.Timer] = {}
+        self._answered: Set[str] = set()
         self._lock = threading.Lock()
         self.logger = logging.getLogger(__name__)
 
@@ -111,6 +121,8 @@ class PstnRingTimerService:
         timer = threading.Timer(delay, _fire)
         timer.daemon = True
         with self._lock:
+            # cancel() marca answered; al re-schedule limpiamos el flag.
+            self._answered.discard(channel_id)
             self._timers[channel_id] = timer
         timer.start()
         self.logger.debug(
@@ -123,6 +135,7 @@ class PstnRingTimerService:
         if not channel_id:
             return
         with self._lock:
+            self._answered.add(channel_id)
             timer = self._timers.pop(channel_id, None)
         if timer is not None:
             timer.cancel()
@@ -133,11 +146,30 @@ class PstnRingTimerService:
             channel_ids = list(self._timers.keys())
         for channel_id in channel_ids:
             self.cancel(channel_id)
+        with self._lock:
+            self._answered.clear()
 
     def get_metadata(self, channel_id: str) -> Optional[Dict[str, Any]]:
         if not self._store or not channel_id:
             return None
         return self._store.get(channel_id)
+
+    def _is_answered_locked(self, channel_id: str) -> bool:
+        return channel_id in self._answered
+
+    def _channel_already_up(self, channel_id: str) -> bool:
+        if not self._ari or not hasattr(self._ari, "get_channel_details"):
+            return False
+        try:
+            details = self._ari.get_channel_details(channel_id)
+            return _channel_state_is_up(details)
+        except Exception as exc:
+            self.logger.debug(
+                "PstnRingTimer: get_channel_details failed channel_id=%s: %s",
+                channel_id,
+                exc,
+            )
+            return False
 
     def _on_timeout(self, channel_id: str) -> None:
         with self._lock:
@@ -148,6 +180,22 @@ class PstnRingTimerService:
                 )
                 return
             self._timers.pop(channel_id, None)
+            if self._is_answered_locked(channel_id):
+                self.logger.info(
+                    "PstnRingTimer: channel_id=%s already answered; skip local_cancel/hangup",
+                    channel_id,
+                )
+                return
+
+        if self._channel_already_up(channel_id):
+            self.logger.info(
+                "PstnRingTimer: channel_id=%s already Up; skip local_cancel/hangup",
+                channel_id,
+            )
+            with self._lock:
+                self._answered.add(channel_id)
+            return
+
         if self._store:
             updated = self._store.update(channel_id, {"local_cancel": True})
             if not updated:
@@ -155,6 +203,15 @@ class PstnRingTimerService:
                     "PstnRingTimer: timeout for channel_id=%s but no pending metadata",
                     channel_id,
                 )
+
+        with self._lock:
+            if self._is_answered_locked(channel_id):
+                self.logger.info(
+                    "PstnRingTimer: channel_id=%s answered after local_cancel; skip hangup",
+                    channel_id,
+                )
+                return
+
         if not self._ari:
             self.logger.error(
                 "PstnRingTimer: no ARI client; cannot hangup channel_id=%s",

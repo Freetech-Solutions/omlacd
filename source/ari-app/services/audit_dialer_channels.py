@@ -23,6 +23,18 @@ RINGING_ARI_STATES = frozenset({
 })
 
 
+# Markers in dialplan.app_data (spaces stripped, casefold) for non-PSTN legs.
+_NON_PSTN_APP_DATA_MARKERS = frozenset({
+    "transfer_target:true",
+    "consult_leg:true",
+    "channel_type:to_agent",
+    "call_type:3",
+})
+
+# Default agent WebRTC trunk (Settings.WEBRTC_TRUNK); avoid importing config here.
+_AGENT_WEBRTC_TRUNK_SUFFIX = "@kamailio-webrtc"
+
+
 def _channel_name(channel: Dict[str, Any]) -> str:
     name = channel.get("name") or ""
     if isinstance(name, str):
@@ -30,10 +42,37 @@ def _channel_name(channel: Dict[str, Any]) -> str:
     return str(name)
 
 
-def _is_dialer_pstn_channel(channel: Dict[str, Any], acd_app: str) -> bool:
-    """True si el canal es pierna PSTN dialer originada por el ACD (excluye snoop/spy)."""
-    name = _channel_name(channel)
+def _is_internal_or_agent_leg(channel: Dict[str, Any], name: str) -> bool:
+    """True for snoop/Local/WebRTC agent/transfer/consult/inbound-Stasis legs."""
     if "Snoop/" in name or name.startswith("Snoop/"):
+        return True
+    if "Local/" in name or name.startswith("Local/"):
+        return True
+    if _AGENT_WEBRTC_TRUNK_SUFFIX in name:
+        return True
+
+    dialplan = channel.get("dialplan") if isinstance(channel.get("dialplan"), dict) else {}
+    app_data = str(dialplan.get("app_data") or "").replace(" ", "").casefold()
+    if app_data:
+        for marker in _NON_PSTN_APP_DATA_MARKERS:
+            if marker in app_data:
+                return True
+
+    caller = channel.get("caller") if isinstance(channel.get("caller"), dict) else {}
+    caller_name = str(caller.get("name") or "")
+    if caller_name.startswith("Transfer:"):
+        return True
+    return False
+
+
+def _is_dialer_pstn_channel(channel: Dict[str, Any], acd_app: str) -> bool:
+    """True si el canal es pierna PSTN dialer originada por el ACD.
+
+    Excluye snoop, Local, WebRTC agente, transfer/consult y inbound en Stasis
+    (call_type:3). La señal positiva sigue siendo OMLCAMPID o caller/connected N_*.
+    """
+    name = _channel_name(channel)
+    if _is_internal_or_agent_leg(channel, name):
         return False
 
     dialplan = channel.get("dialplan") or {}

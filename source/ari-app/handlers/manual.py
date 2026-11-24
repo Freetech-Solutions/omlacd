@@ -476,19 +476,7 @@ class ManualCallHandler(BaseHandler):
                     logging.error(f"Error adding channel {channel_id} to bridge {bridge_id}: {e}", exc_info=True)
                     # No marcamos el flag si falla la operación ARI
 
-        if self.agent_status_service:
-            # Usar el call_id capturado dentro del lock en lugar de context.call_id
-            with self.state_store.lock(call_id_for_agent_status):
-                # Recargar contexto para asegurar datos frescos
-                fresh_context = self.state_store.get(call_id_for_agent_status)
-                if fresh_context and fresh_context.agent_id:
-                    self.agent_status_service.set_oncall(
-                        agent_id=fresh_context.agent_id,
-                        call_id=fresh_context.call_id,
-                        bridge_id=fresh_context.bridge_id,
-                        campaign_id=fresh_context.id_camp,
-                        contact_number=fresh_context.phone_number
-                    )
+        self._confirm_manual_agent_oncall(call_id_for_agent_status)
         return True
 
     def _extract_call_data(self, args_dict: Dict[str, Any], channel_id: str) -> Dict[str, Any]:
@@ -795,13 +783,14 @@ class ManualCallHandler(BaseHandler):
 
             self._report_dial_event(event, call_id, channel_id, channel, call_data, context)
 
+            # DIALING + NODE_ID/CALLID ya aquí (transfer Pub/Sub); ONCALL al answer.
             if self.agent_status_service and call_data['id_agent']:
-                self.agent_status_service.set_oncall(
+                self.agent_status_service.set_dial_call(
                     agent_id=call_data['id_agent'],
                     call_id=call_id,
                     bridge_id=bridge_id,
                     campaign_id=call_data.get('id_camp'),
-                    contact_number=call_data.get('tel_customer')
+                    contact_number=call_data.get('tel_customer'),
                 )
 
         except Exception as e:
@@ -812,9 +801,10 @@ class ManualCallHandler(BaseHandler):
         """
         Answer real de la pierna PSTN creada con create+dial.
 
-        El agente ya se marca en StasisStart. La PSTN solo se marca acá,
-        cuando el canal pasa a Up (200). El originate clásico ya dejó
-        pstn_answered_ts en StasisStart y esta llamada queda en no-op.
+        El agente queda en DIALING en StasisStart; ONCALL al bridge PSTN.
+        La PSTN solo se marca acá cuando el canal pasa a Up (200). El
+        originate clásico ya dejó pstn_answered_ts en StasisStart y esta
+        llamada queda en no-op.
         """
         channel_id = self._channel_id_from_event(event)
         if not channel_id:
@@ -861,7 +851,7 @@ class ManualCallHandler(BaseHandler):
             self._bridge_pstn_if_needed(call_id, bridge_id, channel_id)
 
     def on_pstn_answered(self, channel_id: str, call_id: Optional[str] = None) -> None:
-        """Marca el answer PSTN (200 / estado Up) y asegura el bridge."""
+        """Marca el answer PSTN (200 / estado Up), bridge y ONCALL (create+dial)."""
         context = self._manual_context_for_pstn(channel_id, call_id)
         if not context or not context.call_id:
             return
@@ -877,6 +867,31 @@ class ManualCallHandler(BaseHandler):
         self._stop_ringback(call_id)
         if needs_bridge and bridge_id:
             self._bridge_pstn_if_needed(call_id, bridge_id, channel_id)
+        # create+dial: StasisStart llega en Down → ONCALL solo acá (no en _handle_pstn_leg_start).
+        self._confirm_manual_agent_oncall(call_id)
+
+    def _confirm_manual_agent_oncall(self, call_id: str) -> None:
+        """DIALING→ONCALL con NODE_ID/CALLID/BRIDGE al consolidar answer PSTN."""
+        if not self.agent_status_service or not call_id:
+            return
+        with self.state_store.lock(call_id):
+            fresh = self.state_store.get(call_id)
+            if not fresh or not fresh.agent_id:
+                return
+            confirmed = self.agent_status_service.try_set_oncall(
+                agent_id=fresh.agent_id,
+                call_id=fresh.call_id,
+                bridge_id=fresh.bridge_id,
+                campaign_id=fresh.id_camp,
+                contact_number=fresh.phone_number,
+            )
+            if not confirmed:
+                logging.warning(
+                    "ManualCallHandler: try_set_oncall rechazado para "
+                    "agente %s call_id=%s",
+                    fresh.agent_id,
+                    fresh.call_id,
+                )
 
     def _mark_pstn_answered(self, call_id: str, channel_id: str):
         with self.state_store.lock(call_id):
@@ -1224,6 +1239,7 @@ class ManualCallHandler(BaseHandler):
                 )
             if getattr(fresh_context, "transfer_in_progress", False):
                 fresh_context.transfer_in_progress = False
+                fresh_context.transfer_deadline_ts = None
                 self.state_store.register_unsafe(call_id, fresh_context)
         for abort_ch in channels_to_abort:
             try:

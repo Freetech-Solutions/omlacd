@@ -841,6 +841,24 @@ class CallActionService:
         
         # CallerId pierna agente: phone_number o tel_customer (ANI en SIP INVITE)
         caller_id = phone_number or ''
+
+        # Nombre de campaña para popup softphone (#omlcampname ← X-OML-CampName)
+        camp_name = ""
+        if id_campaign and self.redis_client:
+            try:
+                from services.campaign_config import get_campaign_config_with_defaults
+
+                camp_cfg = get_campaign_config_with_defaults(
+                    self.redis_client, str(id_campaign)
+                )
+                camp_name = str(camp_cfg.get("showcampname") or "").strip()
+            except Exception as e:
+                self.logger.debug(
+                    "dial_agent_with_headers: no se pudo leer SHOWCAMPNAME "
+                    "campaña %s: %s",
+                    id_campaign,
+                    e,
+                )
         
         # Construir variables SIP con headers X-OML-* usando función utilitaria
         variables = build_oml_sip_headers(
@@ -851,6 +869,7 @@ class CallActionService:
             call_type=call_type,
             agent_id=agent_id,
             origin=origin,
+            camp_name=camp_name or None,
         )
         
         # Construir appArgs reutilizando helper común. Excluimos claves que ya están

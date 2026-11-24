@@ -140,6 +140,30 @@ def test_handle_channel_destroyed_echoes_attempt_id():
     assert payload["attempt_id"] == "att-echo-1"
 
 
+def test_handle_channel_destroyed_skips_manual_call_type():
+    """call_type=1 (manual) no debe contaminar process-event del dialer."""
+    pending_store = PendingDialMetadataStore()
+    pending_store.register(
+        "PJSIP-manual-1",
+        {
+            "call_type": 1,
+            "channel_type": "to_pstn",
+            "id_camp": "10",
+            "id_customer": "99",
+            "tel_customer": "1155667788",
+            "callid": "manual-99",
+        },
+    )
+
+    forwarder = LegacyEventForwarder(pending_dial_store=pending_store)
+    forwarder.client = MagicMock()
+
+    forwarder.handle_channel_destroyed("PJSIP-manual-1")
+
+    assert forwarder.client.submit_job.call_count == 0
+    assert pending_store.get("PJSIP-manual-1") is None
+
+
 def test_submit_dial_originate_failed_includes_business_fields():
     forwarder = LegacyEventForwarder()
     forwarder.client = MagicMock()

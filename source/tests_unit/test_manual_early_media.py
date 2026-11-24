@@ -93,6 +93,7 @@ class ManualEarlyMediaTests(unittest.TestCase):
         self.timer.cancel.assert_not_called()
         self.call_service.add_channel_to_bridge.assert_not_called()
         self.ari.stop_playback.assert_not_called()
+        self.agent_status.try_set_oncall.assert_not_called()
         self.agent_status.set_oncall.assert_not_called()
 
     def test_stasis_without_state_still_marks_answer(self):
@@ -103,7 +104,7 @@ class ManualEarlyMediaTests(unittest.TestCase):
         self.assertIsNotNone(self.ctx.pstn_answered_ts)
         self.timer.cancel.assert_called_once_with("pstn-1")
         self.call_service.add_channel_to_bridge.assert_called_once_with("br-1", "pstn-1")
-        self.agent_status.set_oncall.assert_called_once()
+        self.agent_status.try_set_oncall.assert_called_once()
 
     def test_progress_bridges_without_answer(self):
         self.ctx.pstn_channel = "pstn-1"
@@ -122,12 +123,21 @@ class ManualEarlyMediaTests(unittest.TestCase):
         self.assertTrue(self.ctx.pstn_channel_bridged)
         self.timer.cancel.assert_called_once_with("pstn-1")
         self.call_service.add_channel_to_bridge.assert_called_once_with("br-1", "pstn-1")
+        # create+dial: ONCALL se consolida en on_pstn_answered (no solo en Stasis Up clásico)
+        self.agent_status.try_set_oncall.assert_called_once_with(
+            agent_id=self.ctx.agent_id,
+            call_id=self.ctx.call_id,
+            bridge_id=self.ctx.bridge_id,
+            campaign_id=self.ctx.id_camp,
+            contact_number=self.ctx.phone_number,
+        )
 
     def test_agent_up_does_not_mark_pstn_answered(self):
         self.ctx.pstn_channel = "pstn-1"
         self.handler.on_up({"channel": {"id": "agent-1", "state": "Up"}})
         self.assertIsNone(self.ctx.pstn_answered_ts)
         self.timer.cancel.assert_not_called()
+        self.agent_status.try_set_oncall.assert_not_called()
 
     def test_playback_does_not_restart_ringback_during_early_media(self):
         self.ctx.pstn_early_media = True

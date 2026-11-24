@@ -133,8 +133,9 @@ def test_voicebot_max_qcalls_nunca_deriva_a_humanos():
     strategy_engine.get_candidates.assert_not_called()
     call_service.dial_agent_with_headers.assert_not_called()
     call_service.dial_voicebot_with_headers.assert_not_called()
-    redis_client.set.assert_not_called()  # cortó antes de reservar
-    redis_client.incr.assert_not_called()  # no incrementó el contador
+    # Lock se toma antes del cupo MAXQCALLS; al fallar cupo se libera sin dial/INCR.
+    redis_client.incr.assert_not_called()
+    assert redis_client.set.called  # intentó lock del voicebot
 
 
 @pytest.mark.unit

@@ -1,4 +1,5 @@
 import logging
+import time
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Any, Dict, Iterator, List, Optional, Tuple
@@ -457,6 +458,19 @@ def is_pstn_hangup_during_blind_transfer_ringing(context: CallContext, channel_i
     return channel_id == pstn or (bool(uniqueid_pstn) and channel_id == uniqueid_pstn)
 
 
+def is_transfer_window_expired(context: CallContext, *, now: Optional[float] = None) -> bool:
+    """True si transfer_in_progress y transfer_deadline_ts ya venció."""
+    if not getattr(context, "transfer_in_progress", False):
+        return False
+    deadline = getattr(context, "transfer_deadline_ts", None)
+    if deadline is None:
+        return False
+    try:
+        return float(now if now is not None else time.time()) >= float(deadline)
+    except (TypeError, ValueError):
+        return False
+
+
 def should_block_operation_for_transfer(
     context: CallContext,
     log: Optional[logging.Logger] = None,
@@ -465,6 +479,9 @@ def should_block_operation_for_transfer(
     """
     Aplica una política estándar para bloquear operaciones cuando hay
     una transferencia en progreso (`transfer_in_progress=True`).
+
+    Si la ventana expiró (deadline), no bloquea: el caller debería
+    invocar TransferManager.maybe_abort_expired_transfer(call_id).
 
     Retorna:
         True  -> La operación **debe** bloquearse (no continuar)
@@ -478,6 +495,13 @@ def should_block_operation_for_transfer(
     _log = log or logger
 
     if getattr(context, "transfer_in_progress", False):
+        if is_transfer_window_expired(context):
+            _log.warning(
+                "transfer_in_progress expired (deadline); not blocking op=%s call_id=%s",
+                operation or "unknown",
+                getattr(context, "call_id", None),
+            )
+            return False
         _log.debug(
             "Operación bloqueada por transfer_in_progress=True (op=%s, call_id=%s)",
             operation or "unknown",

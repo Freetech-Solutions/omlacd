@@ -138,6 +138,48 @@ class TestReserveBlockedByWrapupCooldown(unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(r.hget(agent_key, "STATUS"), "READY")
 
+    def test_reserve_ignore_cooldown_allows_wrapup_for_manual_dial(self):
+        try:
+            import fakeredis
+        except ImportError:
+            self.skipTest("fakeredis not installed")
+
+        r = fakeredis.FakeRedis(decode_responses=True)
+        agent_id = "9"
+        agent_key = f"OML:AGENT:{agent_id}"
+        r.hset(agent_key, mapping={"STATUS": "READY"})
+        r.set(RedisKeys.agent_offer_cooldown(agent_id), "wrapup", ex=30)
+
+        svc = AgentStatusService(redis_client=r)
+        ok = svc.try_reserve_for_distribution(
+            agent_id, "call-manual", ttl_sec=20, ignore_cooldown=True
+        )
+        self.assertTrue(ok)
+        self.assertEqual(r.hget(agent_key, "STATUS"), "DIALING")
+        # Pisa wrapup con call_id (protección en vuelo del saliente).
+        self.assertEqual(
+            r.get(RedisKeys.agent_offer_cooldown(agent_id)), "call-manual"
+        )
+
+    def test_outbound_reserve_from_pause_acw_with_fakeredis(self):
+        try:
+            import fakeredis
+        except ImportError:
+            self.skipTest("fakeredis not installed")
+
+        r = fakeredis.FakeRedis(decode_responses=True)
+        agent_id = "9"
+        agent_key = f"OML:AGENT:{agent_id}"
+        r.hset(agent_key, mapping={"STATUS": "PAUSE-ACW", "PAUSE_ID": "0"})
+
+        svc = AgentStatusService(redis_client=r)
+        ok = svc.try_reserve_for_distribution(
+            agent_id, "call-acw", ttl_sec=20, ignore_cooldown=True
+        )
+        self.assertTrue(ok)
+        self.assertEqual(r.hget(agent_key, "STATUS"), "DIALING")
+        self.assertIsNone(r.hget(agent_key, "PAUSE_ID"))
+
 
 if __name__ == "__main__":
     unittest.main()

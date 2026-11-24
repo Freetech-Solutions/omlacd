@@ -79,15 +79,17 @@ class TestSetPostcallAtomicCooldown(unittest.TestCase):
         self.redis.eval.assert_called_once()
         args = self.redis.eval.call_args[0]
         self.assertEqual(args[0], _SET_POSTCALL_AND_CLEAR_FIELDS_SCRIPT)
-        self.assertEqual(args[1], 2)  # numkeys
+        self.assertEqual(args[1], 4)  # numkeys: agent, cooldown, lock, lease
         self.assertEqual(args[2], self.svc._get_agent_key(11))
         self.assertEqual(args[3], RedisKeys.agent_offer_cooldown("11"))
+        self.assertEqual(args[4], RedisKeys.agent_lock("11"))
+        self.assertEqual(args[5], RedisKeys.agent_reservation_lease("11"))
         # ARGV
-        self.assertEqual(args[4], AgentStatus.ONCALL.value)
-        self.assertEqual(args[5], AgentStatus.POSTCALL.value)
-        self.assertEqual(args[7], "c-1")
-        self.assertEqual(args[8], "42")
-        self.assertEqual(args[9], "wrapup")
+        self.assertEqual(args[6], AgentStatus.ONCALL.value)
+        self.assertEqual(args[7], AgentStatus.POSTCALL.value)
+        self.assertEqual(args[9], "c-1")
+        self.assertEqual(args[10], "42")
+        self.assertEqual(args[11], "wrapup")
 
     def test_eval_empty_cooldown_key_when_ttl_zero(self):
         with patch.object(self.svc, "resolve_wrapup_cooldown_ttl", return_value=0):
@@ -96,9 +98,9 @@ class TestSetPostcallAtomicCooldown(unittest.TestCase):
             ):
                 self.svc.set_postcall_and_clear_fields(11, call_id="c-2")
         args = self.redis.eval.call_args[0]
-        self.assertEqual(args[1], 2)
+        self.assertEqual(args[1], 4)
         self.assertEqual(args[3], "")
-        self.assertEqual(args[8], "0")
+        self.assertEqual(args[10], "0")
 
     def test_script_sets_cooldown_inline(self):
         """Sanity: el script Lua contiene SET del cooldown en la misma eval."""

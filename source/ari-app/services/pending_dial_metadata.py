@@ -19,6 +19,22 @@ logger = logging.getLogger(__name__)
 KEY_PREFIX = "acd:pending_dial:"
 _DEFAULT_TTL_SEC = 7200
 
+# Merge atómico GET+patch+SETEX (evita lost updates entre EventLoop y PstnRingTimer).
+# KEYS[1]=pending key  ARGV[1]=patch JSON  ARGV[2]=ttl_sec
+_UPDATE_PENDING_DIAL_SCRIPT = """
+local raw = redis.call('GET', KEYS[1])
+if not raw then
+    return 0
+end
+local meta = cjson.decode(raw)
+local patch = cjson.decode(ARGV[1])
+for k, v in pairs(patch) do
+    meta[k] = v
+end
+redis.call('SETEX', KEYS[1], tonumber(ARGV[2]), cjson.encode(meta))
+return 1
+"""
+
 
 def _default_ttl() -> int:
     try:
@@ -67,15 +83,55 @@ class PendingDialMetadataStore:
             logger.debug("PendingDialMetadataStore: registered channel_id=%s (memory)", channel_id)
 
     def update(self, channel_id: str, fields: Dict[str, Any]) -> bool:
-        """Fusiona fields en la metadata existente y renueva TTL."""
+        """Fusiona fields en la metadata existente y renueva TTL (atómico)."""
         if not channel_id or not fields:
             return False
-        current = self.get(channel_id)
-        if not current:
-            return False
-        merged = {**current, **fields}
-        self.register(channel_id, merged)
-        return True
+
+        if self._redis is not None:
+            key = self._redis_key(channel_id)
+            patch_json = json.dumps(fields)
+            try:
+                result = self._redis.eval(
+                    _UPDATE_PENDING_DIAL_SCRIPT,
+                    1,
+                    key,
+                    patch_json,
+                    self._ttl,
+                )
+                return bool(int(result or 0))
+            except Exception as e:
+                logger.warning(
+                    "PendingDialMetadataStore: atomic update failed channel_id=%s, "
+                    "falling back to get+setex: %s",
+                    channel_id,
+                    e,
+                )
+                try:
+                    current = self.get(channel_id)
+                    if not current:
+                        return False
+                    merged = {**current, **fields}
+                    self._redis.setex(key, self._ttl, json.dumps(merged))
+                    return True
+                except Exception as e2:
+                    logger.warning(
+                        "PendingDialMetadataStore: fallback update failed channel_id=%s: %s",
+                        channel_id,
+                        e2,
+                    )
+                    return False
+
+        with self._lock:
+            entry = self._memory.get(channel_id)
+            if not entry:
+                return False
+            if time.monotonic() - entry["ts"] > self._ttl:
+                del self._memory[channel_id]
+                return False
+            current = entry.get("metadata") or {}
+            entry["metadata"] = {**current, **fields}
+            entry["ts"] = time.monotonic()
+            return True
 
     def refresh(self, channel_id: str) -> None:
         """Renueva TTL en actividad del canal (llamadas largas en cola)."""

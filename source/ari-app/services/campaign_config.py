@@ -33,6 +33,7 @@ DEFAULT_CAMPAIGN_CFG = {
     "failover_dst_tipo": None,
     "failover_dst_id": None,
     "welcome_sound": None,
+    "showcampname": "",
 }
 
 
@@ -59,6 +60,8 @@ def fetch_campaign_cfg_from_redis(
     for k, v in raw_cfg.items():
         if k is None:
             continue
+        if isinstance(k, bytes):
+            k = k.decode("utf-8", errors="replace")
         normalized[str(k).lower()] = v
 
     moh_sound = (
@@ -194,6 +197,14 @@ def fetch_campaign_cfg_from_redis(
     welcome_sound = str(welcome_raw).strip() if welcome_raw is not None else ""
     welcome_sound = welcome_sound or None
 
+    # Django: SHOWCAMPNAME = campana.nombre si mostrar_nombre, sino ""
+    showcampname_raw = normalized.get("showcampname")
+    if showcampname_raw is not None and isinstance(showcampname_raw, bytes):
+        showcampname_raw = showcampname_raw.decode("utf-8")
+    showcampname = (
+        str(showcampname_raw).strip() if showcampname_raw is not None else ""
+    )
+
     return {
         "moh_sound": moh_sound,
         "max_wait_time": max_wait_time,
@@ -212,6 +223,7 @@ def fetch_campaign_cfg_from_redis(
         "failover_dst_tipo": failover_dst_tipo,
         "failover_dst_id": failover_dst_id,
         "welcome_sound": welcome_sound,
+        "showcampname": showcampname,
     }
 
 
